@@ -2,8 +2,10 @@
 # Integration test for the TCP control plane: real nodes over localhost
 # UDP, queried over TCP with pulse-ctl.
 #  1. One node: MEMBERS lists itself, STATUS reports id and total=1,
-#     METRICS reports zero counts and no latency samples yet, unknown
-#     commands and bad LEAVE usage get clean ERR lines.
+#     METRICS reports zero counts and no latency samples yet, JSON
+#     returns one line of valid JSON with the node itself as the only
+#     member and zeroed metrics, unknown commands and bad LEAVE usage
+#     get clean ERR lines.
 #  2. A second node joins; MEMBERS on the first lists both.
 #  3. LEAVE the second node on the first: OK, and it is gone from the
 #     first node's listing immediately. (It is alive, so direct contact
@@ -92,6 +94,22 @@ if echo "$metrics" | grep -q "METRICS suspected=0 dead=0" \
 else
     note fail "METRICS on a fresh node reports zero counts and no samples"
     echo "--- ctl output:"; echo "$metrics"
+fi
+
+# JSON on a fresh node: one line of valid JSON, then END, with the
+# node itself as the only member and zeroed metrics.
+json="$(ctl 18401 JSON)"
+if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
+   && echo "$json" | grep -q '"id":"127.0.0.1:17401"' \
+   && echo "$json" | grep -q '"total":1' \
+   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17401","incarnation":1,"state":"ALIVE","phi":null}\]' \
+   && echo "$json" | grep -q '"metrics":{"suspected":0,"dead":0,"refutes":0,"joins":0' \
+   && echo "$json" | grep -q '"detect_latency_ms":{"mean":null,"max":0,"samples":0}' \
+   && echo "$json" | grep -q "^END$"; then
+    note ok "JSON on a fresh node is valid JSON with self member and zeroed metrics"
+else
+    note fail "JSON on a fresh node is valid JSON with self member and zeroed metrics"
+    echo "--- ctl output:"; echo "$json"
 fi
 
 # Unknown command and bad LEAVE usage get clean ERR lines.
@@ -195,6 +213,23 @@ if echo "$metrics" | grep -qE "suspected=[1-9][0-9]* dead=[1-9][0-9]*" \
 else
     note fail "METRICS reports the detected kill with measured latencies"
     echo "--- ctl output:"; echo "$metrics"
+fi
+# JSON after the kill (before the LEAVE below removes the dead member):
+# still valid JSON, the dead member listed with state DEAD, counts
+# reflect the detected kill, and the latency means are numbers now
+# (not null).
+json="$(ctl 18401 JSON)"
+if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
+   && echo "$json" | grep -q '"id":"127.0.0.1:17402","incarnation":1,"state":"DEAD"' \
+   && echo "$json" | grep -q '"dead":1' \
+   && echo "$json" | grep -qE '"suspected":[1-9][0-9]*' \
+   && echo "$json" | grep -qE '"detect_latency_ms":\{"mean":[0-9]+,"max":[0-9]+,"samples":[1-9][0-9]*\}' \
+   && echo "$json" | grep -qE '"suspect_to_dead_ms":\{"mean":[0-9]+,"max":[0-9]+,"samples":[1-9][0-9]*\}' \
+   && echo "$json" | grep -q "^END$"; then
+    note ok "JSON after the kill lists the dead member with measured latencies"
+else
+    note fail "JSON after the kill lists the dead member with measured latencies"
+    echo "--- ctl output:"; echo "$json"
 fi
 if [ "$(ctl 18401 LEAVE 127.0.0.1:17402)" = "OK 127.0.0.1:17402" ]; then
     note ok "LEAVE returns OK for the dead member"

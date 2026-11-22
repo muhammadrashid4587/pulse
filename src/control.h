@@ -36,6 +36,12 @@
  *       there are no samples); suspect_to_dead_ms is SUSPECT -> DEAD.
  *       Transitions learned from gossip bump the counts but add no
  *       latency sample, so samples can be smaller than the counts.
+ *   JSON
+ *       STATUS, MEMBERS and METRICS combined into one machine-readable
+ *       JSON object on a single line, then END. Member phi is a number
+ *       when phi-accrual is on and the peer has heartbeat history,
+ *       null otherwise (including self). Latency means are null when
+ *       there are no samples; max is 0 then.
  *   anything else
  *       ERR unknown command
  *

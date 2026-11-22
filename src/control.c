@@ -124,6 +124,75 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
     send_all(fd, "\nEND\n");
 }
 
+/* JSON: one machine-readable line combining STATUS, MEMBERS and
+ * METRICS, then END. Member ids are host:port (IPv6 bracketed), so
+ * they contain no quote or backslash and need no escaping. Phi is a
+ * number when phi-accrual is on and the peer has heartbeat history,
+ * null otherwise (including self). Latency means are null when there
+ * are no samples. Built into a fixed buffer: 64 members at ~120
+ * bytes each is under 8 KB, so 16 KB has ample headroom. */
+static void handle_json(int fd, const control_hooks_t *hooks) {
+    member_table_t t;
+    hooks->snapshot(hooks->ctx, &t);
+    pulse_metrics_t m;
+    hooks->metrics(hooks->ctx, &m);
+    int phi_on = hooks->phi_enabled(hooks->ctx);
+    int64_t now = pulse_now_ms();
+    int64_t uptime = (now - hooks->start_ms) / 1000;
+    static char buf[16384];
+    size_t used = 0;
+    int w = snprintf(buf + used, sizeof buf - used,
+        "{\"id\":\"%s\",\"uptime\":%lld,\"alive\":%d,\"suspect\":%d,"
+        "\"dead\":%d,\"total\":%d,\"members\":[",
+        hooks->self_id, (long long)uptime,
+        member_count_state(&t, MEMBER_ALIVE),
+        member_count_state(&t, MEMBER_SUSPECT),
+        member_count_state(&t, MEMBER_DEAD), t.count);
+    if (w < 0) return;
+    used += (size_t)w;
+    for (int i = 0; i < t.count; i++) {
+        const member_t *mem = &t.members[i];
+        char phibuf[32];
+        if (!phi_on || strcmp(mem->id, hooks->self_id) == 0 ||
+            !mem->phi.have_last || mem->phi.count < PULSE_PHI_MIN_SAMPLES) {
+            snprintf(phibuf, sizeof phibuf, "null");
+        } else {
+            snprintf(phibuf, sizeof phibuf, "%.2f",
+                     phi_value(&mem->phi, now));
+        }
+        w = snprintf(buf + used, sizeof buf - used,
+                     "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
+                     "\"phi\":%s}",
+                     i == 0 ? "" : ",", mem->id, mem->incarnation,
+                     member_state_name(mem->state), phibuf);
+        if (w < 0 || (size_t)w >= sizeof buf - used) return;
+        used += (size_t)w;
+    }
+    char dmean[16], smean[16];
+    if (m.detect_samples > 0)
+        snprintf(dmean, sizeof dmean, "%lld",
+                 (long long)(m.detect_sum_ms / m.detect_samples));
+    else
+        snprintf(dmean, sizeof dmean, "null");
+    if (m.suspect_dead_samples > 0)
+        snprintf(smean, sizeof smean, "%lld",
+                 (long long)(m.suspect_dead_sum_ms / m.suspect_dead_samples));
+    else
+        snprintf(smean, sizeof smean, "null");
+    w = snprintf(buf + used, sizeof buf - used,
+        "],\"metrics\":{\"suspected\":%lld,\"dead\":%lld,\"refutes\":%lld,"
+        "\"joins\":%lld,\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
+        "\"samples\":%lld},\"suspect_to_dead_ms\":{\"mean\":%s,\"max\":%lld,"
+        "\"samples\":%lld}}}\nEND\n",
+        (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
+        (long long)m.joins, dmean, (long long)m.detect_max_ms,
+        (long long)m.detect_samples, smean,
+        (long long)m.suspect_dead_max_ms,
+        (long long)m.suspect_dead_samples);
+    if (w < 0 || (size_t)w >= sizeof buf - used) return;
+    send_all(fd, buf);
+}
+
 static void handle_leave(int fd, const control_hooks_t *hooks,
                          const char *arg) {
     if (!arg || arg[0] == '\0') {
@@ -166,6 +235,8 @@ static void handle_connection(int fd, const control_hooks_t *hooks) {
         handle_leave(fd, hooks, arg);
     } else if (strcmp(line, "METRICS") == 0) {
         handle_metrics(fd, hooks);
+    } else if (strcmp(line, "JSON") == 0) {
+        handle_json(fd, hooks);
     } else {
         send_all(fd, "ERR unknown command\n");
     }

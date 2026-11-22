@@ -36,7 +36,8 @@ building block, not a production service mesh.
   after a fixed ack timeout. The fixed-timeout path stays the default.
 - TCP control plane (opt-in, `--control-port`): a line-based protocol
   for asking a running node for its membership (`MEMBERS`), its status
-  (`STATUS`), its failure-detector metrics (`METRICS`), or
+  (`STATUS`), its failure-detector metrics (`METRICS`), the whole
+  picture as one machine-readable JSON object (`JSON`), or
   force-removing a member (`LEAVE <id>`). See
   "Control plane" below. Query it with the bundled `pulse-ctl` client
   or plain netcat.
@@ -216,6 +217,10 @@ the port beyond localhost.
 ./pulse-ctl 127.0.0.1:18401 METRICS
 # METRICS suspected=1 dead=1 refutes=0 joins=2 detect_latency_ms mean=203 max=203 samples=1 suspect_to_dead_ms mean=301 max=301 samples=1
 # END
+
+./pulse-ctl 127.0.0.1:18401 JSON
+# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"detect_latency_ms":{"mean":203,"max":203,"samples":1},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1}}}
+# END
 ```
 
 Or with netcat, if it is installed:
@@ -232,6 +237,7 @@ Commands:
 | `STATUS` | One `STATUS id=<self> uptime=<seconds> alive=N suspect=N dead=N total=N` line, then `END`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
 | `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N detect_latency_ms mean=X max=Y samples=N suspect_to_dead_ms mean=X max=Y samples=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. |
+| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. Built for tooling that polls cluster state without scraping the text protocol. |
 | anything else | `ERR unknown command` |
 
 ## Shared secret
@@ -396,7 +402,10 @@ make test
 - `tests/test_control.sh`: integration test for the TCP control plane —
   `MEMBERS` lists the node itself, `STATUS` reports id and totals,
   `METRICS` reports zero counts and no samples on a fresh node and
-  the detected kill with measured latencies after a peer dies,
+  the detected kill with measured latencies after a peer dies, `JSON`
+  returns one line of valid JSON with the node itself as the only
+  member and zeroed metrics on a fresh node, and after a kill it lists
+  the dead member with state `DEAD` and numeric latency means,
   unknown commands and bad `LEAVE` usage get clean `ERR` lines, a
   second node appears in `MEMBERS` after joining, `LEAVE` removes it
   from the listing immediately, the live node comes back via direct
@@ -450,3 +459,4 @@ make test
 - ~~Cluster-size-aware gossip fanout: digest to 1 + floor(log2(peers)) random peers per round, capped at 4.~~ Done in 0.8.0.
 - ~~Prioritized gossip digests: the most recently changed SUSPECT/DEAD entries lead each digest (up to 4, most recent first), so failure news is never stuck behind the random window when the table is larger than the 16-entry digest.~~ Done in 0.9.0.
 - ~~Failure-detector metrics: detection latency (last heartbeat to SUSPECT) and suspect-to-dead duration, with transition counts, exposed as a `METRICS` command on the control plane.~~ Done in 0.10.0.
+- ~~Machine-readable cluster view: a `JSON` control-plane command returning status, members, and metrics as one JSON object, so tooling can poll cluster state without scraping the text protocol.~~ Done in 0.11.0.
