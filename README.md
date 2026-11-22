@@ -36,13 +36,20 @@ building block, not a production service mesh.
   (`STATUS`), or force-removing a member (`LEAVE <id>`). See
   "Control plane" below. Query it with the bundled `pulse-ctl` client
   or plain netcat.
+- Optional shared secret (`--secret`): nodes started with the same
+  secret only accept traffic from peers presenting it, so two clusters
+  on the same network cannot accidentally merge. See "Shared secret"
+  below. Nodes without a secret behave exactly as before.
 
 ## What it is not
 
-- Not a service mesh, not a consensus protocol, not encrypted, not
-  authenticated. Any process on the network can join and any member can
-  claim another is dead. It detects crashes on a trusted LAN; it does not
-  defend against a malicious network.
+- Not a service mesh, not a consensus protocol, not encrypted. Without
+  a shared secret, any process on the network can join and any member
+  can claim another is dead. It detects crashes on a trusted LAN; it
+  does not defend against a malicious network. With a secret, only
+  peers presenting the secret are accepted — but that is a join gate
+  against accidental cross-talk, not authentication (see "Shared
+  secret").
 - Not a replacement for Raft or Paxos. It answers one question — "is that
   node still there?" — and leaves agreement to something else.
 - Dead members are garbage-collected after a retention period (default
@@ -68,6 +75,13 @@ GOSSIP <from-id> <from-inc> <count> <id:inc:state> ...
 
 State codes in gossip entries: `A` alive, `S` suspect, `D` dead.
 Member ids are `host:port`, so a gossip entry is self-contained.
+
+When a shared secret is configured, every message carries a trailing
+` <tag>` token: the first 8 bytes of HMAC-SHA256(secret, message),
+hex-encoded (16 chars). A receiver with a secret drops any datagram
+whose tag is missing or wrong, before it touches the membership
+table; a receiver without a secret ignores the trailing token. The
+tag needs no protocol change: the parser ignores the extra token.
 
 Failure detection, per node, every probe interval (default 100 ms):
 
@@ -146,6 +160,7 @@ scripts/demo.sh
 | `--phi-accrual` | off | Suspect on phi instead of the fixed ack timeout |
 | `--phi-threshold` | 8.0 | Phi value at which a peer is suspected (phi mode only) |
 | `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `LEAVE`) |
+| `--secret` / `--shared-secret` | — (none) | Shared secret for joins: only peers presenting the same secret are accepted |
 
 Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 `GC` (a DEAD entry removed after its retention expired), `ALIVE`,
@@ -198,6 +213,41 @@ Commands:
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
 | anything else | `ERR unknown command` |
 
+## Shared secret
+
+Start every node in a cluster with the same `--secret` (or
+`--shared-secret`) value and each node tags every UDP message it sends
+with HMAC-SHA256(secret, message), truncated to 8 bytes, and drops any
+incoming datagram whose tag is missing or wrong. A node without a
+secret sends untagged messages and accepts anything, exactly as
+before, so existing single-cluster setups need no change.
+
+```sh
+./pulse-node --port 17101 --secret ward-alpha --data-dir /tmp/p1
+./pulse-node --port 17102 --secret ward-alpha --seed 127.0.0.1:17101 --data-dir /tmp/p2
+```
+
+What it is and is not:
+
+- It is a join gate against accidental cross-talk: two wards, or a
+  test rig and a production cluster on the same LAN, cannot merge into
+  one membership table. A node with a different secret is simply
+  ignored — it never appears in `MEMBERS` — and a node with no secret
+  is ignored by secret nodes the same way.
+- It is not authentication, not encryption, and not replay protection.
+  The secret is passed on the command line (visible in `ps`), the
+  messages are still plaintext, the tag is only 8 bytes, and a
+  captured datagram can be replayed while its content is still valid.
+  Do not use it to keep an attacker out; use it to keep two friendly
+  clusters apart. The `START` line reports `secret=on` when a secret
+  is configured; the secret value itself is never logged.
+- Mixed clusters do not merge, but not symmetrically: a plain node
+  accepts anything, so it *hears* a secret node's tagged traffic and
+  adds it to its table, then suspects and GCs it when no untagged
+  reply ever comes. The secret node never acknowledges the plain node
+  at all. The result in both directions is two separate clusters, not
+  one working one.
+
 ## Tests
 
 ```sh
@@ -229,11 +279,24 @@ make test
   second node appears in `MEMBERS` after joining, `LEAVE` removes it
   from the listing immediately, the live node comes back via direct
   contact, and `LEAVE` of a dead node removes it for good.
+- `tests/test_secret.c`: unit tests for the join gate — SHA-256
+  against FIPS 180-4 vectors (including one million 'a's), HMAC-SHA256
+  against the RFC 4231 test case 2 vector, tag shape and
+  determinism, verify against a wrong secret / tampered message /
+  tampered tag, and `pulse_secret_check` accept/drop decisions
+  (untagged, wrong-secret, non-hex token, bare tag, trailing
+  whitespace). Also checks a tagged message still parses.
+- `tests/test_secret.sh`: integration test for the join gate — same
+  secret converges, different secrets stay separate (the seeding node
+  suspects, deads, and GCs the unanswering seed), no secret converges
+  as before, and a mixed secret/plain pair does not merge. Also checks
+  `START` reports `secret=on` only for secret nodes and that the
+  secret value never appears in a log.
 
 ## Roadmap
 
 - ~~Garbage collection of old DEAD entries.~~ Done in 0.2.0.
 - ~~Phi-accrual failure detection as an alternative to fixed timeouts.~~ Done in 0.3.0.
 - ~~A TCP control plane: query membership, force-leave a member.~~ Done in 0.4.0.
-- Optional shared secret so only trusted devices can join.
+- ~~Optional shared secret so only trusted devices can join.~~ Done in 0.5.0.
 - IPv6.

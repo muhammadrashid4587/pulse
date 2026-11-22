@@ -1,12 +1,45 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gossip.h"
+#include "secret.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* Optional shared secret, set once at startup by gossip_set_secret.
+ * When set, every outgoing message carries a trailing " <tag>" token;
+ * when unset, messages go out exactly as before. */
+static char g_secret[PULSE_SECRET_MAX];
+static int g_has_secret = 0;
+
+void gossip_set_secret(const char *secret) {
+    if (secret && secret[0] != '\0') {
+        snprintf(g_secret, sizeof g_secret, "%s", secret);
+        g_has_secret = 1;
+    } else {
+        g_secret[0] = '\0';
+        g_has_secret = 0;
+    }
+}
+
 static int send_str(int sock, const struct sockaddr_in *to, const char *s) {
-    ssize_t n = sendto(sock, s, strlen(s), 0,
+    /* Tagging needs a little headroom past PULSE_MAX_MSG; the buffer is
+     * stack-local, so concurrent sends from the receiver and prober
+     * threads cannot clobber each other. */
+    char tagged[PULSE_MAX_MSG + 32];
+    const char *out = s;
+    if (g_has_secret) {
+        size_t n = strlen(s);
+        if (n >= sizeof tagged - PULSE_TAG_HEX_LEN - 2)
+            n = sizeof tagged - PULSE_TAG_HEX_LEN - 2;
+        memcpy(tagged, s, n);
+        tagged[n] = '\0';
+        char tag[PULSE_TAG_HEX_LEN + 1];
+        pulse_secret_tag(g_secret, (const unsigned char *)tagged, n, tag);
+        snprintf(tagged + n, sizeof tagged - n, " %s", tag);
+        out = tagged;
+    }
+    ssize_t n = sendto(sock, out, strlen(out), 0,
                        (const struct sockaddr *)to, sizeof(*to));
     return n < 0 ? -1 : 0;
 }

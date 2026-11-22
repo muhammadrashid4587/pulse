@@ -29,6 +29,7 @@
 #include "gossip.h"
 #include "member.h"
 #include "phi.h"
+#include "secret.h"
 #include "control.h"
 
 #define MAX_PENDING 32
@@ -53,6 +54,7 @@ typedef struct {
     int phi_accrual;           /* suspect on phi instead of fixed timeouts */
     double phi_threshold;      /* phi at which a peer is suspected */
     int control_port;          /* TCP control plane port, -1 = disabled */
+    char secret[PULSE_SECRET_MAX]; /* shared secret for joins, "" = none */
 } config_t;
 
 typedef struct {
@@ -320,6 +322,14 @@ static void *receiver_thread(void *arg) {
             continue;
         }
         gmsg_t msg;
+        /* Shared-secret gate: with a secret configured, a datagram
+         * whose tag is missing or wrong is dropped here, before it can
+         * touch the membership table. Without a secret, everything is
+         * accepted, as before. */
+        if (g_cfg.secret[0] != '\0' &&
+            !pulse_secret_check(g_cfg.secret, (const unsigned char *)buf,
+                                (size_t)n))
+            continue;
         if (gossip_parse(buf, (size_t)n, &msg) != 0) continue;
         handle_message(&msg);
     }
@@ -595,7 +605,8 @@ static void usage(const char *prog) {
             "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
             "       [--dead-retention SECONDS]\n"
             "       [--phi-accrual] [--phi-threshold N]\n"
-            "       [--control-port PORT]\n",
+            "       [--control-port PORT]\n"
+            "       [--secret SECRET | --shared-secret SECRET]\n",
             prog);
 }
 
@@ -653,6 +664,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--control-port must be a port number\n");
                 return 2;
             }
+        } else if ((strcmp(argv[i], "--secret") == 0 ||
+                    strcmp(argv[i], "--shared-secret") == 0) &&
+                   i + 1 < argc) {
+            snprintf(g_cfg.secret, sizeof g_cfg.secret, "%s", argv[++i]);
+            if (g_cfg.secret[0] == '\0') {
+                fprintf(stderr, "--secret must not be empty\n");
+                return 2;
+            }
         } else {
             usage(argv[0]);
             return 2;
@@ -666,6 +685,7 @@ int main(int argc, char **argv) {
     g_start_ms = pulse_now_ms();
     srand((unsigned)(time(NULL) ^ (long)getpid()));
     g_incarnation = load_incarnation(g_cfg.data_dir);
+    gossip_set_secret(g_cfg.secret);
 
     if (g_cfg.has_id) {
         snprintf(g_self_id, sizeof g_self_id, "%s", g_cfg.id);
@@ -743,12 +763,14 @@ int main(int argc, char **argv) {
         gossip_send_join(g_send_sock, &seed_addr, g_self_id, g_incarnation);
     }
 
+    /* The secret itself is never logged; only that a secret is on. */
+    const char *sec = g_cfg.secret[0] != '\0' ? " secret=on" : "";
     if (g_cfg.phi_accrual) {
-        log_line("START %s inc=%u port=%d phi=on threshold=%.1f", g_self_id,
-                 g_incarnation, g_cfg.port, g_cfg.phi_threshold);
+        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s", g_self_id,
+                 g_incarnation, g_cfg.port, g_cfg.phi_threshold, sec);
     } else {
-        log_line("START %s inc=%u port=%d", g_self_id, g_incarnation,
-                 g_cfg.port);
+        log_line("START %s inc=%u port=%d%s", g_self_id, g_incarnation,
+                 g_cfg.port, sec);
     }
 
     signal(SIGINT, on_signal);

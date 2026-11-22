@@ -17,6 +17,13 @@
  *
  * State codes in gossip entries: A alive, S suspect, D dead.
  * Member ids are always "host:port", so a gossip entry is self-contained.
+ *
+ * When a shared secret is configured (gossip_set_secret), every message
+ * carries a trailing " <tag>" token: the first 8 bytes of
+ * HMAC-SHA256(secret, message), hex-encoded. Receivers with a secret
+ * drop datagrams whose tag is missing or wrong; receivers without one
+ * ignore the trailing token. See secret.h for what the gate is and is
+ * not.
  */
 
 typedef enum {
@@ -40,8 +47,15 @@ typedef struct {
     member_t entries[PULSE_MAX_MEMBERS];
 } gmsg_t;
 
-/* Parse a received datagram. Returns 0 on success, -1 on malformed input. */
+/* Parse a received datagram. Returns 0 on success, -1 on malformed input.
+ * A trailing authentication tag token, if present, is ignored here: the
+ * receiver checks it with pulse_secret_check before parsing. */
 int gossip_parse(const char *buf, size_t len, gmsg_t *out);
+
+/* Set the shared secret used to tag outgoing messages. Call once at
+ * startup, before any thread sends. NULL or "" clears it (the default:
+ * untagged messages, accept anything). */
+void gossip_set_secret(const char *secret);
 
 int gossip_send_ping(int sock, const struct sockaddr_in *to, uint32_t seq,
                      const char *from_id, uint32_t inc);
