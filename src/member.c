@@ -116,6 +116,7 @@ member_t *member_add(member_table_t *t, const char *id,
     m->state = MEMBER_ALIVE;
     m->last_seen_ms = 0;
     m->state_since_ms = 0;
+    phi_init(&m->phi);
     return m;
 }
 
@@ -223,6 +224,7 @@ int member_mark_alive(member_table_t *t, const char *id,
         if (!m) return 0;
         m->last_seen_ms = now;
         m->state_since_ms = now;
+        phi_heartbeat(&m->phi, now);
         return 1;
     }
     int changed = (m->state != MEMBER_ALIVE);
@@ -231,6 +233,7 @@ int member_mark_alive(member_table_t *t, const char *id,
     if (addr) m->addr = *addr;
     m->last_seen_ms = now;
     if (changed) m->state_since_ms = now;
+    phi_heartbeat(&m->phi, now);
     return changed;
 }
 

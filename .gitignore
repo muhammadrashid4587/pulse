@@ -1,5 +1,6 @@
 pulse-node
 test_member
+test_phi
 *.o
 incarnation
 *.log

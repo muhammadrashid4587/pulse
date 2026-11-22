@@ -28,9 +28,15 @@
 
 #include "gossip.h"
 #include "member.h"
+#include "phi.h"
 
 #define MAX_PENDING 32
 #define PING_REQ_FANOUT 2
+/* In phi-accrual mode, a peer with no heartbeat history at all is
+ * suspected after this many probe intervals of silence. A seed that
+ * never answers cannot produce a phi, so without this guard it would
+ * sit ALIVE forever. */
+#define PHI_NO_HISTORY_INTERVALS 20
 
 typedef struct {
     int port;
@@ -43,6 +49,8 @@ typedef struct {
     int ack_timeout_ms;
     int suspect_timeout_ms;
     int64_t dead_retention_ms; /* how long a DEAD entry stays in the table */
+    int phi_accrual;           /* suspect on phi instead of fixed timeouts */
+    double phi_threshold;      /* phi at which a peer is suspected */
 } config_t;
 
 typedef struct {
@@ -319,7 +327,10 @@ static void *receiver_thread(void *arg) {
 static void probe_cycle(int cycle) {
     int64_t now = pulse_now_ms();
 
-    /* 1. Probe a random peer. */
+    /* 1. Probe a random peer. In phi-accrual mode the PING still goes
+     * out (it is the stimulus that produces heartbeats), but no pending
+     * entry is created: suspicion comes from phi, not from a probe
+     * timeout, so there is nothing to escalate. */
     char peer_id[PULSE_ID_LEN];
     struct sockaddr_in peer_addr;
     int have_peer = 0;
@@ -334,30 +345,43 @@ static void probe_cycle(int cycle) {
     if (have_peer) {
         uint32_t seq;
         int slot = -1;
+        int send = 0;
         pthread_mutex_lock(&g_lock);
         seq = g_seq++;
-        for (int i = 0; i < MAX_PENDING; i++) {
-            if (!g_pending[i].active) {
-                slot = i;
-                break;
+        if (g_cfg.phi_accrual) {
+            send = 1;
+        } else {
+            for (int i = 0; i < MAX_PENDING; i++) {
+                if (!g_pending[i].active) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot >= 0) {
+                g_pending[slot].active = 1;
+                g_pending[slot].seq = seq;
+                snprintf(g_pending[slot].target_id,
+                         sizeof g_pending[slot].target_id, "%s", peer_id);
+                g_pending[slot].target_addr = peer_addr;
+                g_pending[slot].sent_ms = now;
+                g_pending[slot].indirect_tried = 0;
+                send = 1;
             }
         }
-        if (slot >= 0) {
-            g_pending[slot].active = 1;
-            g_pending[slot].seq = seq;
-            snprintf(g_pending[slot].target_id,
-                     sizeof g_pending[slot].target_id, "%s", peer_id);
-            g_pending[slot].target_addr = peer_addr;
-            g_pending[slot].sent_ms = now;
-            g_pending[slot].indirect_tried = 0;
-        }
         pthread_mutex_unlock(&g_lock);
-        if (slot >= 0)
+        if (send)
             gossip_send_ping(g_send_sock, &peer_addr, seq, g_self_id,
                              g_incarnation);
     }
 
-    /* 2. Escalate timed-out probes. */
+    /* 2. Decide who to suspect this cycle. Fixed-timeout mode
+     * escalates timed-out probes to indirect probes and suspects on a
+     * second timeout. Phi-accrual mode suspects on phi alone: no
+     * indirect probes, no fixed timeouts — the phi value is the
+     * judgement. A peer with no heartbeat history at all is suspected
+     * after PHI_NO_HISTORY_INTERVALS of silence (a seed that never
+     * answers cannot produce a phi, so without this guard it would
+     * sit ALIVE forever). */
     typedef struct {
         uint32_t seq;
         char target_id[PULSE_ID_LEN];
@@ -368,49 +392,73 @@ static void probe_cycle(int cycle) {
     indirect_action_t actions[8];
     int n_actions = 0;
     char suspect_ids[8][PULSE_ID_LEN];
+    double suspect_phi[8]; /* phi at suspicion, or -1 (fixed-timeout path) */
     int n_suspect = 0;
+    for (int i = 0; i < 8; i++) suspect_phi[i] = -1;
     pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < MAX_PENDING; i++) {
-        if (!g_pending[i].active) continue;
-        int64_t age = now - g_pending[i].sent_ms;
-        if (!g_pending[i].indirect_tried && age >= g_cfg.ack_timeout_ms) {
-            g_pending[i].indirect_tried = 1;
-            if (n_actions < 8) {
-                actions[n_actions].seq = g_pending[i].seq;
-                snprintf(actions[n_actions].target_id,
-                         sizeof actions[n_actions].target_id, "%s",
-                         g_pending[i].target_id);
-                actions[n_actions].target_addr = g_pending[i].target_addr;
-                actions[n_actions].n_inter = 0;
-                n_actions++;
-            }
-        } else if (age >= 2 * g_cfg.ack_timeout_ms) {
-            if (n_suspect < 8) {
-                snprintf(suspect_ids[n_suspect],
-                         sizeof suspect_ids[n_suspect], "%s",
-                         g_pending[i].target_id);
-                n_suspect++;
-            }
-            g_pending[i].active = 0;
-        }
-    }
-    /* Pick up to PING_REQ_FANOUT intermediaries per action. */
-    for (int a = 0; a < n_actions; a++) {
-        for (int tries = 0; tries < 8 && actions[a].n_inter < PING_REQ_FANOUT;
-             tries++) {
-            member_t *m = member_random_peer(&g_table, g_self_id);
-            if (!m) break;
-            if (strcmp(m->id, actions[a].target_id) == 0) continue;
-            int dup = 0;
-            for (int j = 0; j < actions[a].n_inter; j++) {
-                if (memcmp(&actions[a].inter[j], &m->addr,
-                           sizeof(struct sockaddr_in)) == 0) {
-                    dup = 1;
-                    break;
+    if (g_cfg.phi_accrual) {
+        for (int i = 0; i < g_table.count; i++) {
+            member_t *m = &g_table.members[i];
+            if (strcmp(m->id, g_self_id) == 0) continue;
+            if (m->state != MEMBER_ALIVE) continue;
+            double phi = phi_value(&m->phi, now);
+            int no_history = !m->phi.have_last;
+            int64_t silent_for = now - m->state_since_ms;
+            if (phi >= g_cfg.phi_threshold ||
+                (no_history &&
+                 silent_for >=
+                     (int64_t)PHI_NO_HISTORY_INTERVALS * g_cfg.probe_interval_ms)) {
+                if (n_suspect < 8) {
+                    snprintf(suspect_ids[n_suspect], PULSE_ID_LEN, "%s",
+                             m->id);
+                    suspect_phi[n_suspect] = phi;
+                    n_suspect++;
                 }
             }
-            if (dup) continue;
-            actions[a].inter[actions[a].n_inter++] = m->addr;
+        }
+    } else {
+        for (int i = 0; i < MAX_PENDING; i++) {
+            if (!g_pending[i].active) continue;
+            int64_t age = now - g_pending[i].sent_ms;
+            if (!g_pending[i].indirect_tried && age >= g_cfg.ack_timeout_ms) {
+                g_pending[i].indirect_tried = 1;
+                if (n_actions < 8) {
+                    actions[n_actions].seq = g_pending[i].seq;
+                    snprintf(actions[n_actions].target_id,
+                             sizeof actions[n_actions].target_id, "%s",
+                             g_pending[i].target_id);
+                    actions[n_actions].target_addr = g_pending[i].target_addr;
+                    actions[n_actions].n_inter = 0;
+                    n_actions++;
+                }
+            } else if (age >= 2 * g_cfg.ack_timeout_ms) {
+                if (n_suspect < 8) {
+                    snprintf(suspect_ids[n_suspect],
+                             sizeof suspect_ids[n_suspect], "%s",
+                             g_pending[i].target_id);
+                    n_suspect++;
+                }
+                g_pending[i].active = 0;
+            }
+        }
+        /* Pick up to PING_REQ_FANOUT intermediaries per action. */
+        for (int a = 0; a < n_actions; a++) {
+            for (int tries = 0; tries < 8 && actions[a].n_inter < PING_REQ_FANOUT;
+                 tries++) {
+                member_t *m = member_random_peer(&g_table, g_self_id);
+                if (!m) break;
+                if (strcmp(m->id, actions[a].target_id) == 0) continue;
+                int dup = 0;
+                for (int j = 0; j < actions[a].n_inter; j++) {
+                    if (memcmp(&actions[a].inter[j], &m->addr,
+                               sizeof(struct sockaddr_in)) == 0) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                actions[a].inter[actions[a].n_inter++] = m->addr;
+            }
         }
     }
     /* Mark suspects now, while holding the lock. */
@@ -469,8 +517,14 @@ static void probe_cycle(int cycle) {
                                  actions[i].target_id, g_self_id);
         }
     }
-    for (int i = 0; i < n_changed; i++)
-        log_line("SUSPECT %s", suspect_ids[changed_idx[i]]);
+    for (int i = 0; i < n_changed; i++) {
+        int idx = changed_idx[i];
+        if (suspect_phi[idx] >= 0)
+            log_line("SUSPECT %s phi=%.2f", suspect_ids[idx],
+                     suspect_phi[idx]);
+        else
+            log_line("SUSPECT %s", suspect_ids[idx]);
+    }
     for (int i = 0; i < n_dead; i++)
         log_line("DEAD %s", newly_dead[i]);
     for (int i = 0; i < n_gc; i++)
@@ -503,7 +557,8 @@ static void usage(const char *prog) {
             "usage: %s --port PORT [--id ID] [--seed HOST:PORT]...\n"
             "       [--data-dir DIR] [--probe-interval-ms N]\n"
             "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
-            "       [--dead-retention SECONDS]\n",
+            "       [--dead-retention SECONDS]\n"
+            "       [--phi-accrual] [--phi-threshold N]\n",
             prog);
 }
 
@@ -515,6 +570,8 @@ int main(int argc, char **argv) {
     g_cfg.ack_timeout_ms = 100;
     g_cfg.suspect_timeout_ms = 300;
     g_cfg.dead_retention_ms = 60000; /* 60 s */
+    g_cfg.phi_accrual = 0;
+    g_cfg.phi_threshold = 8.0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -544,6 +601,14 @@ int main(int argc, char **argv) {
                 return 2;
             }
             g_cfg.dead_retention_ms = (int64_t)secs * 1000;
+        } else if (strcmp(argv[i], "--phi-accrual") == 0) {
+            g_cfg.phi_accrual = 1;
+        } else if (strcmp(argv[i], "--phi-threshold") == 0 && i + 1 < argc) {
+            g_cfg.phi_threshold = atof(argv[++i]);
+            if (g_cfg.phi_threshold <= 0) {
+                fprintf(stderr, "--phi-threshold must be a positive number\n");
+                return 2;
+            }
         } else {
             usage(argv[0]);
             return 2;
@@ -627,10 +692,20 @@ int main(int argc, char **argv) {
             continue;
         }
         member_add(&g_table, g_cfg.seeds[i], &seed_addr, 0);
+        /* A seed that never answers has no heartbeat history; the
+         * phi-mode no-history guard measures silence from here. */
+        member_t *seed = member_find(&g_table, g_cfg.seeds[i]);
+        if (seed) seed->state_since_ms = g_start_ms;
         gossip_send_join(g_send_sock, &seed_addr, g_self_id, g_incarnation);
     }
 
-    log_line("START %s inc=%u port=%d", g_self_id, g_incarnation, g_cfg.port);
+    if (g_cfg.phi_accrual) {
+        log_line("START %s inc=%u port=%d phi=on threshold=%.1f", g_self_id,
+                 g_incarnation, g_cfg.port, g_cfg.phi_threshold);
+    } else {
+        log_line("START %s inc=%u port=%d", g_self_id, g_incarnation,
+                 g_cfg.port);
+    }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);

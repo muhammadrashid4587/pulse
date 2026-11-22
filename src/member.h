@@ -4,6 +4,8 @@
 #include <netinet/in.h>
 #include <stdint.h>
 
+#include "phi.h"
+
 #define PULSE_MAX_MEMBERS 64
 #define PULSE_ID_LEN 64
 #define PULSE_MAX_TOMBSTONES 16
@@ -27,6 +29,10 @@ typedef struct {
     member_state_t state;
     int64_t last_seen_ms;   /* monotonic ms of last direct contact */
     int64_t state_since_ms; /* when the current state started */
+    /* Phi-accrual history for this peer: fed by every direct contact
+     * (member_mark_alive). Gossip about a peer is not a heartbeat —
+     * only a packet from the peer itself proves it is alive. */
+    phi_accrual_t phi;
 } member_t;
 
 typedef struct {

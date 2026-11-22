@@ -26,6 +26,11 @@ building block, not a production service mesh.
 - Garbage collection: DEAD entries are dropped after a configurable
   retention (default 60 s), with tombstones that stop gossip from
   resurrecting them until every peer has GC'd them too.
+- Phi-accrual failure detection (opt-in, `--phi-accrual`): each peer
+  keeps a window of heartbeat inter-arrival intervals, and a peer is
+  suspected when its phi — -log10 of the probability of a gap this
+  long — crosses a configurable threshold (default 8.0), instead of
+  after a fixed ack timeout. The fixed-timeout path stays the default.
 
 ## What it is not
 
@@ -72,6 +77,32 @@ incarnation, DEAD beats SUSPECT beats ALIVE. A node that hears gossip
 calling itself SUSPECT or DEAD bumps its incarnation and gossips ALIVE
 again — that is the refutation.
 
+### Phi-accrual mode (`--phi-accrual`)
+
+With `--phi-accrual`, suspicion is driven by phi instead of the fixed
+ack timeout: every direct contact with a peer (PING, ACK, gossip,
+JOIN) is a heartbeat, and each peer keeps the last 100 inter-arrival
+intervals. phi is -log10 of the probability, under a normal model of
+those intervals, of a gap as long as the one since the peer's last
+heartbeat. A healthy peer's phi stays near 0; a silent peer's phi
+grows without bound, and the peer is suspected at the threshold
+(default 8.0, `--phi-threshold`). The suspect-to-dead sweep and
+gossip are unchanged, and suspicion is logged as
+`SUSPECT <id> phi=8.42`.
+
+Two honest caveats. The normal model is an approximation — real
+arrival intervals are closer to exponential — so phi is conservative
+here (it rises a little faster than the "true" probability would
+suggest). And the spread is floored at 100 ms (or 5% of the mean):
+with perfectly regular arrivals the variance is ~0 and any tiny
+scheduling delay would look infinitely suspicious. Detection latency
+scales with cluster size, because arrivals come from random probing:
+on a 3-node cluster a dead peer is suspected roughly 0.7 s after it
+stops answering. A peer with no heartbeat history at all (a seed that
+never answers) is suspected after 20 probe intervals of silence, since
+it cannot produce a phi. In phi mode there are no indirect probes:
+phi is the judgement.
+
 ## Quickstart
 
 ```sh
@@ -105,6 +136,8 @@ scripts/demo.sh
 | `--ack-timeout-ms` | 100 | How long to wait for an ACK before an indirect probe |
 | `--suspect-timeout-ms` | 300 | How long a SUSPECT lasts before becoming DEAD |
 | `--dead-retention` | 60 | Seconds a DEAD entry stays in the table before GC |
+| `--phi-accrual` | off | Suspect on phi instead of the fixed ack timeout |
+| `--phi-threshold` | 8.0 | Phi value at which a peer is suspected (phi mode only) |
 
 Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 `GC` (a DEAD entry removed after its retention expired), `ALIVE`,
@@ -135,11 +168,19 @@ make test
   2 s `--dead-retention`, a killed node is GC'd by both survivors (the
   cluster agrees on 2 nodes, dead=0), and a restarted node at a higher
   incarnation is accepted back as ALIVE.
+- `tests/test_phi.c`: unit tests for phi-accrual — phi is 0 with no
+  history, stays low for regular heartbeats, rises monotonically with
+  silence and crosses 8, follows a changed cadence as old samples age
+  out, and is fed by `member_mark_alive`.
+- `tests/test_phi.sh`: integration test for phi-accrual — a 3-node
+  cluster in `--phi-accrual` mode converges, a killed node is SUSPECTED
+  with a phi value and then marked DEAD by both survivors, and a
+  restarted node comes back ALIVE.
 
 ## Roadmap
 
 - ~~Garbage collection of old DEAD entries.~~ Done in 0.2.0.
-- Phi-accrual failure detection as an alternative to fixed timeouts.
+- ~~Phi-accrual failure detection as an alternative to fixed timeouts.~~ Done in 0.3.0.
 - A TCP control plane: query membership, force-leave a member.
 - Optional shared secret so only trusted devices can join.
 - IPv6.
