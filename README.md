@@ -18,8 +18,9 @@ building block, not a production service mesh.
   (PING_REQ) through two random peers when a direct probe goes unanswered,
   SUSPECT then DEAD with incarnation numbers and refutation.
 - Gossip: every node periodically exchanges a digest of its membership
-  table with a random peer, so news of a dead node spreads in O(log n)
-  rounds.
+  table with a few random peers — the fanout grows with log2(cluster
+  size), capped at 4 — so news of a dead node spreads in O(log n)
+  rounds even as the cluster grows.
 - Incarnation numbers persist in `<data-dir>/incarnation`, so a restarted
   node rejoins with a higher incarnation and can refute stale
   SUSPECT/DEAD gossip about itself.
@@ -329,6 +330,19 @@ a seed that is already ALIVE is never re-joined.
 # Node 2 logs REJOIN, node 1 logs JOIN, both report alive=2.
 ```
 
+## Gossip fanout
+
+Every other probe cycle (every ~200 ms at the default 100 ms probe
+interval) a node sends its membership digest to a few random peers
+instead of just one. The fanout is `1 + floor(log2(peers))`, capped
+at 4: 1 peer for a 2-node cluster, 2 for 2–3 peers, 3 for 4–7, 4
+beyond that. One peer per round is enough while the cluster is tiny,
+but gossip only keeps its O(log n) spread as the cluster grows if
+each round reaches O(log n) peers; the cap bounds the extra traffic
+on a large cluster. Only ALIVE and SUSPECT peers are gossip targets,
+and the same digest copy goes to each of them, so the change costs
+no extra table snapshots.
+
 ## Tests
 
 ```sh
@@ -398,3 +412,4 @@ make test
 - ~~Optional shared secret so only trusted devices can join.~~ Done in 0.5.0.
 - ~~IPv6.~~ Done in 0.6.0.
 - ~~Seed rejoin retry when a seed is down at startup.~~ Done in 0.7.0.
+- ~~Cluster-size-aware gossip fanout: digest to 1 + floor(log2(peers)) random peers per round, capped at 4.~~ Done in 0.8.0.

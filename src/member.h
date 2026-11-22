@@ -116,6 +116,10 @@ int member_gc(member_table_t *t, int64_t now, int64_t dead_retention_ms,
 /* Random ALIVE or SUSPECT peer other than self, or NULL if there is none.
  * The returned pointer is only valid while the caller holds the table lock. */
 member_t *member_random_peer(member_table_t *t, const char *self_id);
+/* Gossip fanout for a cluster with peer_count gossipable peers
+ * (other members, excluding self and DEAD entries): 1 + floor(log2(n)),
+ * capped at 4. See member.c for the reasoning. */
+int member_gossip_fanout(int peer_count);
 
 const char *member_state_name(member_state_t s);
 char member_state_code(member_state_t s);

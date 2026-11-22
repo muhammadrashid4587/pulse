@@ -175,6 +175,17 @@ int main(void) {
                      MEMBER_DEAD, now + 300000);
     CHECK(r & MERGE_NEW); /* tombstone expired, entry accepted again */
 
+    /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
+    CHECK(member_gossip_fanout(0) == 1);
+    CHECK(member_gossip_fanout(1) == 1);
+    CHECK(member_gossip_fanout(2) == 2);
+    CHECK(member_gossip_fanout(3) == 2);
+    CHECK(member_gossip_fanout(4) == 3);
+    CHECK(member_gossip_fanout(7) == 3);
+    CHECK(member_gossip_fanout(8) == 4);
+    CHECK(member_gossip_fanout(16) == 4);
+    CHECK(member_gossip_fanout(63) == 4);
+
     printf("test_member: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

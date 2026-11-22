@@ -550,14 +550,38 @@ static void probe_cycle(int cycle) {
     char gc_ids[8][PULSE_ID_LEN];
     int n_gc = member_gc(&g_table, now, g_cfg.dead_retention_ms,
                          2 * g_cfg.dead_retention_ms, gc_ids, 8);
-    /* 4. Gossip a digest to a random peer every other cycle. */
+    /* 4. Gossip a digest to a few random peers every other cycle. The
+     * fanout grows with log2(cluster size) — 1 peer for a 2-node
+     * cluster, up to 4 for 8+ peers — so news still spreads in
+     * O(log n) rounds as the cluster grows, without flooding a large
+     * cluster. Only ALIVE/SUSPECT peers are gossip targets; the same
+     * digest copy goes to each of them. */
     member_table_t digest_copy;
     int have_digest = 0;
-    struct sockaddr_storage digest_to;
+    struct sockaddr_storage digest_to[4];
+    int n_digest = 0;
     if (cycle % 2 == 0) {
-        member_t *d = member_random_peer(&g_table, g_self_id);
-        if (d) {
-            digest_to = d->addr;
+        int n_peers = 0;
+        for (int i = 0; i < g_table.count; i++) {
+            if (strcmp(g_table.members[i].id, g_self_id) == 0) continue;
+            if (g_table.members[i].state == MEMBER_DEAD) continue;
+            n_peers++;
+        }
+        int fanout = member_gossip_fanout(n_peers);
+        for (int tries = 0; tries < 8 && n_digest < fanout; tries++) {
+            member_t *d = member_random_peer(&g_table, g_self_id);
+            if (!d) break;
+            int dup = 0;
+            for (int j = 0; j < n_digest; j++) {
+                if (pulse_addr_equal(&digest_to[j], &d->addr)) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup) continue;
+            digest_to[n_digest++] = d->addr;
+        }
+        if (n_digest > 0) {
             digest_copy = g_table;
             have_digest = 1;
         }
@@ -597,9 +621,11 @@ static void probe_cycle(int cycle) {
         log_line("DEAD %s", newly_dead[i]);
     for (int i = 0; i < n_gc; i++)
         log_line("GC %s", gc_ids[i]);
-    if (have_digest)
-        gossip_send_digest(g_send_sock, &digest_to, g_self_id, g_incarnation,
-                           &digest_copy);
+    if (have_digest) {
+        for (int i = 0; i < n_digest; i++)
+            gossip_send_digest(g_send_sock, &digest_to[i], g_self_id,
+                               g_incarnation, &digest_copy);
+    }
     if (cycle % 10 == 0) {
         log_line("STATUS alive=%d suspect=%d dead=%d total=%d", st_alive,
                  st_suspect, st_dead, st_alive + st_suspect + st_dead);

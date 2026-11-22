@@ -363,6 +363,24 @@ member_t *member_random_peer(member_table_t *t, const char *self_id) {
     return &t->members[idx[rand() % n]];
 }
 
+/* Gossip fanout: how many distinct peers receive a digest each gossip
+ * round. One peer is enough for a tiny cluster, but gossip only
+ * spreads in O(log n) rounds when each round reaches O(log n) peers,
+ * so the fanout grows as 1 + floor(log2(peer_count)) and caps at 4 to
+ * bound traffic on large clusters: 0-1 peers -> 1, 2-3 -> 2, 4-7 -> 3,
+ * 8+ -> 4. */
+int member_gossip_fanout(int peer_count) {
+    if (peer_count <= 1) return 1;
+    int f = 1;
+    int n = peer_count;
+    while (n > 1) {
+        f++;
+        n >>= 1;
+    }
+    if (f > 4) f = 4;
+    return f;
+}
+
 const char *member_state_name(member_state_t s) {
     switch (s) {
         case MEMBER_ALIVE: return "ALIVE";
