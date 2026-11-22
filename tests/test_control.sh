@@ -2,7 +2,8 @@
 # Integration test for the TCP control plane: real nodes over localhost
 # UDP, queried over TCP with pulse-ctl.
 #  1. One node: MEMBERS lists itself, STATUS reports id and total=1,
-#     unknown commands and bad LEAVE usage get clean ERR lines.
+#     METRICS reports zero counts and no latency samples yet, unknown
+#     commands and bad LEAVE usage get clean ERR lines.
 #  2. A second node joins; MEMBERS on the first lists both.
 #  3. LEAVE the second node on the first: OK, and it is gone from the
 #     first node's listing immediately. (It is alive, so direct contact
@@ -11,7 +12,8 @@
 #     it; otherwise there would be no peer for the first node to mark
 #     DEAD.)
 #  4. LEAVE of an unknown id and of self are rejected cleanly.
-#  5. Kill the second node; once the first marks it DEAD, LEAVE removes
+#  5. Kill the second node; once the first marks it DEAD, METRICS
+#     reports the detection with measured latencies, and LEAVE removes
 #     it for good — it stays gone, because a dead member cannot refute.
 set -u
 
@@ -78,6 +80,18 @@ if echo "$status" | grep -q "STATUS id=127.0.0.1:17401 .* total=1"; then
 else
     note fail "STATUS reports id and total=1"
     echo "--- ctl output:"; echo "$status"
+fi
+
+# METRICS on a fresh node: no transitions yet, so the latency groups
+# have no samples.
+metrics="$(ctl 18401 METRICS)"
+if echo "$metrics" | grep -q "METRICS suspected=0 dead=0" \
+   && echo "$metrics" | grep -q "detect_latency_ms mean=- max=- samples=0" \
+   && echo "$metrics" | grep -q "^END$"; then
+    note ok "METRICS on a fresh node reports zero counts and no samples"
+else
+    note fail "METRICS on a fresh node reports zero counts and no samples"
+    echo "--- ctl output:"; echo "$metrics"
 fi
 
 # Unknown command and bad LEAVE usage get clean ERR lines.
@@ -168,6 +182,19 @@ if wait_for "$TMP/n1.log" "DEAD 127.0.0.1:17402" 6; then
     note ok "killed node is marked DEAD"
 else
     note fail "killed node is marked DEAD"
+fi
+# METRICS on the survivor: it detected the kill itself, so it has one
+# suspected and one dead transition, each with a measured latency, and
+# it saw the second node join.
+metrics="$(ctl 18401 METRICS)"
+if echo "$metrics" | grep -qE "suspected=[1-9][0-9]* dead=[1-9][0-9]*" \
+   && echo "$metrics" | grep -qE "detect_latency_ms mean=[0-9]+ max=[0-9]+ samples=[1-9][0-9]*" \
+   && echo "$metrics" | grep -qE "suspect_to_dead_ms mean=[0-9]+ max=[0-9]+ samples=[1-9][0-9]*" \
+   && echo "$metrics" | grep -qE "joins=[1-9][0-9]*"; then
+    note ok "METRICS reports the detected kill with measured latencies"
+else
+    note fail "METRICS reports the detected kill with measured latencies"
+    echo "--- ctl output:"; echo "$metrics"
 fi
 if [ "$(ctl 18401 LEAVE 127.0.0.1:17402)" = "OK 127.0.0.1:17402" ]; then
     note ok "LEAVE returns OK for the dead member"

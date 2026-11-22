@@ -2,12 +2,12 @@ CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g -Isrc
 LDFLAGS ?= -pthread -lm
 
-NODE_SRC = src/node.c src/member.c src/gossip.c src/phi.c src/secret.c src/control.c
-HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h
+NODE_SRC = src/node.c src/member.c src/gossip.c src/phi.c src/secret.c src/control.c src/metrics.c
+HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h src/metrics.h
 
 .PHONY: all test clean
 
-all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip
+all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics
 
 pulse-node: $(NODE_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $(NODE_SRC) $(LDFLAGS)
@@ -30,12 +30,16 @@ test_ipv6: tests/test_ipv6.c src/member.c src/phi.c src/gossip.c src/secret.c sr
 test_gossip: tests/test_gossip.c src/member.c src/phi.c src/gossip.c src/secret.c src/member.h src/phi.h src/gossip.h src/secret.h
 	$(CC) $(CFLAGS) -o $@ tests/test_gossip.c src/member.c src/phi.c src/gossip.c src/secret.c $(LDFLAGS)
 
-test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip
+test_metrics: tests/test_metrics.c src/metrics.c src/metrics.h
+	$(CC) $(CFLAGS) -o $@ tests/test_metrics.c src/metrics.c $(LDFLAGS)
+
+test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics
 	./test_member
 	./test_phi
 	./test_secret
 	./test_ipv6
 	./test_gossip
+	./test_metrics
 	bash tests/test_cluster.sh
 	bash tests/test_gc.sh
 	bash tests/test_rejoin.sh
@@ -45,4 +49,4 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_ipv6.sh
 
 clean:
-	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip
+	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics

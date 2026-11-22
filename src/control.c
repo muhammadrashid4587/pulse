@@ -115,6 +115,15 @@ static void handle_status(int fd, const control_hooks_t *hooks) {
     send_all(fd, line);
 }
 
+static void handle_metrics(int fd, const control_hooks_t *hooks) {
+    pulse_metrics_t m;
+    hooks->metrics(hooks->ctx, &m);
+    char line[512];
+    metrics_format(&m, line, sizeof line);
+    if (send_all(fd, line) != 0) return;
+    send_all(fd, "\nEND\n");
+}
+
 static void handle_leave(int fd, const control_hooks_t *hooks,
                          const char *arg) {
     if (!arg || arg[0] == '\0') {
@@ -155,6 +164,8 @@ static void handle_connection(int fd, const control_hooks_t *hooks) {
         handle_status(fd, hooks);
     } else if (strcmp(line, "LEAVE") == 0) {
         handle_leave(fd, hooks, arg);
+    } else if (strcmp(line, "METRICS") == 0) {
+        handle_metrics(fd, hooks);
     } else {
         send_all(fd, "ERR unknown command\n");
     }

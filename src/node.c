@@ -28,6 +28,7 @@
 
 #include "gossip.h"
 #include "member.h"
+#include "metrics.h"
 #include "phi.h"
 #include "secret.h"
 #include "control.h"
@@ -87,6 +88,7 @@ static int g_send_sock = -1; /* dedicated sending socket (see main) */
 static int g_control_sock = -1; /* TCP control plane listen socket */
 static int g_family = AF_INET; /* address family of this node */
 static control_hooks_t g_hooks;
+static pulse_metrics_t g_metrics;
 static int64_t g_start_ms = 0;
 static volatile sig_atomic_t g_stop = 0;
 static uint32_t g_seq = 1;
@@ -153,6 +155,7 @@ static void note_contact(const gmsg_t *msg,
     is_new = member_find(&g_table, msg->from_id) == NULL;
     revived = member_mark_alive(&g_table, msg->from_id, addr,
                                 msg->from_inc, pulse_now_ms());
+    if (is_new) metrics_note_join(&g_metrics);
     pthread_mutex_unlock(&g_lock);
     if (is_new) {
         log_line("JOIN %s", msg->from_id);
@@ -258,13 +261,29 @@ static void handle_message(const gmsg_t *msg) {
             int is_new = member_find(&g_table, msg->from_id) == NULL;
             int revived = member_mark_alive(&g_table, msg->from_id, &from_addr,
                                             msg->from_inc, pulse_now_ms());
+            if (is_new) metrics_note_join(&g_metrics);
             for (int i = 0; i < msg->entry_count; i++) {
                 const member_t *e = &msg->entries[i];
                 member_t *before = member_find(&g_table, e->id);
                 member_state_t prev = before ? before->state : MEMBER_ALIVE;
                 int r = member_merge(&g_table, g_self_id, e->id, &e->addr,
                                      e->incarnation, e->state, pulse_now_ms());
-                if (r & MERGE_SELF_SUSPECTED) refute = 1;
+                if ((r & MERGE_SELF_SUSPECTED) && !refute) {
+                    refute = 1;
+                    metrics_note_refute(&g_metrics);
+                }
+                if (r & MERGE_NEW) metrics_note_join(&g_metrics);
+                if (r & MERGE_CHANGED) {
+                    /* A transition learned from gossip: count it, but
+                     * there is no local latency to measure. */
+                    member_t *after = member_find(&g_table, e->id);
+                    if (after && after->state != prev) {
+                        if (after->state == MEMBER_SUSPECT)
+                            metrics_note_suspect(&g_metrics, -1);
+                        else if (after->state == MEMBER_DEAD)
+                            metrics_note_dead(&g_metrics, -1);
+                    }
+                }
                 if ((r & MERGE_NEW) && new_count < 8) {
                     snprintf(new_ids[new_count], PULSE_ID_LEN, "%s", e->id);
                     new_count++;
@@ -521,12 +540,18 @@ static void probe_cycle(int cycle) {
             }
         }
     }
-    /* Mark suspects now, while holding the lock. */
+    /* Mark suspects now, while holding the lock. Detection latency is
+     * measured from the peer's last direct contact to now; a gossip
+     * suspicion has no local heartbeat to measure against, so the
+     * gossip path records -1 instead (see the GOSSIP handler). */
     int changed_idx[8];
     int n_changed = 0;
     for (int i = 0; i < n_suspect; i++) {
+        member_t *m = member_find(&g_table, suspect_ids[i]);
+        int64_t latency = m ? now - m->last_seen_ms : -1;
         if (member_mark_suspect(&g_table, suspect_ids[i], now)) {
             changed_idx[n_changed++] = i;
+            metrics_note_suspect(&g_metrics, latency);
         }
     }
     /* 3. Sweep stale suspects to dead. */
@@ -536,9 +561,13 @@ static void probe_cycle(int cycle) {
         member_t *m = &g_table.members[i];
         if (m->state == MEMBER_SUSPECT &&
             now - m->state_since_ms >= g_cfg.suspect_timeout_ms) {
-            if (member_mark_dead(&g_table, m->id, now) && n_dead < 8) {
-                snprintf(newly_dead[n_dead], PULSE_ID_LEN, "%s", m->id);
-                n_dead++;
+            int64_t duration = now - m->state_since_ms;
+            if (member_mark_dead(&g_table, m->id, now)) {
+                metrics_note_dead(&g_metrics, duration);
+                if (n_dead < 8) {
+                    snprintf(newly_dead[n_dead], PULSE_ID_LEN, "%s", m->id);
+                    n_dead++;
+                }
             }
         }
     }
@@ -638,6 +667,13 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
     (void)ctx;
     pthread_mutex_lock(&g_lock);
     *out = g_table;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void metrics_hook(void *ctx, pulse_metrics_t *out) {
+    (void)ctx;
+    pthread_mutex_lock(&g_lock);
+    *out = g_metrics;
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -895,6 +931,7 @@ int main(int argc, char **argv) {
     }
 
     member_table_init(&g_table);
+    metrics_init(&g_metrics);
     /* The address stored for self is the one the id advertises: peers
      * already reply to the advertised id, so the table entry should
      * agree with it. (An unparseable --id falls back to loopback.) */
@@ -969,6 +1006,7 @@ int main(int argc, char **argv) {
         }
         g_hooks.ctx = NULL;
         g_hooks.snapshot = snapshot_hook;
+        g_hooks.metrics = metrics_hook;
         g_hooks.force_leave = force_leave_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
         g_hooks.self_id = g_self_id;

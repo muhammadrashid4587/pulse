@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "member.h"
+#include "metrics.h"
 
 /* TCP control plane for pulse-node: a tiny line-based protocol on a
  * separate TCP port, one command per connection, plain text in and out
@@ -25,6 +26,16 @@
  *       member refutes by bumping its incarnation and comes back.
  *       Unknown member: ERR unknown member <id>. Self: ERR cannot
  *       leave self. Missing id: ERR usage: LEAVE <member-id>.
+ *   METRICS
+ *       One line of failure-detector metrics, then END:
+ *       METRICS suspected=N dead=N refutes=N joins=N
+ *           detect_latency_ms mean=X max=Y samples=N
+ *           suspect_to_dead_ms mean=X max=Y samples=N
+ *       detect_latency_ms is last-direct-contact -> SUSPECT for
+ *       suspicions this node detected itself (mean/max in ms, "-" when
+ *       there are no samples); suspect_to_dead_ms is SUSPECT -> DEAD.
+ *       Transitions learned from gossip bump the counts but add no
+ *       latency sample, so samples can be smaller than the counts.
  *   anything else
  *       ERR unknown command
  *
@@ -42,6 +53,8 @@ typedef struct {
     /* Force-remove a member. Returns 1 if removed, 0 if the member is
      * unknown, -1 if the id is this node itself. */
     int (*force_leave)(void *ctx, const char *id);
+    /* Copy the failure-detector metrics into out (hook locks as needed). */
+    void (*metrics)(void *ctx, pulse_metrics_t *out);
     /* 1 when phi-accrual suspicion is on (phi values are meaningful). */
     int (*phi_enabled)(void *ctx);
     const char *self_id;
