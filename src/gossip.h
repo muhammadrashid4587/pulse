@@ -21,9 +21,19 @@
  *   PING_REQ <seq> <target-id> <from-id>
  *   JOIN <from-id> <from-inc>
  *   GOSSIP <from-id> <from-inc> <count> <id:inc:state> ...
+ *   SYNC <from-id> <from-inc> <count> <id:inc:state> ...
  *
  * State codes in gossip entries: A alive, S suspect, D dead.
  * Member ids are always "host:port", so a gossip entry is self-contained.
+ *
+ * SYNC is the anti-entropy message: unlike GOSSIP, which carries a
+ * 16-entry digest (urgent entries first, then a random window), SYNC
+ * carries the sender's whole membership table, so a peer that missed
+ * many incremental digests converges in one exchange instead of waiting
+ * for the random window to rotate the missing entries through. A node
+ * that receives a SYNC answers with its own full table, so one exchange
+ * converges both sides. Entries use the same "id:inc:state" encoding
+ * and the same merge rule as GOSSIP.
  *
  * When a shared secret is configured (gossip_set_secret), every message
  * carries a trailing " <tag>" token: the first 8 bytes of
@@ -39,6 +49,7 @@ typedef enum {
     GMSG_PING_REQ,
     GMSG_JOIN,
     GMSG_GOSSIP,
+    GMSG_SYNC,
     GMSG_UNKNOWN
 } gmsg_type_t;
 
@@ -83,5 +94,17 @@ int gossip_send_join(int sock, const struct sockaddr_storage *to,
 int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                        const char *from_id, uint32_t inc,
                        const member_table_t *t);
+/* Send the sender's whole membership table (anti-entropy SYNC): every
+ * table entry, then tombstones as DEAD while there is room, in table
+ * order — no 16-entry cap, no prioritization, no random window. One
+ * datagram holds at most PULSE_MAX_MSG bytes, so a table of long ids
+ * (a full 64-member IPv6 table) does not fit in one SYNC: the entries
+ * start at a rotating offset that advances by the number sent, so
+ * successive SYNCs walk the whole table and a stale peer still
+ * converges within a couple of exchanges. Returns 0 on success (or
+ * when the table is empty and nothing is sent), -1 on send failure. */
+int gossip_send_full_table(int sock, const struct sockaddr_storage *to,
+                           const char *from_id, uint32_t inc,
+                           const member_table_t *t);
 
 #endif

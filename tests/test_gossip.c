@@ -50,9 +50,13 @@ static const char *id_at(int i) {
     return id;
 }
 
-/* Send one digest of t to a loopback receiver and parse it back.
- * Returns the parsed entry count, or -1 if nothing arrived. */
-static int digest_roundtrip(const member_table_t *t, gmsg_t *out) {
+/* Send one message (digest or full table) from t to a loopback
+ * receiver and parse it back. Returns the parsed entry count, or -1
+ * if nothing arrived. */
+typedef int (*send_fn_t)(int, const struct sockaddr_storage *,
+                         const char *, uint32_t, const member_table_t *);
+static int msg_roundtrip(send_fn_t send_fn, const member_table_t *t,
+                         gmsg_t *out) {
     int recv_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (recv_sock < 0) return -1;
     struct sockaddr_in bind_addr;
@@ -94,7 +98,7 @@ static int digest_roundtrip(const member_table_t *t, gmsg_t *out) {
         close(recv_sock);
         return -1;
     }
-    int rc = gossip_send_digest(send_sock, &dest, "127.0.0.1:17999", 1, t);
+    int rc = send_fn(send_sock, &dest, "127.0.0.1:17999", 1, t);
     if (rc != 0) {
         close(send_sock);
         close(recv_sock);
@@ -125,7 +129,7 @@ int main(void) {
         member_table_t t;
         build_table(&t, 3);
         member_mark_suspect(&t, id_at(1), 1000);
-        int n = digest_roundtrip(&t, &msg);
+        int n = msg_roundtrip(gossip_send_digest, &t, &msg);
         CHECK(n == 3);
         CHECK(msg.type == GMSG_GOSSIP);
         CHECK(strcmp(msg.entries[0].id, id_at(1)) == 0);
@@ -146,7 +150,7 @@ int main(void) {
         member_mark_dead(&t, id_at(3), 1200);    /* D: DEAD @1200 */
         member_mark_suspect(&t, id_at(4), 1800); /* E: SUSPECT @1800 */
         member_mark_dead(&t, id_at(5), 1100);    /* F: DEAD @1100 */
-        int n = digest_roundtrip(&t, &msg);
+        int n = msg_roundtrip(gossip_send_digest, &t, &msg);
         CHECK(n == PULSE_GOSSIP_ENTRIES);
         /* Expected lead order: B(2000), E(1800), C(1500), D(1200). */
         CHECK(strcmp(msg.entries[0].id, id_at(1)) == 0);
@@ -172,7 +176,7 @@ int main(void) {
         member_mark_suspect(&t, id_at(0), 5000);
         member_mark_suspect(&t, id_at(1), 5000);
         member_mark_dead(&t, id_at(1), 5000);
-        int n = digest_roundtrip(&t, &msg);
+        int n = msg_roundtrip(gossip_send_digest, &t, &msg);
         CHECK(n == 3);
         CHECK(strcmp(msg.entries[0].id, id_at(1)) == 0);
         CHECK(msg.entries[0].state == MEMBER_DEAD);
@@ -185,7 +189,7 @@ int main(void) {
     {
         member_table_t t;
         build_table(&t, 20);
-        int n = digest_roundtrip(&t, &msg);
+        int n = msg_roundtrip(gossip_send_digest, &t, &msg);
         CHECK(n == PULSE_GOSSIP_ENTRIES);
         for (int i = 0; i < msg.entry_count; i++) {
             CHECK(msg.entries[i].state == MEMBER_ALIVE);
@@ -202,7 +206,7 @@ int main(void) {
         member_mark_dead(&t, id_at(1), 1000);
         member_force_remove(&t, id_at(1), 2000);
         CHECK(t.tombstone_count == 1);
-        int n = digest_roundtrip(&t, &msg);
+        int n = msg_roundtrip(gossip_send_digest, &t, &msg);
         CHECK(n == 3); /* 2 live members + 1 tombstone */
         int idx = has_entry(&msg, id_at(1));
         CHECK(idx >= 0);
@@ -225,6 +229,128 @@ int main(void) {
                                  &t) == 0);
         close(send_sock);
         close(recv_sock);
+    }
+
+    /* Anti-entropy: a SYNC carries the whole table, not a 16-entry
+     * digest — a 20-member table arrives in full, in table order. */
+    {
+        member_table_t t;
+        build_table(&t, 20);
+        member_mark_suspect(&t, id_at(2), 1000);
+        member_mark_dead(&t, id_at(5), 2000);
+        int n = msg_roundtrip(gossip_send_full_table, &t, &msg);
+        CHECK(n == 20);
+        CHECK(msg.type == GMSG_SYNC);
+        for (int i = 0; i < 20; i++)
+            CHECK(has_entry(&msg, id_at(i)) >= 0);
+        int idx = has_entry(&msg, id_at(2));
+        CHECK(idx >= 0 && msg.entries[idx].state == MEMBER_SUSPECT);
+        idx = has_entry(&msg, id_at(5));
+        CHECK(idx >= 0 && msg.entries[idx].state == MEMBER_DEAD);
+    }
+
+    /* A stale node converges to the full table after one SYNC exchange:
+     * the receiver knows only 5 of 20 members, one at a lower
+     * incarnation, one with a stale state — after merging the parsed
+     * SYNC entries it holds all 20 with the sender's states. */
+    {
+        member_table_t sender, receiver;
+        build_table(&sender, 20);
+        member_mark_suspect(&sender, id_at(2), 1000);
+        member_mark_dead(&sender, id_at(5), 2000);
+        /* One member rejoined at a higher incarnation: the stale
+         * receiver holds the old one. */
+        member_t *m = member_find(&sender, id_at(7));
+        m->incarnation = 3;
+        build_table(&receiver, 5);
+        member_mark_suspect(&receiver, id_at(2), 500);
+        int n = msg_roundtrip(gossip_send_full_table, &sender, &msg);
+        CHECK(n == 20);
+        CHECK(msg.type == GMSG_SYNC);
+        /* Merge exactly as the node does on receipt. */
+        for (int i = 0; i < msg.entry_count; i++) {
+            const member_t *e = &msg.entries[i];
+            member_merge(&receiver, "127.0.0.1:17998", e->id, &e->addr,
+                         e->incarnation, e->state, 5000);
+        }
+        CHECK(receiver.count == 20);
+        for (int i = 0; i < 20; i++) {
+            member_t *got = member_find(&receiver, id_at(i));
+            member_t *want = member_find(&sender, id_at(i));
+            CHECK(got != NULL);
+            if (got && want) {
+                CHECK(got->state == want->state);
+                CHECK(got->incarnation == want->incarnation);
+            }
+        }
+    }
+
+    /* A tombstone still rides along in a SYNC as a DEAD entry. */
+    {
+        member_table_t t;
+        build_table(&t, 3);
+        member_mark_dead(&t, id_at(1), 1000);
+        member_force_remove(&t, id_at(1), 2000);
+        CHECK(t.tombstone_count == 1);
+        int n = msg_roundtrip(gossip_send_full_table, &t, &msg);
+        CHECK(n == 3); /* 2 live members + 1 tombstone */
+        int idx = has_entry(&msg, id_at(1));
+        CHECK(idx >= 0);
+        CHECK(msg.entries[idx].state == MEMBER_DEAD);
+    }
+
+    /* An empty table sends no SYNC either. */
+    {
+        member_table_t t;
+        member_table_init(&t);
+        int send_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_storage dest;
+        memset(&dest, 0, sizeof dest);
+        struct sockaddr_in *d4 = (struct sockaddr_in *)&dest;
+        d4->sin_family = AF_INET;
+        d4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        d4->sin_port = htons(1);
+        CHECK(gossip_send_full_table(send_sock, &dest, "127.0.0.1:17999",
+                                     1, &t) == 0);
+        close(send_sock);
+    }
+
+    /* A table too big for one datagram rotates: a 64-member table of
+     * long IPv6 ids does not fit in a single SYNC, but two consecutive
+     * SYNCs cover every member between them, with no entry sent twice
+     * in one message. */
+    {
+        member_table_t t;
+        member_table_init(&t);
+        char id[PULSE_ID_LEN];
+        for (int i = 0; i < 64; i++) {
+            snprintf(id, sizeof id, "[2001:db8::%x]:%d", i + 1,
+                     18000 + i);
+            struct sockaddr_storage a = addr_of(id);
+            member_add(&t, id, &a, 1);
+        }
+        CHECK(t.count == 64);
+        gmsg_t first, second;
+        int n1 = msg_roundtrip(gossip_send_full_table, &t, &first);
+        int n2 = msg_roundtrip(gossip_send_full_table, &t, &second);
+        CHECK(n1 > 0 && n1 < 64); /* truncated: the table is too big */
+        CHECK(n2 > 0 && n2 < 64);
+        for (int i = 0; i < first.entry_count; i++) {
+            for (int j = i + 1; j < first.entry_count; j++) {
+                CHECK(strcmp(first.entries[i].id,
+                             first.entries[j].id) != 0);
+            }
+        }
+        /* Union of the two exchanges covers the whole table. */
+        int seen = 0;
+        for (int i = 0; i < 64; i++) {
+            snprintf(id, sizeof id, "[2001:db8::%x]:%d", i + 1,
+                     18000 + i);
+            if (has_entry(&first, id) >= 0 ||
+                has_entry(&second, id) >= 0)
+                seen++;
+        }
+        CHECK(seen == 64);
     }
 
     if (failures == 0) {

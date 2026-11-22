@@ -56,6 +56,8 @@ typedef struct {
     int phi_accrual;           /* suspect on phi instead of fixed timeouts */
     double phi_threshold;      /* phi at which a peer is suspected */
     int control_port;          /* TCP control plane port, -1 = disabled */
+    int sync_interval_ms;      /* how often to exchange full tables
+                                  (anti-entropy SYNC) with a random peer */
     char secret[PULSE_SECRET_MAX]; /* shared secret for joins, "" = none */
     int ipv6;                  /* use IPv6 (bind ::, ids are "[::1]:port") */
     char bind_host[128];       /* bind address override, "" = wildcard */
@@ -165,6 +167,102 @@ static void note_contact(const gmsg_t *msg,
     }
 }
 
+/* Merge a membership message into the table: a GOSSIP digest or a SYNC
+ * full table — the entries merge the same way (higher incarnation wins;
+ * DEAD > SUSPECT > ALIVE at equal incarnation). The sender is alive by
+ * direct contact. A SYNC is answered with our own full table, so one
+ * exchange converges both sides; a GOSSIP gets no reply, the periodic
+ * digest round is one-way. */
+static void handle_membership_msg(const gmsg_t *msg,
+                                  const struct sockaddr_storage *from_addr,
+                                  int reply_sync) {
+    int refute = 0;
+    char new_ids[8][PULSE_ID_LEN];
+    int new_count = 0;
+    /* State transitions learned from gossip (e.g. a peer's digest
+     * says a member is DEAD, or a restarted member is ALIVE again
+     * at a higher incarnation). Logged after unlock, like JOINs. */
+    char changed_ids[8][PULSE_ID_LEN];
+    member_state_t changed_states[8];
+    int changed_count = 0;
+    pthread_mutex_lock(&g_lock);
+    int is_new = member_find(&g_table, msg->from_id) == NULL;
+    int revived = member_mark_alive(&g_table, msg->from_id, from_addr,
+                                    msg->from_inc, pulse_now_ms());
+    if (is_new) metrics_note_join(&g_metrics);
+    for (int i = 0; i < msg->entry_count; i++) {
+        const member_t *e = &msg->entries[i];
+        member_t *before = member_find(&g_table, e->id);
+        member_state_t prev = before ? before->state : MEMBER_ALIVE;
+        int r = member_merge(&g_table, g_self_id, e->id, &e->addr,
+                             e->incarnation, e->state, pulse_now_ms());
+        if ((r & MERGE_SELF_SUSPECTED) && !refute) {
+            refute = 1;
+            metrics_note_refute(&g_metrics);
+        }
+        if (r & MERGE_NEW) metrics_note_join(&g_metrics);
+        if (r & MERGE_CHANGED) {
+            /* A transition learned from gossip: count it, but
+             * there is no local latency to measure. */
+            member_t *after = member_find(&g_table, e->id);
+            if (after && after->state != prev) {
+                if (after->state == MEMBER_SUSPECT)
+                    metrics_note_suspect(&g_metrics, -1);
+                else if (after->state == MEMBER_DEAD)
+                    metrics_note_dead(&g_metrics, -1);
+            }
+        }
+        if ((r & MERGE_NEW) && new_count < 8) {
+            snprintf(new_ids[new_count], PULSE_ID_LEN, "%s", e->id);
+            new_count++;
+        }
+        if ((r & MERGE_CHANGED) && changed_count < 8) {
+            member_t *after = member_find(&g_table, e->id);
+            if (after && after->state != prev) {
+                snprintf(changed_ids[changed_count], PULSE_ID_LEN,
+                         "%s", e->id);
+                changed_states[changed_count] = after->state;
+                changed_count++;
+            }
+        }
+    }
+    if (refute) {
+        g_incarnation++;
+        save_incarnation(g_cfg.data_dir, g_incarnation + 1);
+        member_t *self = member_find(&g_table, g_self_id);
+        if (self) self->incarnation = g_incarnation;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (is_new) {
+        log_line("JOIN %s", msg->from_id);
+    } else if (revived) {
+        log_line("ALIVE %s", msg->from_id);
+    }
+    for (int i = 0; i < new_count; i++)
+        log_line("JOIN %s", new_ids[i]);
+    for (int i = 0; i < changed_count; i++) {
+        if (changed_states[i] == MEMBER_DEAD)
+            log_line("DEAD %s", changed_ids[i]);
+        else if (changed_states[i] == MEMBER_ALIVE)
+            log_line("ALIVE %s", changed_ids[i]);
+        else
+            log_line("SUSPECT %s", changed_ids[i]);
+    }
+    if (refute)
+        log_line("REFUTE %s inc=%u", g_self_id, g_incarnation);
+    if (reply_sync) {
+        /* Answer a full table with our own, so the exchange converges
+         * both sides in one round trip. Sent from a snapshot taken
+         * under the lock, like the JOIN reply. */
+        member_table_t copy;
+        pthread_mutex_lock(&g_lock);
+        copy = g_table;
+        pthread_mutex_unlock(&g_lock);
+        gossip_send_full_table(g_send_sock, from_addr, g_self_id,
+                               g_incarnation, &copy);
+    }
+}
+
 static void handle_message(const gmsg_t *msg) {
     /* Reply to the address the sender ADVERTISES in its id
      * (e.g. 127.0.0.1:17102), not the datagram's source address. A node's
@@ -248,83 +346,13 @@ static void handle_message(const gmsg_t *msg) {
             break;
         }
 
-        case GMSG_GOSSIP: {
-            int refute = 0;
-            char new_ids[8][PULSE_ID_LEN];
-            int new_count = 0;
-            /* State transitions learned from gossip (e.g. a peer's digest
-             * says a member is DEAD, or a restarted member is ALIVE again
-             * at a higher incarnation). Logged after unlock, like JOINs. */
-            char changed_ids[8][PULSE_ID_LEN];
-            member_state_t changed_states[8];
-            int changed_count = 0;
-            pthread_mutex_lock(&g_lock);
-            int is_new = member_find(&g_table, msg->from_id) == NULL;
-            int revived = member_mark_alive(&g_table, msg->from_id, &from_addr,
-                                            msg->from_inc, pulse_now_ms());
-            if (is_new) metrics_note_join(&g_metrics);
-            for (int i = 0; i < msg->entry_count; i++) {
-                const member_t *e = &msg->entries[i];
-                member_t *before = member_find(&g_table, e->id);
-                member_state_t prev = before ? before->state : MEMBER_ALIVE;
-                int r = member_merge(&g_table, g_self_id, e->id, &e->addr,
-                                     e->incarnation, e->state, pulse_now_ms());
-                if ((r & MERGE_SELF_SUSPECTED) && !refute) {
-                    refute = 1;
-                    metrics_note_refute(&g_metrics);
-                }
-                if (r & MERGE_NEW) metrics_note_join(&g_metrics);
-                if (r & MERGE_CHANGED) {
-                    /* A transition learned from gossip: count it, but
-                     * there is no local latency to measure. */
-                    member_t *after = member_find(&g_table, e->id);
-                    if (after && after->state != prev) {
-                        if (after->state == MEMBER_SUSPECT)
-                            metrics_note_suspect(&g_metrics, -1);
-                        else if (after->state == MEMBER_DEAD)
-                            metrics_note_dead(&g_metrics, -1);
-                    }
-                }
-                if ((r & MERGE_NEW) && new_count < 8) {
-                    snprintf(new_ids[new_count], PULSE_ID_LEN, "%s", e->id);
-                    new_count++;
-                }
-                if ((r & MERGE_CHANGED) && changed_count < 8) {
-                    member_t *after = member_find(&g_table, e->id);
-                    if (after && after->state != prev) {
-                        snprintf(changed_ids[changed_count], PULSE_ID_LEN,
-                                 "%s", e->id);
-                        changed_states[changed_count] = after->state;
-                        changed_count++;
-                    }
-                }
-            }
-            if (refute) {
-                g_incarnation++;
-                save_incarnation(g_cfg.data_dir, g_incarnation + 1);
-                member_t *self = member_find(&g_table, g_self_id);
-                if (self) self->incarnation = g_incarnation;
-            }
-            pthread_mutex_unlock(&g_lock);
-            if (is_new) {
-                log_line("JOIN %s", msg->from_id);
-            } else if (revived) {
-                log_line("ALIVE %s", msg->from_id);
-            }
-            for (int i = 0; i < new_count; i++)
-                log_line("JOIN %s", new_ids[i]);
-            for (int i = 0; i < changed_count; i++) {
-                if (changed_states[i] == MEMBER_DEAD)
-                    log_line("DEAD %s", changed_ids[i]);
-                else if (changed_states[i] == MEMBER_ALIVE)
-                    log_line("ALIVE %s", changed_ids[i]);
-                else
-                    log_line("SUSPECT %s", changed_ids[i]);
-            }
-            if (refute)
-                log_line("REFUTE %s inc=%u", g_self_id, g_incarnation);
+        case GMSG_GOSSIP:
+            handle_membership_msg(msg, &from_addr, 0);
             break;
-        }
+
+        case GMSG_SYNC:
+            handle_membership_msg(msg, &from_addr, 1);
+            break;
 
         case GMSG_UNKNOWN:
             break;
@@ -622,6 +650,28 @@ static void probe_cycle(int cycle) {
             have_digest = 1;
         }
     }
+    /* 4b. Anti-entropy: every sync_interval, exchange full tables with
+     * one random peer, so a node that missed many digests converges
+     * instead of waiting for the random window to rotate the missing
+     * entries through. The peer answers with its own full table, so
+     * one exchange converges both sides. */
+    member_table_t sync_copy;
+    struct sockaddr_storage sync_to;
+    char sync_id[PULSE_ID_LEN];
+    int have_sync = 0;
+    {
+        int sync_every = g_cfg.sync_interval_ms / g_cfg.probe_interval_ms;
+        if (sync_every < 1) sync_every = 1;
+        if (cycle % sync_every == 0) {
+            member_t *s = member_random_peer(&g_table, g_self_id);
+            if (s) {
+                sync_to = s->addr;
+                snprintf(sync_id, sizeof sync_id, "%s", s->id);
+                sync_copy = g_table;
+                have_sync = 1;
+            }
+        }
+    }
     /* 5. Periodic STATUS line. */
     int st_alive = 0, st_suspect = 0, st_dead = 0;
     if (cycle % 10 == 0) {
@@ -665,6 +715,11 @@ static void probe_cycle(int cycle) {
         for (int i = 0; i < n_digest; i++)
             gossip_send_digest(g_send_sock, &digest_to[i], g_self_id,
                                g_incarnation, &digest_copy);
+    }
+    if (have_sync) {
+        gossip_send_full_table(g_send_sock, &sync_to, g_self_id,
+                               g_incarnation, &sync_copy);
+        log_line("SYNC %s", sync_id);
     }
     if (cycle % 10 == 0) {
         log_line("STATUS alive=%d suspect=%d dead=%d total=%d", st_alive,
@@ -735,6 +790,7 @@ static void usage(const char *prog) {
             "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
             "       [--dead-retention SECONDS]\n"
             "       [--phi-accrual] [--phi-threshold N]\n"
+            "       [--sync-interval-ms N]\n"
             "       [--control-port PORT]\n"
             "       [--secret SECRET | --shared-secret SECRET]\n"
             "       [--ipv6] [--bind HOST]\n",
@@ -751,6 +807,7 @@ int main(int argc, char **argv) {
     g_cfg.dead_retention_ms = 60000; /* 60 s */
     g_cfg.phi_accrual = 0;
     g_cfg.phi_threshold = 8.0;
+    g_cfg.sync_interval_ms = 10000; /* anti-entropy full-table exchange */
     g_cfg.control_port = -1; /* disabled unless --control-port is given */
 
     for (int i = 1; i < argc; i++) {
@@ -787,6 +844,12 @@ int main(int argc, char **argv) {
             g_cfg.phi_threshold = atof(argv[++i]);
             if (g_cfg.phi_threshold <= 0) {
                 fprintf(stderr, "--phi-threshold must be a positive number\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--sync-interval-ms") == 0 && i + 1 < argc) {
+            g_cfg.sync_interval_ms = atoi(argv[++i]);
+            if (g_cfg.sync_interval_ms <= 0) {
+                fprintf(stderr, "--sync-interval-ms must be a positive number of milliseconds\n");
                 return 2;
             }
         } else if (strcmp(argv[i], "--control-port") == 0 && i + 1 < argc) {

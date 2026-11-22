@@ -58,6 +58,11 @@ building block, not a production service mesh.
   them on startup, so a restarted node re-discovers its old peers
   even with no `--seed` — and re-probes every restored entry instead
   of trusting it. See "Membership persistence" below.
+- Anti-entropy: every ~10 s a node exchanges its whole membership
+  table with a random peer (`SYNC`), and the peer answers with its own
+  full table, so a node that missed many incremental digests converges
+  in one exchange instead of waiting for the random window to rotate
+  the missing entries through. See "Anti-entropy" below.
 
 ## What it is not
 
@@ -89,6 +94,7 @@ ACK <seq> <from-id> <from-inc>
 PING_REQ <seq> <target-id> <from-id>
 JOIN <from-id> <from-inc>
 GOSSIP <from-id> <from-inc> <count> <id:inc:state> ...
+SYNC <from-id> <from-inc> <count> <id:inc:state> ...
 ```
 
 State codes in gossip entries: `A` alive, `S` suspect, `D` dead.
@@ -116,7 +122,8 @@ Failure detection, per node, every probe interval (default 100 ms):
 Merge rule for gossip, per entry: higher incarnation wins; at equal
 incarnation, DEAD beats SUSPECT beats ALIVE. A node that hears gossip
 calling itself SUSPECT or DEAD bumps its incarnation and gossips ALIVE
-again — that is the refutation.
+again — that is the refutation. SYNC entries merge by exactly the same
+rule; the only difference from GOSSIP is how many entries arrive.
 
 ### Phi-accrual mode (`--phi-accrual`)
 
@@ -179,6 +186,7 @@ scripts/demo.sh
 | `--dead-retention` | 60 | Seconds a DEAD entry stays in the table before GC |
 | `--phi-accrual` | off | Suspect on phi instead of the fixed ack timeout |
 | `--phi-threshold` | 8.0 | Phi value at which a peer is suspected (phi mode only) |
+| `--sync-interval-ms` | 10000 | How often to exchange full tables (anti-entropy SYNC) with a random peer |
 | `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `LEAVE`) |
 | `--secret` / `--shared-secret` | — (none) | Shared secret for joins: only peers presenting the same secret are accepted |
 | `--ipv6` | off | Run over IPv6: bind `::`, ids are `[::1]:port`, control plane on `::1` |
@@ -186,7 +194,8 @@ scripts/demo.sh
 
 Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 `GC` (a DEAD entry removed after its retention expired), `ALIVE`,
-`REFUTE`, and a `STATUS alive=N suspect=N dead=N total=N` line
+`REFUTE`, `SYNC <id>` (a periodic full-table exchange was sent to that
+peer), and a `STATUS alive=N suspect=N dead=N total=N` line
 every second.
 
 Note on sending: `pulse-node` sends on a dedicated socket that is
@@ -388,6 +397,26 @@ stays silent goes SUSPECT then DEAD again like any other peer:
 # Node 3 logs RESTORE 2 members and the cluster is back to alive=3.
 ```
 
+## Anti-entropy
+
+A digest carries at most 16 entries, so a node that was partitioned
+away — or that joined while failure news was spreading — can miss
+updates for a long time: the random window only rotates the missing
+entries through by chance. Every `--sync-interval-ms` (default 10 s)
+each node therefore sends its whole membership table to one random
+ALIVE/SUSPECT peer as a `SYNC` message, and the peer answers with its
+own full table, so one exchange converges both sides. Entries merge
+by the same rule as gossip, and tombstones ride along as DEAD, so a
+SYNC also spreads removals.
+
+One datagram holds at most 1400 bytes, so a full 64-member table of
+long IPv6 ids does not fit in a single SYNC. The entries then start
+at a rotating offset that advances by the number sent, so successive
+SYNCs walk the whole table and a stale peer still converges within a
+couple of exchanges instead of re-receiving the same head of the
+table forever. A table that fits — every IPv4 table, and small IPv6
+ones — converges in exactly one exchange.
+
 ## Gossip fanout
 
 Every other probe cycle (every ~200 ms at the default 100 ms probe
@@ -474,7 +503,12 @@ make test
   a same-instant tie puts DEAD before SUSPECT, a table with no
   urgent entries still caps at 16 distinct ALIVE entries, a
   tombstone still rides along as DEAD, and an empty table sends
-  nothing.
+  nothing. Anti-entropy: a SYNC carries the whole 20-member table,
+  a stale node holding only 5 members converges to all 20 with the
+  sender's states and incarnations after merging one SYNC, a
+  tombstone rides along in a SYNC as DEAD, an empty table sends no
+  SYNC, and a 64-member table of long IPv6 ids rotates so two
+  consecutive SYNCs cover every member between them.
 - `tests/test_ipv6.c`: unit tests for IPv6 — parse/format round-trips
   for IPv4, bracketed and bare IPv6 ids, rejects for malformed ids and
   ports, `pulse_addr_equal`/`pulse_addr_len`, bare-host parsing for
@@ -497,6 +531,10 @@ make test
   starts with its seed down, GCs the unanswering seed, the seed comes
   up later, and the node re-sends JOIN (REJOIN log line) until both
   nodes converge on alive=2.
+- `tests/test_sync.sh`: integration test for anti-entropy — a 2-node
+  cluster with `--sync-interval-ms 2000` converges, both nodes log a
+  periodic `SYNC` line to each other within a few seconds, and both
+  stay converged on alive=2 after the exchange.
 - `tests/test_ipv6.sh`: integration test for IPv6 — a 3-node `--ipv6`
   cluster converges, a killed node is marked DEAD by both survivors,
   the survivors agree, a restarted node comes back ALIVE, the control
@@ -518,3 +556,4 @@ make test
 - ~~Failure-detector metrics: detection latency (last heartbeat to SUSPECT) and suspect-to-dead duration, with transition counts, exposed as a `METRICS` command on the control plane.~~ Done in 0.10.0.
 - ~~Machine-readable cluster view: a `JSON` control-plane command returning status, members, and metrics as one JSON object, so tooling can poll cluster state without scraping the text protocol.~~ Done in 0.11.0.
 - ~~Membership persistence: save the known member list to disk periodically and on clean shutdown, and reload it on startup, so a restarted node re-discovers its old peers without a seed — re-probing every restored entry instead of trusting it.~~ Done in 0.12.0.
+- ~~Anti-entropy full-table sync: periodically exchange the whole membership table with a random peer (SYNC, answered with the peer's own full table), so a node that missed many incremental digests converges in one exchange; tables too big for one datagram rotate across successive SYNCs.~~ Done in 0.13.0.

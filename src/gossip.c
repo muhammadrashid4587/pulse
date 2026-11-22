@@ -174,6 +174,51 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
     return send_str(sock, to, buf);
 }
 
+/* Anti-entropy offset: where the next SYNC starts in the table. A
+ * full IPv6 table does not fit in one datagram, so successive SYNCs
+ * walk the table from where the last one stopped; a stale peer then
+ * converges within a couple of exchanges instead of re-receiving the
+ * same head of the table forever. */
+static int g_sync_offset = 0;
+
+int gossip_send_full_table(int sock, const struct sockaddr_storage *to,
+                           const char *from_id, uint32_t inc,
+                           const member_table_t *t) {
+    /* Entries must leave room for the header and a possible auth tag
+     * inside PULSE_MAX_MSG; the parse side truncates at the same size. */
+    char entries[PULSE_MAX_MSG - 64];
+    int off = 0;
+    int n = t->count;
+    if (n == 0) return 0;
+    int total = 0;
+
+    /* Every table entry in table order, starting at the rotating
+     * offset and wrapping, until the datagram is full. */
+    int start = g_sync_offset % n;
+    for (int k = 0; k < n; k++) {
+        const member_t *m = &t->members[(start + k) % n];
+        if (append_entry(entries, sizeof entries, &off, m->id,
+                         m->incarnation, m->state) != 0)
+            break;
+        total++;
+    }
+    g_sync_offset = (start + total) % n;
+    /* Tombstones ride along as DEAD entries when there is room, exactly
+     * as in a digest. */
+    for (int k = 0; k < t->tombstone_count; k++) {
+        const tombstone_t *ts = &t->tombstones[k];
+        if (append_entry(entries, sizeof entries, &off, ts->id,
+                         ts->incarnation, MEMBER_DEAD) != 0)
+            break;
+        total++;
+    }
+    char buf[PULSE_MAX_MSG];
+    int hoff = snprintf(buf, sizeof buf, "SYNC %s %u %d%s", from_id, inc,
+                        total, entries);
+    if (hoff < 0 || (size_t)hoff >= sizeof buf) return -1;
+    return send_str(sock, to, buf);
+}
+
 int gossip_parse(const char *buf, size_t len, gmsg_t *out) {
     memset(out, 0, sizeof(*out));
     char tmp[PULSE_MAX_MSG];
@@ -195,6 +240,8 @@ int gossip_parse(const char *buf, size_t len, gmsg_t *out) {
         out->type = GMSG_JOIN;
     } else if (strcmp(tok, "GOSSIP") == 0) {
         out->type = GMSG_GOSSIP;
+    } else if (strcmp(tok, "SYNC") == 0) {
+        out->type = GMSG_SYNC;
     } else {
         out->type = GMSG_UNKNOWN;
         return -1;
@@ -230,7 +277,9 @@ int gossip_parse(const char *buf, size_t len, gmsg_t *out) {
         s = strtok_r(NULL, " \t\r\n", &save);
         if (!s) return -1;
         out->from_inc = (uint32_t)strtoul(s, NULL, 10);
-    } else if (out->type == GMSG_GOSSIP) {
+    } else if (out->type == GMSG_GOSSIP || out->type == GMSG_SYNC) {
+        /* SYNC carries the same "id:inc:state" entries as GOSSIP, so
+         * the two verbs share one parser branch. */
         s = strtok_r(NULL, " \t\r\n", &save);
         if (!s) return -1;
         snprintf(out->from_id, sizeof out->from_id, "%s", s);
