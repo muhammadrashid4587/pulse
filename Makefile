@@ -17,7 +17,8 @@ test_member: tests/test_member.c src/member.c src/member.h
 
 test: pulse-node test_member
 	./test_member
-	tests/test_cluster.sh
+	bash tests/test_cluster.sh
+	bash tests/test_gc.sh
 
 clean:
 	rm -f pulse-node test_member

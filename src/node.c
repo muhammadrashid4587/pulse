@@ -42,6 +42,7 @@ typedef struct {
     int probe_interval_ms;
     int ack_timeout_ms;
     int suspect_timeout_ms;
+    int64_t dead_retention_ms; /* how long a DEAD entry stays in the table */
 } config_t;
 
 typedef struct {
@@ -433,6 +434,14 @@ static void probe_cycle(int cycle) {
             }
         }
     }
+    /* 3b. Garbage-collect DEAD entries older than the retention period.
+     * Tombstones live twice as long: a peer that learned the DEAD entry
+     * later than we did still has up to one retention period to GC it
+     * itself, and the tombstone stops its gossip from resurrecting the
+     * entry here in the meantime. */
+    char gc_ids[8][PULSE_ID_LEN];
+    int n_gc = member_gc(&g_table, now, g_cfg.dead_retention_ms,
+                         2 * g_cfg.dead_retention_ms, gc_ids, 8);
     /* 4. Gossip a digest to a random peer every other cycle. */
     member_table_t digest_copy;
     int have_digest = 0;
@@ -464,6 +473,8 @@ static void probe_cycle(int cycle) {
         log_line("SUSPECT %s", suspect_ids[changed_idx[i]]);
     for (int i = 0; i < n_dead; i++)
         log_line("DEAD %s", newly_dead[i]);
+    for (int i = 0; i < n_gc; i++)
+        log_line("GC %s", gc_ids[i]);
     if (have_digest)
         gossip_send_digest(g_send_sock, &digest_to, g_self_id, g_incarnation,
                            &digest_copy);
@@ -491,7 +502,8 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s --port PORT [--id ID] [--seed HOST:PORT]...\n"
             "       [--data-dir DIR] [--probe-interval-ms N]\n"
-            "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n",
+            "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
+            "       [--dead-retention SECONDS]\n",
             prog);
 }
 
@@ -502,6 +514,7 @@ int main(int argc, char **argv) {
     g_cfg.probe_interval_ms = 100;
     g_cfg.ack_timeout_ms = 100;
     g_cfg.suspect_timeout_ms = 300;
+    g_cfg.dead_retention_ms = 60000; /* 60 s */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -524,6 +537,13 @@ int main(int argc, char **argv) {
             g_cfg.ack_timeout_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--suspect-timeout-ms") == 0 && i + 1 < argc) {
             g_cfg.suspect_timeout_ms = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--dead-retention") == 0 && i + 1 < argc) {
+            int secs = atoi(argv[++i]);
+            if (secs <= 0) {
+                fprintf(stderr, "--dead-retention must be a positive number of seconds\n");
+                return 2;
+            }
+            g_cfg.dead_retention_ms = (int64_t)secs * 1000;
         } else {
             usage(argv[0]);
             return 2;

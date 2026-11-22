@@ -15,6 +15,81 @@ int64_t pulse_now_ms(void) {
 
 void member_table_init(member_table_t *t) {
     t->count = 0;
+    t->tombstone_count = 0;
+}
+
+/* Tombstones: a GC'd member leaves a record so gossip cannot bring it
+ * back. A tombstone is keyed by id; a rejoin at a higher incarnation
+ * clears it, and direct contact clears it too (a packet from the member
+ * is proof of life). Tombstones expire after their retention: by then
+ * every peer has had a chance to GC the entry itself, so nobody is left
+ * to re-gossip it. */
+static tombstone_t *tombstone_find(member_table_t *t, const char *id) {
+    for (int i = 0; i < t->tombstone_count; i++) {
+        if (strcmp(t->tombstones[i].id, id) == 0) return &t->tombstones[i];
+    }
+    return NULL;
+}
+
+static void tombstone_remove(member_table_t *t, const char *id) {
+    for (int i = 0; i < t->tombstone_count; i++) {
+        if (strcmp(t->tombstones[i].id, id) == 0) {
+            t->tombstones[i] = t->tombstones[--t->tombstone_count];
+            return;
+        }
+    }
+}
+
+static void tombstone_add(member_table_t *t, const char *id,
+                          uint32_t incarnation, int64_t now) {
+    if (tombstone_find(t, id)) return; /* already recorded */
+    if (t->tombstone_count >= PULSE_MAX_TOMBSTONES) {
+        /* Full: evict the oldest tombstone to make room. */
+        int oldest = 0;
+        for (int i = 1; i < t->tombstone_count; i++) {
+            if (t->tombstones[i].removed_ms < t->tombstones[oldest].removed_ms)
+                oldest = i;
+        }
+        t->tombstones[oldest] = t->tombstones[--t->tombstone_count];
+    }
+    tombstone_t *ts = &t->tombstones[t->tombstone_count++];
+    /* Copy through a local buffer: id may point into the table itself
+     * (member_gc passes m->id), and snprintf warns about the overlap. */
+    char idbuf[PULSE_ID_LEN];
+    snprintf(idbuf, sizeof idbuf, "%s", id);
+    snprintf(ts->id, sizeof(ts->id), "%s", idbuf);
+    ts->incarnation = incarnation;
+    ts->removed_ms = now;
+}
+
+int member_gc(member_table_t *t, int64_t now, int64_t dead_retention_ms,
+              int64_t tombstone_retention_ms,
+              char removed[][PULSE_ID_LEN], int max_removed) {
+    /* Expire old tombstones first. */
+    for (int i = 0; i < t->tombstone_count;) {
+        if (now - t->tombstones[i].removed_ms >= tombstone_retention_ms) {
+            t->tombstones[i] = t->tombstones[--t->tombstone_count];
+        } else {
+            i++;
+        }
+    }
+    int n_removed = 0;
+    for (int i = 0; i < t->count;) {
+        member_t *m = &t->members[i];
+        if (m->state == MEMBER_DEAD &&
+            now - m->state_since_ms >= dead_retention_ms) {
+            tombstone_add(t, m->id, m->incarnation, now);
+            if (n_removed < max_removed) {
+                snprintf(removed[n_removed], PULSE_ID_LEN, "%s", m->id);
+            }
+            n_removed++;
+            /* Swap-remove: the last entry moves into this slot. */
+            t->members[i] = t->members[--t->count];
+        } else {
+            i++;
+        }
+    }
+    return n_removed;
 }
 
 member_t *member_find(member_table_t *t, const char *id) {
@@ -86,6 +161,15 @@ int member_merge(member_table_t *t, const char *self_id, const char *id,
     }
     member_t *m = member_find(t, id);
     if (!m) {
+        /* A tombstoned id only comes back at a higher incarnation: the
+         * member rejoined (its incarnation file bumps on every restart).
+         * Gossip at the recorded incarnation or below is a peer that
+         * still holds the stale DEAD entry; ignore it. */
+        tombstone_t *ts = tombstone_find(t, id);
+        if (ts) {
+            if (incarnation <= ts->incarnation) return MERGE_NONE;
+            tombstone_remove(t, id);
+        }
         m = member_add(t, id, addr, incarnation);
         if (!m) return MERGE_NONE;
         m->state = state;
@@ -128,6 +212,13 @@ int member_mark_alive(member_table_t *t, const char *id,
                       int64_t now) {
     member_t *m = member_find(t, id);
     if (!m) {
+        /* Direct contact is proof of life: a member that talks to us is
+         * alive even if we garbage-collected its DEAD entry. Drop any
+         * tombstone and re-add it, whatever its incarnation. (The
+         * supported restart path bumps the incarnation anyway; a node
+         * that restarts with a wiped data dir reuses incarnation 1 and
+         * still comes back through this path.) */
+        tombstone_remove(t, id);
         m = member_add(t, id, addr, incarnation);
         if (!m) return 0;
         m->last_seen_ms = now;

@@ -123,6 +123,58 @@ int main(void) {
     member_mark_dead(&t2, "127.0.0.1:17102", now);
     CHECK(member_random_peer(&t2, "127.0.0.1:17101") == NULL);
 
+    /* garbage collection of DEAD entries (retention 60 s, tombstones 120 s) */
+    member_table_t t3;
+    member_table_init(&t3);
+    struct sockaddr_in a4 = addr("127.0.0.1:17104");
+    struct sockaddr_in a5 = addr("127.0.0.1:17105");
+    struct sockaddr_in a6 = addr("127.0.0.1:17106");
+    member_add(&t3, "127.0.0.1:17104", &a4, 1);
+    member_add(&t3, "127.0.0.1:17105", &a5, 1);
+    member_add(&t3, "127.0.0.1:17106", &a6, 1);
+    member_mark_dead(&t3, "127.0.0.1:17104", now); /* dead since 1000 */
+    member_mark_suspect(&t3, "127.0.0.1:17105", now);
+    char removed[8][PULSE_ID_LEN];
+    /* before the retention expires, nothing is collected */
+    CHECK(member_gc(&t3, now + 59999, 60000, 120000, removed, 8) == 0);
+    CHECK(member_find(&t3, "127.0.0.1:17104") != NULL);
+    /* at the retention boundary the DEAD entry goes, ALIVE/SUSPECT stay */
+    CHECK(member_gc(&t3, now + 60000, 60000, 120000, removed, 8) == 1);
+    CHECK(strcmp(removed[0], "127.0.0.1:17104") == 0);
+    CHECK(member_find(&t3, "127.0.0.1:17104") == NULL);
+    CHECK(t3.count == 2);
+    CHECK(member_find(&t3, "127.0.0.1:17105") != NULL); /* SUSPECT kept */
+    CHECK(member_find(&t3, "127.0.0.1:17106") != NULL); /* ALIVE kept */
+    /* the tombstone blocks gossip from resurrecting it at the same inc */
+    r = member_merge(&t3, "127.0.0.1:17106", "127.0.0.1:17104", &a4, 1,
+                     MEMBER_DEAD, now + 60000);
+    CHECK(r == MERGE_NONE);
+    CHECK(member_find(&t3, "127.0.0.1:17104") == NULL);
+    /* ... but a rejoin at a higher incarnation clears the tombstone */
+    r = member_merge(&t3, "127.0.0.1:17106", "127.0.0.1:17104", &a4, 2,
+                     MEMBER_ALIVE, now + 60000);
+    CHECK(r & MERGE_NEW);
+    CHECK(member_find(&t3, "127.0.0.1:17104")->state == MEMBER_ALIVE);
+    /* direct contact revives a GC'd member even at the same incarnation */
+    member_mark_dead(&t3, "127.0.0.1:17104", now + 60000);
+    CHECK(member_gc(&t3, now + 120000, 60000, 120000, removed, 8) == 1);
+    CHECK(member_find(&t3, "127.0.0.1:17104") == NULL);
+    CHECK(member_mark_alive(&t3, "127.0.0.1:17104", &a4, 2, now + 120000) == 1);
+    CHECK(member_find(&t3, "127.0.0.1:17104")->state == MEMBER_ALIVE);
+    /* the tombstone itself expires: after 2x retention, stale gossip
+     * can re-add the id again (nobody holds the DEAD entry by then) */
+    member_mark_dead(&t3, "127.0.0.1:17104", now + 120000);
+    CHECK(member_gc(&t3, now + 180000, 60000, 120000, removed, 8) == 1);
+    CHECK(member_find(&t3, "127.0.0.1:17104") == NULL);
+    /* tombstone recorded at 180000, expires at 180000 + 120000 */
+    r = member_merge(&t3, "127.0.0.1:17106", "127.0.0.1:17104", &a4, 2,
+                     MEMBER_DEAD, now + 180000);
+    CHECK(r == MERGE_NONE); /* tombstone still live */
+    CHECK(member_gc(&t3, now + 300000, 60000, 120000, removed, 8) == 0);
+    r = member_merge(&t3, "127.0.0.1:17106", "127.0.0.1:17104", &a4, 2,
+                     MEMBER_DEAD, now + 300000);
+    CHECK(r & MERGE_NEW); /* tombstone expired, entry accepted again */
+
     printf("test_member: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

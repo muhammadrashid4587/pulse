@@ -23,6 +23,9 @@ building block, not a production service mesh.
 - Incarnation numbers persist in `<data-dir>/incarnation`, so a restarted
   node rejoins with a higher incarnation and can refute stale
   SUSPECT/DEAD gossip about itself.
+- Garbage collection: DEAD entries are dropped after a configurable
+  retention (default 60 s), with tombstones that stop gossip from
+  resurrecting them until every peer has GC'd them too.
 
 ## What it is not
 
@@ -32,8 +35,12 @@ building block, not a production service mesh.
   defend against a malicious network.
 - Not a replacement for Raft or Paxos. It answers one question — "is that
   node still there?" — and leaves agreement to something else.
-- Dead members are kept in the table indefinitely in v0.1.0; there is no
-  garbage collection of old DEAD entries yet (see Roadmap).
+- Dead members are garbage-collected after a retention period (default
+  60 s, `--dead-retention`): the entry is dropped, a tombstone stops
+  gossip from resurrecting it, and a rejoining node comes back at a
+  higher incarnation. Removals are not sent on the wire — each node
+  GCs on its own retention timer, and tombstones (kept twice as long)
+  stop a peer that still holds the DEAD entry from re-adding it here.
 
 ## Protocol
 
@@ -97,9 +104,11 @@ scripts/demo.sh
 | `--probe-interval-ms` | 100 | How often to probe a random peer |
 | `--ack-timeout-ms` | 100 | How long to wait for an ACK before an indirect probe |
 | `--suspect-timeout-ms` | 300 | How long a SUSPECT lasts before becoming DEAD |
+| `--dead-retention` | 60 | Seconds a DEAD entry stays in the table before GC |
 
 Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
-`ALIVE`, `REFUTE`, and a `STATUS alive=N suspect=N dead=N total=N` line
+`GC` (a DEAD entry removed after its retention expired), `ALIVE`,
+`REFUTE`, and a `STATUS alive=N suspect=N dead=N total=N` line
 every second.
 
 Note on sending: `pulse-node` sends on a dedicated socket that is
@@ -122,10 +131,14 @@ make test
   converge, a killed node is marked DEAD by both survivors, the survivors
   agree on membership, and a restarted node (same data dir) is cleared
   back to ALIVE.
+- `tests/test_gc.sh`: integration test for garbage collection — with a
+  2 s `--dead-retention`, a killed node is GC'd by both survivors (the
+  cluster agrees on 2 nodes, dead=0), and a restarted node at a higher
+  incarnation is accepted back as ALIVE.
 
 ## Roadmap
 
-- Garbage collection of old DEAD entries.
+- ~~Garbage collection of old DEAD entries.~~ Done in 0.2.0.
 - Phi-accrual failure detection as an alternative to fixed timeouts.
 - A TCP control plane: query membership, force-leave a member.
 - Optional shared secret so only trusted devices can join.

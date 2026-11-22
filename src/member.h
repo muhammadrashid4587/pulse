@@ -6,12 +6,19 @@
 
 #define PULSE_MAX_MEMBERS 64
 #define PULSE_ID_LEN 64
+#define PULSE_MAX_TOMBSTONES 16
 
 typedef enum {
     MEMBER_ALIVE = 0,
     MEMBER_SUSPECT = 1,
     MEMBER_DEAD = 2
 } member_state_t;
+
+typedef struct {
+    char id[PULSE_ID_LEN]; /* "host:port" */
+    uint32_t incarnation;  /* incarnation the member had when removed */
+    int64_t removed_ms;    /* monotonic ms when the tombstone was recorded */
+} tombstone_t;
 
 typedef struct {
     char id[PULSE_ID_LEN]; /* "host:port" */
@@ -25,6 +32,14 @@ typedef struct {
 typedef struct {
     member_t members[PULSE_MAX_MEMBERS];
     int count;
+    /* Tombstones: members garbage-collected while DEAD. Gossip about a
+     * tombstoned id at an incarnation <= the recorded one is ignored, so
+     * a peer that still holds the DEAD entry cannot resurrect it here.
+     * A higher incarnation clears the tombstone (the member rejoined).
+     * Tombstones expire after their retention so the table stays bounded;
+     * by then every peer has had time to GC the entry itself. */
+    tombstone_t tombstones[PULSE_MAX_TOMBSTONES];
+    int tombstone_count;
 } member_table_t;
 
 int64_t pulse_now_ms(void);
@@ -61,6 +76,14 @@ int member_mark_alive(member_table_t *t, const char *id,
                       int64_t now);
 
 int member_count_state(const member_table_t *t, member_state_t state);
+/* Garbage-collect DEAD members whose state is older than
+ * dead_retention_ms. Each removal records a tombstone so gossip cannot
+ * resurrect the entry, and tombstones older than
+ * tombstone_retention_ms are dropped. Removed ids are written into
+ * `removed` (up to max_removed); returns the number removed. */
+int member_gc(member_table_t *t, int64_t now, int64_t dead_retention_ms,
+              int64_t tombstone_retention_ms,
+              char removed[][PULSE_ID_LEN], int max_removed);
 /* Random ALIVE or SUSPECT peer other than self, or NULL if there is none.
  * The returned pointer is only valid while the caller holds the table lock. */
 member_t *member_random_peer(member_table_t *t, const char *self_id);
