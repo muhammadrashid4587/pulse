@@ -20,7 +20,9 @@ building block, not a production service mesh.
 - Gossip: every node periodically exchanges a digest of its membership
   table with a few random peers — the fanout grows with log2(cluster
   size), capped at 4 — so news of a dead node spreads in O(log n)
-  rounds even as the cluster grows.
+  rounds even as the cluster grows. Recently-changed SUSPECT/DEAD
+  entries lead each digest, so failure news is never stuck behind
+  the random window when the table is larger than the digest.
 - Incarnation numbers persist in `<data-dir>/incarnation`, so a restarted
   node rejoins with a higher incarnation and can refute stale
   SUSPECT/DEAD gossip about itself.
@@ -343,6 +345,18 @@ on a large cluster. Only ALIVE and SUSPECT peers are gossip targets,
 and the same digest copy goes to each of them, so the change costs
 no extra table snapshots.
 
+## Digest prioritization
+
+A digest carries at most 16 entries, but the table holds up to 64
+members, so a purely random window can miss a fresh SUSPECT for
+several rounds and delay exactly the news that matters most. The
+first up-to-4 slots of every digest are therefore reserved for the
+members that most recently turned SUSPECT or DEAD — most recently
+changed first, DEAD before SUSPECT on a tie — and the remaining
+slots are the usual random window, skipping entries already sent as
+urgent, so the rest of the table still rotates through instead of
+starving. Tombstones still ride along after the table entries.
+
 ## Tests
 
 ```sh
@@ -387,6 +401,14 @@ make test
   as before, and a mixed secret/plain pair does not merge. Also checks
   `START` reports `secret=on` only for secret nodes and that the
   secret value never appears in a log.
+- `tests/test_gossip.c`: unit tests for digest prioritization over
+  real UDP loopback sockets — a SUSPECT leads a small digest, the
+  four most recently changed SUSPECT/DEAD entries lead a capped
+  16-entry digest from a 20-member table in most-recent-first order,
+  a same-instant tie puts DEAD before SUSPECT, a table with no
+  urgent entries still caps at 16 distinct ALIVE entries, a
+  tombstone still rides along as DEAD, and an empty table sends
+  nothing.
 - `tests/test_ipv6.c`: unit tests for IPv6 — parse/format round-trips
   for IPv4, bracketed and bare IPv6 ids, rejects for malformed ids and
   ports, `pulse_addr_equal`/`pulse_addr_len`, bare-host parsing for
@@ -413,3 +435,4 @@ make test
 - ~~IPv6.~~ Done in 0.6.0.
 - ~~Seed rejoin retry when a seed is down at startup.~~ Done in 0.7.0.
 - ~~Cluster-size-aware gossip fanout: digest to 1 + floor(log2(peers)) random peers per round, capped at 4.~~ Done in 0.8.0.
+- ~~Prioritized gossip digests: the most recently changed SUSPECT/DEAD entries lead each digest (up to 4, most recent first), so failure news is never stuck behind the random window when the table is larger than the 16-entry digest.~~ Done in 0.9.0.

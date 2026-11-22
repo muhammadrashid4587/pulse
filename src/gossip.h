@@ -6,6 +6,13 @@
 
 #define PULSE_MAX_MSG 1400
 #define PULSE_GOSSIP_ENTRIES 16
+/* Leading slots of a digest reserved for the most urgent news: members
+ * that recently turned SUSPECT or DEAD go first (most recently changed
+ * first, DEAD before SUSPECT on a tie), so failure news is never stuck
+ * behind the random window when the table is larger than the digest.
+ * The rest of the digest is the usual random window, so entries beyond
+ * the urgent set still rotate through. */
+#define PULSE_GOSSIP_URGENT 4
 
 /* Wire protocol: one text message per UDP datagram.
  *
@@ -65,7 +72,14 @@ int gossip_send_ping_req(int sock, const struct sockaddr_storage *to, uint32_t s
                          const char *target_id, const char *from_id);
 int gossip_send_join(int sock, const struct sockaddr_storage *to,
                      const char *from_id, uint32_t inc);
-/* Send a digest of up to PULSE_GOSSIP_ENTRIES table entries to a peer. */
+/* Send a digest of up to PULSE_GOSSIP_ENTRIES table entries to a peer.
+ * Recently-changed SUSPECT/DEAD entries go first (up to
+ * PULSE_GOSSIP_URGENT of them, most recently changed first): a digest
+ * is only 16 entries and the table holds up to 64 members, so a purely
+ * random window can miss a fresh SUSPECT for several rounds and delay
+ * the news that matters most. The remaining slots are the usual random
+ * contiguous window, skipping entries already sent as urgent, so the
+ * rest of the table still rotates through. */
 int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                        const char *from_id, uint32_t inc,
                        const member_table_t *t);

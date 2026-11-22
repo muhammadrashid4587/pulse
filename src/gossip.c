@@ -75,6 +75,25 @@ int gossip_send_join(int sock, const struct sockaddr_storage *to,
     return send_str(sock, to, buf);
 }
 
+/* Append one " id:inc:state" entry to the digest buffer. Returns 0 on
+ * success, -1 when the buffer is full. */
+static int append_entry(char *entries, size_t size, int *off,
+                        const char *id, uint32_t inc, member_state_t state) {
+    int w = snprintf(entries + *off, size - (size_t)*off, " %s:%u:%c", id,
+                     inc, member_state_code(state));
+    if (w < 0 || (size_t)(*off + w) >= size) return -1;
+    *off += w;
+    return 0;
+}
+
+/* 1 when a should be gossiped before b: the more recently changed entry
+ * first, DEAD before SUSPECT when both changed at the same instant. */
+static int urgent_before(const member_t *a, const member_t *b) {
+    if (a->state_since_ms != b->state_since_ms)
+        return a->state_since_ms > b->state_since_ms;
+    return a->state > b->state;
+}
+
 int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                        const char *from_id, uint32_t inc,
                        const member_table_t *t) {
@@ -84,29 +103,68 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
     int off = 0;
     int n = t->count;
     if (n == 0) return 0;
+    int total = 0;
+
+    /* Urgent entries first: SUSPECT/DEAD members, most recently changed
+     * first, capped at PULSE_GOSSIP_URGENT. Insertion sort — the table
+     * holds at most 64 members and the urgent set is usually tiny. */
+    int urgent[PULSE_MAX_MEMBERS];
+    int n_urgent = 0;
+    for (int i = 0; i < n; i++) {
+        if (t->members[i].state != MEMBER_ALIVE)
+            urgent[n_urgent++] = i;
+    }
+    for (int i = 1; i < n_urgent; i++) {
+        int key = urgent[i];
+        int j = i - 1;
+        while (j >= 0 &&
+               urgent_before(&t->members[key], &t->members[urgent[j]])) {
+            urgent[j + 1] = urgent[j];
+            j--;
+        }
+        urgent[j + 1] = key;
+    }
+    int n_first = n_urgent < PULSE_GOSSIP_URGENT ? n_urgent
+                                                 : PULSE_GOSSIP_URGENT;
+    if (n_first > PULSE_GOSSIP_ENTRIES) n_first = PULSE_GOSSIP_ENTRIES;
+    for (int k = 0; k < n_first; k++) {
+        const member_t *m = &t->members[urgent[k]];
+        if (append_entry(entries, sizeof entries, &off, m->id,
+                         m->incarnation, m->state) != 0)
+            break;
+        total++;
+    }
+
+    /* The rest of the digest is the usual random contiguous window,
+     * skipping entries already sent as urgent, so the remainder of the
+     * table still rotates through instead of starving. */
     int start = rand() % n;
-    int count = n < PULSE_GOSSIP_ENTRIES ? n : PULSE_GOSSIP_ENTRIES;
-    for (int k = 0; k < count; k++) {
-        const member_t *m = &t->members[(start + k) % n];
-        int w = snprintf(entries + off, sizeof entries - (size_t)off,
-                         " %s:%u:%c", m->id, m->incarnation,
-                         member_state_code(m->state));
-        if (w < 0 || (size_t)(off + w) >= sizeof entries) break;
-        off += w;
+    for (int k = 0; k < n && total < PULSE_GOSSIP_ENTRIES; k++) {
+        int idx = (start + k) % n;
+        int already = 0;
+        for (int j = 0; j < n_first; j++) {
+            if (urgent[j] == idx) {
+                already = 1;
+                break;
+            }
+        }
+        if (already) continue;
+        const member_t *m = &t->members[idx];
+        if (append_entry(entries, sizeof entries, &off, m->id,
+                         m->incarnation, m->state) != 0)
+            break;
+        total++;
     }
     /* Tombstones ride along as DEAD entries when there is room: a
      * force-leave (or a GC removal) then spreads to peers, which mark
      * the member DEAD and GC it on their own retention timer. A live
      * member that hears itself DEAD refutes by bumping its incarnation,
      * exactly as for a DEAD entry already in the table. */
-    int total = count;
     for (int k = 0; k < t->tombstone_count && total < PULSE_GOSSIP_ENTRIES; k++) {
         const tombstone_t *ts = &t->tombstones[k];
-        int w = snprintf(entries + off, sizeof entries - (size_t)off,
-                         " %s:%u:%c", ts->id, ts->incarnation,
-                         member_state_code(MEMBER_DEAD));
-        if (w < 0 || (size_t)(off + w) >= sizeof entries) break;
-        off += w;
+        if (append_entry(entries, sizeof entries, &off, ts->id,
+                         ts->incarnation, MEMBER_DEAD) != 0)
+            break;
         total++;
     }
     char buf[PULSE_MAX_MSG];

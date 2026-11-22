@@ -7,7 +7,7 @@ HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h
 
 .PHONY: all test clean
 
-all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6
+all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip
 
 pulse-node: $(NODE_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $(NODE_SRC) $(LDFLAGS)
@@ -27,11 +27,15 @@ test_secret: tests/test_secret.c src/member.c src/phi.c src/gossip.c src/secret.
 test_ipv6: tests/test_ipv6.c src/member.c src/phi.c src/gossip.c src/secret.c src/member.h src/phi.h src/gossip.h src/secret.h
 	$(CC) $(CFLAGS) -o $@ tests/test_ipv6.c src/member.c src/phi.c src/gossip.c src/secret.c $(LDFLAGS)
 
-test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6
+test_gossip: tests/test_gossip.c src/member.c src/phi.c src/gossip.c src/secret.c src/member.h src/phi.h src/gossip.h src/secret.h
+	$(CC) $(CFLAGS) -o $@ tests/test_gossip.c src/member.c src/phi.c src/gossip.c src/secret.c $(LDFLAGS)
+
+test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip
 	./test_member
 	./test_phi
 	./test_secret
 	./test_ipv6
+	./test_gossip
 	bash tests/test_cluster.sh
 	bash tests/test_gc.sh
 	bash tests/test_rejoin.sh
@@ -41,4 +45,4 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6
 	bash tests/test_ipv6.sh
 
 clean:
-	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6
+	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip
