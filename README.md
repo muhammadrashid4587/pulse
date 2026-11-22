@@ -44,6 +44,10 @@ building block, not a production service mesh.
   member ids (`[::1]:17101`), the control plane on `::1`, and
   `pulse-ctl` accepting `[::1]:port`. See "IPv6" below. IPv4 remains
   the default and is unchanged.
+- Seed rejoin: a node that starts while its seed is down re-sends
+  `JOIN` to the seed every ~5 s (logged as `REJOIN`) until the seed
+  answers, so a late-starting seed still merges the cluster instead
+  of leaving the node isolated forever. See "Seed rejoin" below.
 
 ## What it is not
 
@@ -296,6 +300,35 @@ What it is and is not:
   still advertises `[::1]` by default — pass `--id` with a reachable
   address for a multi-host cluster, as with IPv4.
 
+## Seed rejoin
+
+A node sends `JOIN` to each `--seed` once at startup. If the seed is
+down at that moment, the node would otherwise stay isolated forever:
+it probes the seed, suspects it, marks it DEAD, garbage-collects it,
+and the seed — once it comes up — has no reason to contact the node
+at all. Two 1-node clusters, permanently.
+
+So every ~5 s the node re-sends `JOIN` to each seed that is not
+currently ALIVE in its membership table (logged as `REJOIN <id>`
+when the seed had already been garbage-collected). When the seed
+comes up it answers the `JOIN` with a membership digest, both sides
+learn about each other, and the cluster merges. The seed is
+deliberately not re-added to the table by the retry itself: it comes
+back through the normal path (direct contact re-adds it), so a seed
+that never answers — wrong secret, wrong family, genuinely dead —
+stays garbage-collected instead of cycling back into the table.
+A seed that never comes up costs one UDP datagram per retry interval
+and nothing else; a seed of the other address family is skipped, and
+a seed that is already ALIVE is never re-joined.
+
+```sh
+# Terminal 1: start node 2 first — its seed is not up yet
+./pulse-node --port 17102 --seed 127.0.0.1:17101 --data-dir /tmp/p2
+# Terminal 2: start node 1 a few seconds later
+./pulse-node --port 17101 --data-dir /tmp/p1
+# Node 2 logs REJOIN, node 1 logs JOIN, both report alive=2.
+```
+
 ## Tests
 
 ```sh
@@ -345,6 +378,10 @@ make test
   ports, `pulse_addr_equal`/`pulse_addr_len`, bare-host parsing for
   `--bind`, gossip parsing of PING/JOIN/PING_REQ/GOSSIP messages
   carrying IPv6 ids, and membership-table operations on v6 ids.
+- `tests/test_rejoin.sh`: integration test for seed rejoin — a node
+  starts with its seed down, GCs the unanswering seed, the seed comes
+  up later, and the node re-sends JOIN (REJOIN log line) until both
+  nodes converge on alive=2.
 - `tests/test_ipv6.sh`: integration test for IPv6 — a 3-node `--ipv6`
   cluster converges, a killed node is marked DEAD by both survivors,
   the survivors agree, a restarted node comes back ALIVE, the control
@@ -360,3 +397,4 @@ make test
 - ~~A TCP control plane: query membership, force-leave a member.~~ Done in 0.4.0.
 - ~~Optional shared secret so only trusted devices can join.~~ Done in 0.5.0.
 - ~~IPv6.~~ Done in 0.6.0.
+- ~~Seed rejoin retry when a seed is down at startup.~~ Done in 0.7.0.

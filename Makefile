@@ -34,6 +34,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6
 	./test_ipv6
 	bash tests/test_cluster.sh
 	bash tests/test_gc.sh
+	bash tests/test_rejoin.sh
 	bash tests/test_phi.sh
 	bash tests/test_control.sh
 	bash tests/test_secret.sh

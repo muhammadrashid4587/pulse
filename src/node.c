@@ -85,6 +85,7 @@ static uint32_t g_incarnation = 1;
 static int g_sock = -1;      /* bound receiving socket, never connected */
 static int g_send_sock = -1; /* dedicated sending socket (see main) */
 static int g_control_sock = -1; /* TCP control plane listen socket */
+static int g_family = AF_INET; /* address family of this node */
 static control_hooks_t g_hooks;
 static int64_t g_start_ms = 0;
 static volatile sig_atomic_t g_stop = 0;
@@ -393,6 +394,47 @@ static void probe_cycle(int cycle) {
                              g_incarnation);
     }
 
+    /* 1b. Re-JOIN seeds that are not ALIVE. A node that starts while its
+     * seed is down sends JOIN once at startup and would otherwise stay
+     * isolated forever: it suspects, deads and GCs the seed, and the
+     * seed, once up, has no reason to contact it. Every ~5 s, re-send
+     * JOIN to each seed that is not currently ALIVE, so the cluster
+     * heals when the seed comes up. The seed is deliberately NOT
+     * re-added to the table here: it comes back through the normal
+     * path (the seed answers the JOIN with a digest, and direct
+     * contact re-adds it), so a seed that never answers — wrong
+     * secret, wrong family, genuinely dead — stays GC'd instead of
+     * cycling back into the table. A seed of the other address
+     * family is skipped: it can never be reached from this socket. */
+    typedef struct {
+        char id[PULSE_ID_LEN];
+        struct sockaddr_storage addr;
+        int was_absent; /* it had been GC'd from the table */
+    } rejoin_action_t;
+    rejoin_action_t rejoins[16];
+    int n_rejoins = 0;
+    {
+        int retry_every = 5000 / g_cfg.probe_interval_ms;
+        if (retry_every < 1) retry_every = 1;
+        if (cycle % retry_every == 0 && g_cfg.seed_count > 0) {
+            pthread_mutex_lock(&g_lock);
+            for (int i = 0; i < g_cfg.seed_count && n_rejoins < 16; i++) {
+                member_t *m = member_find(&g_table, g_cfg.seeds[i]);
+                if (m && m->state == MEMBER_ALIVE) continue;
+                struct sockaddr_storage saddr;
+                if (member_parse_addr(g_cfg.seeds[i], &saddr) != 0) continue;
+                if (saddr.ss_family != g_family) continue;
+                int was_absent = (m == NULL);
+                snprintf(rejoins[n_rejoins].id, PULSE_ID_LEN, "%s",
+                         g_cfg.seeds[i]);
+                rejoins[n_rejoins].addr = saddr;
+                rejoins[n_rejoins].was_absent = was_absent;
+                n_rejoins++;
+            }
+            pthread_mutex_unlock(&g_lock);
+        }
+    }
+
     /* 2. Decide who to suspect this cycle. Fixed-timeout mode
      * escalates timed-out probes to indirect probes and suspects on a
      * second timeout. Phi-accrual mode suspects on phi alone: no
@@ -534,6 +576,14 @@ static void probe_cycle(int cycle) {
             gossip_send_ping_req(g_send_sock, &actions[i].inter[j], actions[i].seq,
                                  actions[i].target_id, g_self_id);
         }
+    }
+    for (int i = 0; i < n_rejoins; i++) {
+        gossip_send_join(g_send_sock, &rejoins[i].addr, g_self_id,
+                         g_incarnation);
+        /* Logged only when the seed had been GC'd: a re-JOIN to a
+         * SUSPECT/DEAD seed still in the table is routine. */
+        if (rejoins[i].was_absent)
+            log_line("REJOIN %s", rejoins[i].id);
     }
     for (int i = 0; i < n_changed; i++) {
         int idx = changed_idx[i];
@@ -716,6 +766,7 @@ int main(int argc, char **argv) {
     } else if (g_cfg.ipv6) {
         family = AF_INET6;
     }
+    g_family = family;
     if (family == AF_INET6) {
         struct sockaddr_in6 *b6 = (struct sockaddr_in6 *)&bind_addr;
         b6->sin6_family = AF_INET6;
