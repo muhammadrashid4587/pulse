@@ -23,8 +23,8 @@ typedef struct {
 } tombstone_t;
 
 typedef struct {
-    char id[PULSE_ID_LEN]; /* "host:port" */
-    struct sockaddr_in addr;
+    char id[PULSE_ID_LEN]; /* "host:port", IPv6 hosts bracketed: "[::1]:port" */
+    struct sockaddr_storage addr;
     uint32_t incarnation;
     member_state_t state;
     int64_t last_seen_ms;   /* monotonic ms of last direct contact */
@@ -52,11 +52,27 @@ int64_t pulse_now_ms(void);
 void member_table_init(member_table_t *t);
 member_t *member_find(member_table_t *t, const char *id);
 member_t *member_add(member_table_t *t, const char *id,
-                     const struct sockaddr_in *addr, uint32_t incarnation);
+                     const struct sockaddr_storage *addr,
+                     uint32_t incarnation);
 
-/* Parse a "host:port" id into a sockaddr_in. Returns 0 on success. */
-int member_parse_addr(const char *id, struct sockaddr_in *addr);
-void member_format_id(const struct sockaddr_in *addr, char *id, size_t len);
+/* Parse a "host:port" id into a sockaddr_storage. IPv4 ids are bare
+ * ("127.0.0.1:17101"); IPv6 ids are bracketed ("[::1]:17101"). A bare
+ * IPv6 literal ("::1:17101") also parses: the port is the part after
+ * the last colon. Returns 0 on success. */
+int member_parse_addr(const char *id, struct sockaddr_storage *addr);
+/* Parse a bare host literal (no port) into a sockaddr_storage: an IPv4
+ * or IPv6 address, port left 0. Returns 0 on success. */
+int member_parse_host(const char *host, struct sockaddr_storage *addr);
+/* Format an address back to an id: "127.0.0.1:17101" or "[::1]:17101". */
+void member_format_id(const struct sockaddr_storage *addr, char *id,
+                      size_t len);
+/* sizeof(struct sockaddr_in) or sizeof(struct sockaddr_in6) for the
+ * address's family; 0 for an unknown family. Use as the length argument
+ * to sendto/connect/bind. */
+socklen_t pulse_addr_len(const struct sockaddr_storage *addr);
+/* 1 when two addresses are the same family, port and address bytes. */
+int pulse_addr_equal(const struct sockaddr_storage *a,
+                     const struct sockaddr_storage *b);
 
 /* Merge results (bit flags). */
 #define MERGE_NONE 0
@@ -70,7 +86,7 @@ void member_format_id(const struct sockaddr_in *addr, char *id, size_t len);
  * DEAD at an incarnation >= our own, MERGE_SELF_SUSPECTED is returned so
  * the caller can refute by bumping its incarnation. */
 int member_merge(member_table_t *t, const char *self_id, const char *id,
-                 const struct sockaddr_in *addr, uint32_t incarnation,
+                 const struct sockaddr_storage *addr, uint32_t incarnation,
                  member_state_t state, int64_t now);
 
 int member_mark_suspect(member_table_t *t, const char *id, int64_t now);
@@ -78,8 +94,8 @@ int member_mark_dead(member_table_t *t, const char *id, int64_t now);
 /* Direct contact: the member is alive. Returns 1 if the member was new or
  * its state changed, 0 if it was already ALIVE. */
 int member_mark_alive(member_table_t *t, const char *id,
-                      const struct sockaddr_in *addr, uint32_t incarnation,
-                      int64_t now);
+                      const struct sockaddr_storage *addr,
+                      uint32_t incarnation, int64_t now);
 
 int member_count_state(const member_table_t *t, member_state_t state);
 /* Force-remove a member (operator action, e.g. the control plane's

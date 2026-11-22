@@ -2,6 +2,8 @@ pulse-node
 pulse-ctl
 test_member
 test_phi
+test_secret
+test_ipv6
 *.o
 incarnation
 *.log

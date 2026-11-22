@@ -14,8 +14,8 @@ static int checks = 0, failures = 0;
     } \
 } while (0)
 
-static struct sockaddr_in addr(const char *id) {
-    struct sockaddr_in a;
+static struct sockaddr_storage addr(const char *id) {
+    struct sockaddr_storage a;
     if (member_parse_addr(id, &a) != 0) {
         memset(&a, 0, sizeof a);
     }
@@ -28,7 +28,7 @@ int main(void) {
     int64_t now = 1000;
 
     /* add / find / address round-trip */
-    struct sockaddr_in a1 = addr("127.0.0.1:17101");
+    struct sockaddr_storage a1 = addr("127.0.0.1:17101");
     member_t *m = member_add(&t, "127.0.0.1:17101", &a1, 1);
     CHECK(m != NULL);
     CHECK(t.count == 1);
@@ -45,7 +45,7 @@ int main(void) {
     CHECK(m->incarnation == 1); /* re-add does not bump incarnation */
 
     /* merge: a new member via gossip */
-    struct sockaddr_in a2 = addr("127.0.0.1:17102");
+    struct sockaddr_storage a2 = addr("127.0.0.1:17102");
     int r = member_merge(&t, "127.0.0.1:17101", "127.0.0.1:17102", &a2, 1,
                          MEMBER_ALIVE, now);
     CHECK(r & MERGE_NEW);
@@ -92,7 +92,7 @@ int main(void) {
     CHECK(r == MERGE_NONE); /* stale: inc 1 < our inc 5 */
 
     /* mark_suspect / mark_dead / mark_alive transitions */
-    struct sockaddr_in a3 = addr("127.0.0.1:17103");
+    struct sockaddr_storage a3 = addr("127.0.0.1:17103");
     member_add(&t, "127.0.0.1:17103", &a3, 1);
     CHECK(member_mark_suspect(&t, "127.0.0.1:17103", now) == 1);
     CHECK(member_mark_suspect(&t, "127.0.0.1:17103", now) == 0); /* already */
@@ -126,9 +126,9 @@ int main(void) {
     /* garbage collection of DEAD entries (retention 60 s, tombstones 120 s) */
     member_table_t t3;
     member_table_init(&t3);
-    struct sockaddr_in a4 = addr("127.0.0.1:17104");
-    struct sockaddr_in a5 = addr("127.0.0.1:17105");
-    struct sockaddr_in a6 = addr("127.0.0.1:17106");
+    struct sockaddr_storage a4 = addr("127.0.0.1:17104");
+    struct sockaddr_storage a5 = addr("127.0.0.1:17105");
+    struct sockaddr_storage a6 = addr("127.0.0.1:17106");
     member_add(&t3, "127.0.0.1:17104", &a4, 1);
     member_add(&t3, "127.0.0.1:17105", &a5, 1);
     member_add(&t3, "127.0.0.1:17106", &a6, 1);

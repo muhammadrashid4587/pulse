@@ -22,7 +22,7 @@ void gossip_set_secret(const char *secret) {
     }
 }
 
-static int send_str(int sock, const struct sockaddr_in *to, const char *s) {
+static int send_str(int sock, const struct sockaddr_storage *to, const char *s) {
     /* Tagging needs a little headroom past PULSE_MAX_MSG; the buffer is
      * stack-local, so concurrent sends from the receiver and prober
      * threads cannot clobber each other. */
@@ -39,40 +39,43 @@ static int send_str(int sock, const struct sockaddr_in *to, const char *s) {
         snprintf(tagged + n, sizeof tagged - n, " %s", tag);
         out = tagged;
     }
+    /* The length must match the family: passing sizeof(storage) for an
+     * IPv4 destination is harmless on Linux, but passing it for an
+     * IPv6 destination is required, and the reverse is wrong. */
     ssize_t n = sendto(sock, out, strlen(out), 0,
-                       (const struct sockaddr *)to, sizeof(*to));
+                       (const struct sockaddr *)to, pulse_addr_len(to));
     return n < 0 ? -1 : 0;
 }
 
-int gossip_send_ping(int sock, const struct sockaddr_in *to, uint32_t seq,
+int gossip_send_ping(int sock, const struct sockaddr_storage *to, uint32_t seq,
                      const char *from_id, uint32_t inc) {
     char buf[PULSE_MAX_MSG];
     snprintf(buf, sizeof buf, "PING %u %s %u", seq, from_id, inc);
     return send_str(sock, to, buf);
 }
 
-int gossip_send_ack(int sock, const struct sockaddr_in *to, uint32_t seq,
+int gossip_send_ack(int sock, const struct sockaddr_storage *to, uint32_t seq,
                     const char *from_id, uint32_t inc) {
     char buf[PULSE_MAX_MSG];
     snprintf(buf, sizeof buf, "ACK %u %s %u", seq, from_id, inc);
     return send_str(sock, to, buf);
 }
 
-int gossip_send_ping_req(int sock, const struct sockaddr_in *to, uint32_t seq,
+int gossip_send_ping_req(int sock, const struct sockaddr_storage *to, uint32_t seq,
                          const char *target_id, const char *from_id) {
     char buf[PULSE_MAX_MSG];
     snprintf(buf, sizeof buf, "PING_REQ %u %s %s", seq, target_id, from_id);
     return send_str(sock, to, buf);
 }
 
-int gossip_send_join(int sock, const struct sockaddr_in *to,
+int gossip_send_join(int sock, const struct sockaddr_storage *to,
                      const char *from_id, uint32_t inc) {
     char buf[PULSE_MAX_MSG];
     snprintf(buf, sizeof buf, "JOIN %s %u", from_id, inc);
     return send_str(sock, to, buf);
 }
 
-int gossip_send_digest(int sock, const struct sockaddr_in *to,
+int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                        const char *from_id, uint32_t inc,
                        const member_table_t *t) {
     /* Entry text is built first so the header count can cover both the

@@ -10,6 +10,7 @@
  * Example:
  *   pulse-ctl 127.0.0.1:18401 MEMBERS
  *   pulse-ctl 127.0.0.1:18401 LEAVE 127.0.0.1:17402
+ *   pulse-ctl '[::1]:18401' MEMBERS          (IPv6 control plane)
  *
  * The same thing works with netcat, if it is installed:
  *   printf 'MEMBERS\n' | nc 127.0.0.1 18401
@@ -24,48 +25,30 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "member.h"
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s <host:port> <COMMAND> [args...]\n",
                 argv[0]);
         return 2;
     }
-    const char *addr = argv[1];
-    const char *colon = strrchr(addr, ':');
-    if (!colon || colon == addr) {
-        fprintf(stderr, "bad address (want host:port): %s\n", addr);
-        return 2;
-    }
-    char host[128];
-    size_t hlen = (size_t)(colon - addr);
-    if (hlen >= sizeof host) {
-        fprintf(stderr, "host too long: %s\n", addr);
-        return 2;
-    }
-    memcpy(host, addr, hlen);
-    host[hlen] = '\0';
-    int port = atoi(colon + 1);
-    if (port <= 0 || port > 65535) {
-        fprintf(stderr, "bad port: %s\n", addr);
+    /* The address may be IPv4 ("127.0.0.1:18401") or IPv6
+     * ("[::1]:18401"); member_parse_addr handles both, and the socket
+     * family follows the address. */
+    struct sockaddr_storage dst;
+    if (member_parse_addr(argv[1], &dst) != 0) {
+        fprintf(stderr, "bad address (want host:port): %s\n", argv[1]);
         return 2;
     }
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(dst.ss_family, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("socket");
         return 1;
     }
-    struct sockaddr_in dst;
-    memset(&dst, 0, sizeof dst);
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &dst.sin_addr) != 1) {
-        fprintf(stderr, "bad host (IPv4 only): %s\n", host);
-        close(fd);
-        return 2;
-    }
-    if (connect(fd, (struct sockaddr *)&dst, sizeof dst) < 0) {
-        fprintf(stderr, "connect %s: %s\n", addr, strerror(errno));
+    if (connect(fd, (struct sockaddr *)&dst, pulse_addr_len(&dst)) < 0) {
+        fprintf(stderr, "connect %s: %s\n", argv[1], strerror(errno));
         close(fd);
         return 1;
     }
@@ -95,7 +78,7 @@ int main(int argc, char **argv) {
     return 0;
 
 send_fail:
-    fprintf(stderr, "send to %s: %s\n", addr, strerror(errno));
+    fprintf(stderr, "send to %s: %s\n", argv[1], strerror(errno));
     close(fd);
     return 1;
 }

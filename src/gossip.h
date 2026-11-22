@@ -41,7 +41,7 @@ typedef struct {
     char from_id[PULSE_ID_LEN];
     uint32_t from_inc;
     char target_id[PULSE_ID_LEN];
-    struct sockaddr_in target_addr;
+    struct sockaddr_storage target_addr;
     int has_target;
     int entry_count;
     member_t entries[PULSE_MAX_MEMBERS];
@@ -57,16 +57,16 @@ int gossip_parse(const char *buf, size_t len, gmsg_t *out);
  * untagged messages, accept anything). */
 void gossip_set_secret(const char *secret);
 
-int gossip_send_ping(int sock, const struct sockaddr_in *to, uint32_t seq,
+int gossip_send_ping(int sock, const struct sockaddr_storage *to, uint32_t seq,
                      const char *from_id, uint32_t inc);
-int gossip_send_ack(int sock, const struct sockaddr_in *to, uint32_t seq,
+int gossip_send_ack(int sock, const struct sockaddr_storage *to, uint32_t seq,
                     const char *from_id, uint32_t inc);
-int gossip_send_ping_req(int sock, const struct sockaddr_in *to, uint32_t seq,
+int gossip_send_ping_req(int sock, const struct sockaddr_storage *to, uint32_t seq,
                          const char *target_id, const char *from_id);
-int gossip_send_join(int sock, const struct sockaddr_in *to,
+int gossip_send_join(int sock, const struct sockaddr_storage *to,
                      const char *from_id, uint32_t inc);
 /* Send a digest of up to PULSE_GOSSIP_ENTRIES table entries to a peer. */
-int gossip_send_digest(int sock, const struct sockaddr_in *to,
+int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                        const char *from_id, uint32_t inc,
                        const member_table_t *t);
 

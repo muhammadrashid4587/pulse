@@ -100,7 +100,8 @@ member_t *member_find(member_table_t *t, const char *id) {
 }
 
 member_t *member_add(member_table_t *t, const char *id,
-                     const struct sockaddr_in *addr, uint32_t incarnation) {
+                     const struct sockaddr_storage *addr,
+                     uint32_t incarnation) {
     member_t *m = member_find(t, id);
     if (m) return m;
     if (t->count >= PULSE_MAX_MEMBERS) return NULL;
@@ -120,27 +121,123 @@ member_t *member_add(member_table_t *t, const char *id,
     return m;
 }
 
-int member_parse_addr(const char *id, struct sockaddr_in *addr) {
-    const char *colon = strrchr(id, ':');
-    if (!colon) return -1;
-    char host[64];
-    size_t hlen = (size_t)(colon - id);
-    if (hlen == 0 || hlen >= sizeof(host)) return -1;
-    memcpy(host, id, hlen);
-    host[hlen] = '\0';
-    int port = atoi(colon + 1);
-    if (port <= 0 || port > 65535) return -1;
-    memset(addr, 0, sizeof(*addr));
-    addr->sin_family = AF_INET;
-    addr->sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &addr->sin_addr) != 1) return -1;
+/* Strict port check: all digits, 1..65535. atoi would silently accept
+ * "12x" as 12 and "99999" as a wrapped value; ids must not do that. */
+static int parse_port(const char *s, uint16_t *port) {
+    if (!s || *s == '\0') return -1;
+    long v = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        v = v * 10 + (*p - '0');
+        if (v > 65535) return -1;
+    }
+    if (v <= 0) return -1;
+    *port = (uint16_t)v;
     return 0;
 }
 
-void member_format_id(const struct sockaddr_in *addr, char *id, size_t len) {
-    char host[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr->sin_addr, host, sizeof(host));
-    snprintf(id, len, "%s:%d", host, ntohs(addr->sin_port));
+int member_parse_host(const char *host, struct sockaddr_storage *addr) {
+    memset(addr, 0, sizeof(*addr));
+    if (!host || *host == '\0') return -1;
+    struct sockaddr_in *a4 = (struct sockaddr_in *)addr;
+    if (inet_pton(AF_INET, host, &a4->sin_addr) == 1) {
+        a4->sin_family = AF_INET;
+        return 0;
+    }
+    struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)addr;
+    if (inet_pton(AF_INET6, host, &a6->sin6_addr) == 1) {
+        a6->sin6_family = AF_INET6;
+        return 0;
+    }
+    return -1;
+}
+
+int member_parse_addr(const char *id, struct sockaddr_storage *addr) {
+    if (!id || *id == '\0') return -1;
+    const char *host_start, *host_end, *port_str;
+    if (id[0] == '[') {
+        /* Bracketed IPv6: "[::1]:17101". */
+        const char *close = strchr(id, ']');
+        if (!close || close[1] != ':' || close == id + 1) return -1;
+        host_start = id + 1;
+        host_end = close;
+        port_str = close + 2;
+    } else {
+        /* Bare form: the port is after the last colon. For an IPv4
+         * id that is the only colon; for a bare IPv6 literal
+         * ("::1:17101") the host part still contains colons. */
+        const char *colon = strrchr(id, ':');
+        if (!colon || colon == id) return -1;
+        host_start = id;
+        host_end = colon;
+        port_str = colon + 1;
+    }
+    char host[64];
+    size_t hlen = (size_t)(host_end - host_start);
+    if (hlen == 0 || hlen >= sizeof(host)) return -1;
+    memcpy(host, host_start, hlen);
+    host[hlen] = '\0';
+    uint16_t port;
+    if (parse_port(port_str, &port) != 0) return -1;
+    /* A host part with a colon in it is IPv6; without, IPv4. */
+    int v6 = strchr(host, ':') != NULL;
+    memset(addr, 0, sizeof(*addr));
+    if (v6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)addr;
+        if (inet_pton(AF_INET6, host, &a6->sin6_addr) != 1) return -1;
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port = htons(port);
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)addr;
+        if (inet_pton(AF_INET, host, &a4->sin_addr) != 1) return -1;
+        a4->sin_family = AF_INET;
+        a4->sin_port = htons(port);
+    }
+    return 0;
+}
+
+void member_format_id(const struct sockaddr_storage *addr, char *id,
+                      size_t len) {
+    if (addr->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *a6 =
+            (const struct sockaddr_in6 *)addr;
+        char host[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &a6->sin6_addr, host, sizeof(host));
+        snprintf(id, len, "[%s]:%d", host, ntohs(a6->sin6_port));
+    } else {
+        const struct sockaddr_in *a4 = (const struct sockaddr_in *)addr;
+        char host[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &a4->sin_addr, host, sizeof(host));
+        snprintf(id, len, "%s:%d", host, ntohs(a4->sin_port));
+    }
+}
+
+socklen_t pulse_addr_len(const struct sockaddr_storage *addr) {
+    switch (addr->ss_family) {
+        case AF_INET: return sizeof(struct sockaddr_in);
+        case AF_INET6: return sizeof(struct sockaddr_in6);
+        default: return 0;
+    }
+}
+
+int pulse_addr_equal(const struct sockaddr_storage *a,
+                     const struct sockaddr_storage *b) {
+    if (a->ss_family != b->ss_family) return 0;
+    if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *x = (const struct sockaddr_in6 *)a;
+        const struct sockaddr_in6 *y = (const struct sockaddr_in6 *)b;
+        return x->sin6_port == y->sin6_port &&
+               memcmp(&x->sin6_addr, &y->sin6_addr,
+                      sizeof(struct in6_addr)) == 0;
+    }
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in *x = (const struct sockaddr_in *)a;
+        const struct sockaddr_in *y = (const struct sockaddr_in *)b;
+        return x->sin_port == y->sin_port &&
+               memcmp(&x->sin_addr, &y->sin_addr,
+                      sizeof(struct in_addr)) == 0;
+    }
+    return 0;
 }
 
 static int state_rank(member_state_t s) {
@@ -152,7 +249,7 @@ static int state_rank(member_state_t s) {
 }
 
 int member_merge(member_table_t *t, const char *self_id, const char *id,
-                 const struct sockaddr_in *addr, uint32_t incarnation,
+                 const struct sockaddr_storage *addr, uint32_t incarnation,
                  member_state_t state, int64_t now) {
     if (strcmp(id, self_id) == 0) {
         member_t *self = member_find(t, self_id);
@@ -209,8 +306,8 @@ int member_mark_dead(member_table_t *t, const char *id, int64_t now) {
 }
 
 int member_mark_alive(member_table_t *t, const char *id,
-                      const struct sockaddr_in *addr, uint32_t incarnation,
-                      int64_t now) {
+                      const struct sockaddr_storage *addr,
+                      uint32_t incarnation, int64_t now) {
     member_t *m = member_find(t, id);
     if (!m) {
         /* Direct contact is proof of life: a member that talks to us is

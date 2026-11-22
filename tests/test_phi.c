@@ -94,10 +94,10 @@ int main(void) {
      * and high phi after a long silence. */
     member_table_t tab;
     member_table_init(&tab);
-    struct sockaddr_in a;
+    struct sockaddr_storage a;
     member_parse_addr("127.0.0.1:17101", &a);
     member_add(&tab, "127.0.0.1:17101", &a, 1);
-    struct sockaddr_in b;
+    struct sockaddr_storage b;
     member_parse_addr("127.0.0.1:17102", &b);
     member_add(&tab, "127.0.0.1:17102", &b, 1);
     for (int i = 0; i < 11; i++)

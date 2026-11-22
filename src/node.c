@@ -55,12 +55,14 @@ typedef struct {
     double phi_threshold;      /* phi at which a peer is suspected */
     int control_port;          /* TCP control plane port, -1 = disabled */
     char secret[PULSE_SECRET_MAX]; /* shared secret for joins, "" = none */
+    int ipv6;                  /* use IPv6 (bind ::, ids are "[::1]:port") */
+    char bind_host[128];       /* bind address override, "" = wildcard */
 } config_t;
 
 typedef struct {
     uint32_t seq;
     char target_id[PULSE_ID_LEN];
-    struct sockaddr_in target_addr;
+    struct sockaddr_storage target_addr;
     int64_t sent_ms;
     int indirect_tried;
     int active;
@@ -69,7 +71,7 @@ typedef struct {
 typedef struct {
     uint32_t seq;
     char target_id[PULSE_ID_LEN];
-    struct sockaddr_in requester;
+    struct sockaddr_storage requester;
     int64_t sent_ms;
     int active;
 } pending_indirect_t;
@@ -143,7 +145,8 @@ static void save_incarnation(const char *data_dir, uint32_t next) {
 /* Direct contact with a member: it is alive. Logs JOIN for a first sighting
  * and ALIVE when a suspected/dead member comes back. The address stored is
  * the one the member advertises in its id, never the datagram source. */
-static void note_contact(const gmsg_t *msg, const struct sockaddr_in *addr) {
+static void note_contact(const gmsg_t *msg,
+                         const struct sockaddr_storage *addr) {
     int is_new, revived;
     pthread_mutex_lock(&g_lock);
     is_new = member_find(&g_table, msg->from_id) == NULL;
@@ -164,7 +167,7 @@ static void handle_message(const gmsg_t *msg) {
      * is an ephemeral port nobody listens on; answering there (and
      * storing that address in the membership table) silently blackholes
      * every reply and every later probe. */
-    struct sockaddr_in from_addr;
+    struct sockaddr_storage from_addr;
     if (member_parse_addr(msg->from_id, &from_addr) != 0) return;
     switch (msg->type) {
         case GMSG_PING:
@@ -173,7 +176,7 @@ static void handle_message(const gmsg_t *msg) {
             break;
 
         case GMSG_ACK: {
-            struct sockaddr_in requester;
+            struct sockaddr_storage requester;
             int has_requester = 0;
             pthread_mutex_lock(&g_lock);
             for (int i = 0; i < MAX_PENDING; i++) {
@@ -311,8 +314,9 @@ static void *receiver_thread(void *arg) {
     (void)arg;
     char buf[PULSE_MAX_MSG];
     while (!g_stop) {
-        struct sockaddr_in from; /* source address; only used for logging,
-                                    never for replies (see handle_message) */
+        struct sockaddr_storage from; /* source address; only used for
+                                         logging, never for replies (see
+                                         handle_message) */
         socklen_t fromlen = sizeof(from);
         ssize_t n = recvfrom(g_sock, buf, sizeof(buf) - 1, 0,
                              (struct sockaddr *)&from, &fromlen);
@@ -347,7 +351,7 @@ static void probe_cycle(int cycle) {
      * entry is created: suspicion comes from phi, not from a probe
      * timeout, so there is nothing to escalate. */
     char peer_id[PULSE_ID_LEN];
-    struct sockaddr_in peer_addr;
+    struct sockaddr_storage peer_addr;
     int have_peer = 0;
     pthread_mutex_lock(&g_lock);
     member_t *peer = member_random_peer(&g_table, g_self_id);
@@ -400,8 +404,8 @@ static void probe_cycle(int cycle) {
     typedef struct {
         uint32_t seq;
         char target_id[PULSE_ID_LEN];
-        struct sockaddr_in target_addr;
-        struct sockaddr_in inter[PING_REQ_FANOUT];
+        struct sockaddr_storage target_addr;
+        struct sockaddr_storage inter[PING_REQ_FANOUT];
         int n_inter;
     } indirect_action_t;
     indirect_action_t actions[8];
@@ -465,8 +469,7 @@ static void probe_cycle(int cycle) {
                 if (strcmp(m->id, actions[a].target_id) == 0) continue;
                 int dup = 0;
                 for (int j = 0; j < actions[a].n_inter; j++) {
-                    if (memcmp(&actions[a].inter[j], &m->addr,
-                               sizeof(struct sockaddr_in)) == 0) {
+                    if (pulse_addr_equal(&actions[a].inter[j], &m->addr)) {
                         dup = 1;
                         break;
                     }
@@ -508,7 +511,7 @@ static void probe_cycle(int cycle) {
     /* 4. Gossip a digest to a random peer every other cycle. */
     member_table_t digest_copy;
     int have_digest = 0;
-    struct sockaddr_in digest_to;
+    struct sockaddr_storage digest_to;
     if (cycle % 2 == 0) {
         member_t *d = member_random_peer(&g_table, g_self_id);
         if (d) {
@@ -606,7 +609,8 @@ static void usage(const char *prog) {
             "       [--dead-retention SECONDS]\n"
             "       [--phi-accrual] [--phi-threshold N]\n"
             "       [--control-port PORT]\n"
-            "       [--secret SECRET | --shared-secret SECRET]\n",
+            "       [--secret SECRET | --shared-secret SECRET]\n"
+            "       [--ipv6] [--bind HOST]\n",
             prog);
 }
 
@@ -672,6 +676,15 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--secret must not be empty\n");
                 return 2;
             }
+        } else if (strcmp(argv[i], "--ipv6") == 0) {
+            g_cfg.ipv6 = 1;
+        } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+            snprintf(g_cfg.bind_host, sizeof g_cfg.bind_host, "%s",
+                     argv[++i]);
+            if (g_cfg.bind_host[0] == '\0') {
+                fprintf(stderr, "--bind must not be empty\n");
+                return 2;
+            }
         } else {
             usage(argv[0]);
             return 2;
@@ -687,25 +700,60 @@ int main(int argc, char **argv) {
     g_incarnation = load_incarnation(g_cfg.data_dir);
     gossip_set_secret(g_cfg.secret);
 
+    /* Address family: an explicit --bind host decides it; otherwise
+     * --ipv6 selects IPv6 and the default is IPv4. A node is one family
+     * or the other — there is no dual-stack mode, so a v4 node and a v6
+     * node cannot accidentally merge (see README, "IPv6"). */
+    int family = AF_INET;
+    struct sockaddr_storage bind_addr;
+    memset(&bind_addr, 0, sizeof bind_addr);
+    if (g_cfg.bind_host[0] != '\0') {
+        if (member_parse_host(g_cfg.bind_host, &bind_addr) != 0) {
+            fprintf(stderr, "bad --bind address: %s\n", g_cfg.bind_host);
+            return 2;
+        }
+        family = bind_addr.ss_family;
+    } else if (g_cfg.ipv6) {
+        family = AF_INET6;
+    }
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *b6 = (struct sockaddr_in6 *)&bind_addr;
+        b6->sin6_family = AF_INET6;
+        b6->sin6_port = htons((uint16_t)g_cfg.port);
+        /* bind_addr is otherwise all zeros (in6addr_any) unless --bind
+         * set a specific host. */
+    } else {
+        struct sockaddr_in *b4 = (struct sockaddr_in *)&bind_addr;
+        b4->sin_family = AF_INET;
+        b4->sin_port = htons((uint16_t)g_cfg.port);
+    }
+
     if (g_cfg.has_id) {
         snprintf(g_self_id, sizeof g_self_id, "%s", g_cfg.id);
+    } else if (g_cfg.bind_host[0] != '\0') {
+        /* Default id is the bind address: "[2001:db8::5]:17101". */
+        member_format_id(&bind_addr, g_self_id, sizeof g_self_id);
+    } else if (family == AF_INET6) {
+        snprintf(g_self_id, sizeof g_self_id, "[::1]:%d", g_cfg.port);
     } else {
         snprintf(g_self_id, sizeof g_self_id, "127.0.0.1:%d", g_cfg.port);
     }
 
-    g_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    g_sock = socket(family, SOCK_DGRAM, 0);
     if (g_sock < 0) {
         perror("socket");
         return 1;
     }
     int one = 1;
     setsockopt(g_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in bind_addr;
-    memset(&bind_addr, 0, sizeof bind_addr);
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind_addr.sin_port = htons((uint16_t)g_cfg.port);
-    if (bind(g_sock, (struct sockaddr *)&bind_addr, sizeof bind_addr) < 0) {
+    if (family == AF_INET6) {
+        /* Pure IPv6: do not also accept IPv4-mapped traffic. A v6 node
+         * is v6-only, so a v4 node cannot reach it through its IPv4
+         * address and the two families stay separate clusters. */
+        setsockopt(g_sock, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+    }
+    if (bind(g_sock, (struct sockaddr *)&bind_addr,
+             pulse_addr_len(&bind_addr)) < 0) {
         perror("bind");
         return 1;
     }
@@ -717,18 +765,49 @@ int main(int argc, char **argv) {
      * nothing and does not filter sendto) keeps gossip flowing there
      * and is a no-op on a normal host. The receiving socket stays
      * unconnected so it keeps accepting datagrams from any peer. */
-    g_send_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    g_send_sock = socket(family, SOCK_DGRAM, 0);
     if (g_send_sock >= 0) {
-        struct sockaddr_in dst;
-        memset(&dst, 0, sizeof dst);
-        dst.sin_family = AF_INET;
-        if (g_cfg.seed_count > 0) {
-            member_parse_addr(g_cfg.seeds[0], &dst);
-        } else {
-            dst.sin_port = htons(1);
-            inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
+        if (family == AF_INET6) {
+            /* Same as the receiving socket: a v6 node is v6-only.
+             * Without this, the send socket is dual-stack by default
+             * and a v6 node could still reach a v4 peer (Linux maps
+             * the IPv4 destination to ::ffff:a.b.c.d), so the two
+             * families would half-merge: the v4 side would hear the
+             * v6 node while the v6 side could never hear it back. */
+            setsockopt(g_send_sock, IPPROTO_IPV6, IPV6_V6ONLY, &one,
+                       sizeof one);
         }
-        if (connect(g_send_sock, (struct sockaddr *)&dst, sizeof dst) < 0) {
+        /* Connect to the first seed of our own family, if there is one;
+         * a seed of the other family can never be reached from this
+         * socket, so it is skipped, not connected to. With no usable
+         * seed, connect to loopback (port 1, nothing listens there). */
+        struct sockaddr_storage dst;
+        memset(&dst, 0, sizeof dst);
+        int have_dst = 0;
+        for (int i = 0; i < g_cfg.seed_count; i++) {
+            struct sockaddr_storage s;
+            if (member_parse_addr(g_cfg.seeds[i], &s) == 0 &&
+                s.ss_family == family) {
+                dst = s;
+                have_dst = 1;
+                break;
+            }
+        }
+        if (!have_dst) {
+            if (family == AF_INET6) {
+                struct sockaddr_in6 *d6 = (struct sockaddr_in6 *)&dst;
+                d6->sin6_family = AF_INET6;
+                d6->sin6_port = htons(1);
+                inet_pton(AF_INET6, "::1", &d6->sin6_addr);
+            } else {
+                struct sockaddr_in *d4 = (struct sockaddr_in *)&dst;
+                d4->sin_family = AF_INET;
+                d4->sin_port = htons(1);
+                inet_pton(AF_INET, "127.0.0.1", &d4->sin_addr);
+            }
+        }
+        if (connect(g_send_sock, (struct sockaddr *)&dst,
+                    pulse_addr_len(&dst)) < 0) {
             /* Non-fatal: plain sendto works on a normal host. */
             fprintf(stderr, "warning: send-socket connect failed: %s\n",
                     strerror(errno));
@@ -739,18 +818,31 @@ int main(int argc, char **argv) {
     }
 
     member_table_init(&g_table);
-    struct sockaddr_in self_addr;
-    memset(&self_addr, 0, sizeof self_addr);
-    self_addr.sin_family = AF_INET;
-    self_addr.sin_port = htons((uint16_t)g_cfg.port);
-    inet_pton(AF_INET, "127.0.0.1", &self_addr.sin_addr);
+    /* The address stored for self is the one the id advertises: peers
+     * already reply to the advertised id, so the table entry should
+     * agree with it. (An unparseable --id falls back to loopback.) */
+    struct sockaddr_storage self_addr;
+    if (member_parse_addr(g_self_id, &self_addr) != 0) {
+        memset(&self_addr, 0, sizeof self_addr);
+        if (family == AF_INET6) {
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&self_addr;
+            s6->sin6_family = AF_INET6;
+            s6->sin6_port = htons((uint16_t)g_cfg.port);
+            inet_pton(AF_INET6, "::1", &s6->sin6_addr);
+        } else {
+            struct sockaddr_in *s4 = (struct sockaddr_in *)&self_addr;
+            s4->sin_family = AF_INET;
+            s4->sin_port = htons((uint16_t)g_cfg.port);
+            inet_pton(AF_INET, "127.0.0.1", &s4->sin_addr);
+        }
+    }
     member_add(&g_table, g_self_id, &self_addr, g_incarnation);
     member_t *self = member_find(&g_table, g_self_id);
     self->last_seen_ms = g_start_ms;
     self->state_since_ms = g_start_ms;
 
     for (int i = 0; i < g_cfg.seed_count; i++) {
-        struct sockaddr_in seed_addr;
+        struct sockaddr_storage seed_addr;
         if (member_parse_addr(g_cfg.seeds[i], &seed_addr) != 0) {
             fprintf(stderr, "bad seed address: %s\n", g_cfg.seeds[i]);
             continue;
@@ -765,12 +857,13 @@ int main(int argc, char **argv) {
 
     /* The secret itself is never logged; only that a secret is on. */
     const char *sec = g_cfg.secret[0] != '\0' ? " secret=on" : "";
+    const char *v6 = family == AF_INET6 ? " ipv6=on" : "";
     if (g_cfg.phi_accrual) {
-        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s", g_self_id,
-                 g_incarnation, g_cfg.port, g_cfg.phi_threshold, sec);
+        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s%s", g_self_id,
+                 g_incarnation, g_cfg.port, g_cfg.phi_threshold, sec, v6);
     } else {
-        log_line("START %s inc=%u port=%d%s", g_self_id, g_incarnation,
-                 g_cfg.port, sec);
+        log_line("START %s inc=%u port=%d%s%s", g_self_id, g_incarnation,
+                 g_cfg.port, sec, v6);
     }
 
     signal(SIGINT, on_signal);
@@ -791,7 +884,7 @@ int main(int argc, char **argv) {
     pthread_t control = 0;
     int have_control = 0;
     if (g_cfg.control_port > 0) {
-        g_control_sock = control_listen(g_cfg.control_port);
+        g_control_sock = control_listen(g_cfg.control_port, family);
         if (g_control_sock < 0) {
             fprintf(stderr, "control plane: listen on port %d failed: %s\n",
                     g_cfg.control_port, strerror(errno));
@@ -808,7 +901,9 @@ int main(int argc, char **argv) {
             return 1;
         }
         have_control = 1;
-        log_line("CONTROL 127.0.0.1:%d", g_cfg.control_port);
+        log_line("CONTROL %s:%d",
+                 family == AF_INET6 ? "[::1]" : "127.0.0.1",
+                 g_cfg.control_port);
     }
     while (!g_stop) pause();
     pthread_join(receiver, NULL);

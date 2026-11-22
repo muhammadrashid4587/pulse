@@ -40,6 +40,10 @@ building block, not a production service mesh.
   secret only accept traffic from peers presenting it, so two clusters
   on the same network cannot accidentally merge. See "Shared secret"
   below. Nodes without a secret behave exactly as before.
+- IPv6 (`--ipv6`): a node can run entirely over IPv6, with bracketed
+  member ids (`[::1]:17101`), the control plane on `::1`, and
+  `pulse-ctl` accepting `[::1]:port`. See "IPv6" below. IPv4 remains
+  the default and is unchanged.
 
 ## What it is not
 
@@ -75,6 +79,8 @@ GOSSIP <from-id> <from-inc> <count> <id:inc:state> ...
 
 State codes in gossip entries: `A` alive, `S` suspect, `D` dead.
 Member ids are `host:port`, so a gossip entry is self-contained.
+IPv6 ids are bracketed (`[::1]:17101`), which keeps the `id:inc:state`
+entries unambiguous even though the address itself contains colons.
 
 When a shared secret is configured, every message carries a trailing
 ` <tag>` token: the first 8 bytes of HMAC-SHA256(secret, message),
@@ -161,6 +167,8 @@ scripts/demo.sh
 | `--phi-threshold` | 8.0 | Phi value at which a peer is suspected (phi mode only) |
 | `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `LEAVE`) |
 | `--secret` / `--shared-secret` | — (none) | Shared secret for joins: only peers presenting the same secret are accepted |
+| `--ipv6` | off | Run over IPv6: bind `::`, ids are `[::1]:port`, control plane on `::1` |
+| `--bind HOST` | — (wildcard) | Bind address override, a literal IP: decides the family and the default id host (`--bind ::1` is IPv6, `--bind 127.0.0.1` is IPv4) |
 
 Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 `GC` (a DEAD entry removed after its retention expired), `ALIVE`,
@@ -248,6 +256,46 @@ What it is and is not:
   at all. The result in both directions is two separate clusters, not
   one working one.
 
+## IPv6
+
+Start a node with `--ipv6` and it runs entirely over IPv6: the UDP
+socket binds `::` (v6-only), the default id is `[::1]:<port>`, seeds
+are bracketed (`--seed '[::1]:17101'`), and the control plane listens
+on `::1` (`pulse-ctl '[::1]:18401' MEMBERS`). `--bind HOST` pins the
+bind address to a literal IP instead of the wildcard — `--bind ::1`
+for v6 loopback, `--bind 127.0.0.1` for v4 loopback — and the bind
+address decides the family and the default id host. IPv4 stays the
+default: a node with neither flag behaves exactly as before.
+
+```sh
+./pulse-node --ipv6 --port 17101 --data-dir /tmp/p1
+./pulse-node --ipv6 --port 17102 --seed '[::1]:17101' --data-dir /tmp/p2
+```
+
+What it is and is not:
+
+- A node is one family or the other. There is no dual-stack mode: a
+  v6 node sets `IPV6_V6ONLY` on both its sockets, so it neither
+  receives nor sends IPv4 traffic. A v4 node and a v6 node therefore
+  cannot merge — a seed of the other family is simply unanswerable,
+  and goes SUSPECT, DEAD, then GC'd like any seed that never answers.
+  (The V6ONLY flag on the *send* socket matters: without it Linux
+  maps an IPv4 destination to `::ffff:a.b.c.d` and a v6 node can
+  still reach a v4 peer, so the v4 side would hear the v6 node while
+  the v6 side could never hear it back — a half-merge. The test
+  suite caught that and the flag is set on both sockets.)
+- Member ids are `host:port` with IPv6 hosts bracketed, so `[::1]:17101`
+  is the id and `::1:17101` also parses (the port is after the last
+  colon) but always formats back bracketed. The wire protocol is
+  unchanged: gossip entries split `id:inc:state` from the right, so
+  bracketed ids need no escaping.
+- The control plane follows the node's family. A v6 node's control
+  port is on `::1` only, same as the v4 one is on `127.0.0.1` only.
+- A v6 node bound to `::` listens on all IPv6 interfaces, like the
+  v4 node bound to `0.0.0.0` listens on all IPv4 interfaces. It
+  still advertises `[::1]` by default — pass `--id` with a reachable
+  address for a multi-host cluster, as with IPv4.
+
 ## Tests
 
 ```sh
@@ -292,6 +340,18 @@ make test
   as before, and a mixed secret/plain pair does not merge. Also checks
   `START` reports `secret=on` only for secret nodes and that the
   secret value never appears in a log.
+- `tests/test_ipv6.c`: unit tests for IPv6 — parse/format round-trips
+  for IPv4, bracketed and bare IPv6 ids, rejects for malformed ids and
+  ports, `pulse_addr_equal`/`pulse_addr_len`, bare-host parsing for
+  `--bind`, gossip parsing of PING/JOIN/PING_REQ/GOSSIP messages
+  carrying IPv6 ids, and membership-table operations on v6 ids.
+- `tests/test_ipv6.sh`: integration test for IPv6 — a 3-node `--ipv6`
+  cluster converges, a killed node is marked DEAD by both survivors,
+  the survivors agree, a restarted node comes back ALIVE, the control
+  plane answers over IPv6 (`pulse-ctl '[::1]:port'`), `--bind ::1`
+  and `--bind 127.0.0.1` nodes join normally, and mixed families do
+  not merge (each side GCs the unanswering cross-family seed and
+  neither side ever learns the other's id).
 
 ## Roadmap
 
@@ -299,4 +359,4 @@ make test
 - ~~Phi-accrual failure detection as an alternative to fixed timeouts.~~ Done in 0.3.0.
 - ~~A TCP control plane: query membership, force-leave a member.~~ Done in 0.4.0.
 - ~~Optional shared secret so only trusted devices can join.~~ Done in 0.5.0.
-- IPv6.
+- ~~IPv6.~~ Done in 0.6.0.

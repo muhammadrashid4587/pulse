@@ -14,17 +14,25 @@
 
 #define CONTROL_MAX_LINE 1024
 
-int control_listen(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+int control_listen(int port, int family) {
+    int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
     memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&addr;
+        a6->sin6_family = AF_INET6;
+        a6->sin6_addr = in6addr_loopback;
+        a6->sin6_port = htons((uint16_t)port);
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&addr;
+        a4->sin_family = AF_INET;
+        a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a4->sin_port = htons((uint16_t)port);
+    }
+    if (bind(fd, (struct sockaddr *)&addr, pulse_addr_len(&addr)) < 0) {
         close(fd);
         return -1;
     }
@@ -154,7 +162,7 @@ static void handle_connection(int fd, const control_hooks_t *hooks) {
 
 void control_serve(int fd, const control_hooks_t *hooks) {
     for (;;) {
-        struct sockaddr_in peer;
+        struct sockaddr_storage peer;
         socklen_t peerlen = sizeof peer;
         int conn = accept(fd, (struct sockaddr *)&peer, &peerlen);
         if (conn < 0) {

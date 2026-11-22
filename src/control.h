@@ -48,9 +48,12 @@ typedef struct {
     int64_t start_ms; /* monotonic ms when the node started */
 } control_hooks_t;
 
-/* Create, bind and listen on a TCP socket for the control plane.
- * Returns the listen fd, or -1 on error (with errno set). */
-int control_listen(int port);
+/* Create, bind and listen on a TCP socket for the control plane, on the
+ * loopback address of the given family (AF_INET or AF_INET6). The
+ * control plane follows the node's family: a v6 node answers on ::1,
+ * a v4 node on 127.0.0.1. Returns the listen fd, or -1 on error (with
+ * errno set). */
+int control_listen(int port, int family);
 
 /* Serve connections on fd until accept() fails (e.g. the fd is shut
  * down from another thread). Returns when the server stops. */

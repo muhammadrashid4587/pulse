@@ -7,13 +7,13 @@ HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h
 
 .PHONY: all test clean
 
-all: pulse-node pulse-ctl test_member test_phi test_secret
+all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6
 
 pulse-node: $(NODE_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $(NODE_SRC) $(LDFLAGS)
 
-pulse-ctl: src/pulse_ctl.c
-	$(CC) $(CFLAGS) -o $@ src/pulse_ctl.c
+pulse-ctl: src/pulse_ctl.c src/member.c src/phi.c src/member.h src/phi.h
+	$(CC) $(CFLAGS) -o $@ src/pulse_ctl.c src/member.c src/phi.c $(LDFLAGS)
 
 test_member: tests/test_member.c src/member.c src/phi.c src/member.h src/phi.h
 	$(CC) $(CFLAGS) -o $@ tests/test_member.c src/member.c src/phi.c $(LDFLAGS)
@@ -24,15 +24,20 @@ test_phi: tests/test_phi.c src/member.c src/phi.c src/member.h src/phi.h
 test_secret: tests/test_secret.c src/member.c src/phi.c src/gossip.c src/secret.c src/member.h src/phi.h src/gossip.h src/secret.h
 	$(CC) $(CFLAGS) -o $@ tests/test_secret.c src/member.c src/phi.c src/gossip.c src/secret.c $(LDFLAGS)
 
-test: pulse-node pulse-ctl test_member test_phi test_secret
+test_ipv6: tests/test_ipv6.c src/member.c src/phi.c src/gossip.c src/secret.c src/member.h src/phi.h src/gossip.h src/secret.h
+	$(CC) $(CFLAGS) -o $@ tests/test_ipv6.c src/member.c src/phi.c src/gossip.c src/secret.c $(LDFLAGS)
+
+test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6
 	./test_member
 	./test_phi
 	./test_secret
+	./test_ipv6
 	bash tests/test_cluster.sh
 	bash tests/test_gc.sh
 	bash tests/test_phi.sh
 	bash tests/test_control.sh
 	bash tests/test_secret.sh
+	bash tests/test_ipv6.sh
 
 clean:
-	rm -f pulse-node pulse-ctl test_member test_phi test_secret
+	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6
