@@ -29,6 +29,7 @@
 #include "gossip.h"
 #include "member.h"
 #include "phi.h"
+#include "control.h"
 
 #define MAX_PENDING 32
 #define PING_REQ_FANOUT 2
@@ -51,6 +52,7 @@ typedef struct {
     int64_t dead_retention_ms; /* how long a DEAD entry stays in the table */
     int phi_accrual;           /* suspect on phi instead of fixed timeouts */
     double phi_threshold;      /* phi at which a peer is suspected */
+    int control_port;          /* TCP control plane port, -1 = disabled */
 } config_t;
 
 typedef struct {
@@ -78,6 +80,8 @@ static char g_self_id[PULSE_ID_LEN];
 static uint32_t g_incarnation = 1;
 static int g_sock = -1;      /* bound receiving socket, never connected */
 static int g_send_sock = -1; /* dedicated sending socket (see main) */
+static int g_control_sock = -1; /* TCP control plane listen socket */
+static control_hooks_t g_hooks;
 static int64_t g_start_ms = 0;
 static volatile sig_atomic_t g_stop = 0;
 static uint32_t g_seq = 1;
@@ -101,6 +105,7 @@ static void on_signal(int sig) {
     (void)sig;
     g_stop = 1;
     if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR);
+    if (g_control_sock >= 0) shutdown(g_control_sock, SHUT_RDWR);
 }
 
 /* Incarnation survives restarts: the data dir holds a file with the next
@@ -538,6 +543,37 @@ static void probe_cycle(int cycle) {
     }
 }
 
+/* Control-plane hooks: the control server knows nothing about the
+ * node's threads; it reads state through these. */
+static void snapshot_hook(void *ctx, member_table_t *out) {
+    (void)ctx;
+    pthread_mutex_lock(&g_lock);
+    *out = g_table;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static int phi_enabled_hook(void *ctx) {
+    (void)ctx;
+    return g_cfg.phi_accrual;
+}
+
+static int force_leave_hook(void *ctx, const char *id) {
+    (void)ctx;
+    if (strcmp(id, g_self_id) == 0) return -1;
+    int removed = 0;
+    pthread_mutex_lock(&g_lock);
+    removed = member_force_remove(&g_table, id, pulse_now_ms());
+    pthread_mutex_unlock(&g_lock);
+    if (removed) log_line("LEAVE %s", id);
+    return removed;
+}
+
+static void *control_thread(void *arg) {
+    (void)arg;
+    control_serve(g_control_sock, &g_hooks);
+    return NULL;
+}
+
 static void *prober_thread(void *arg) {
     (void)arg;
     int cycle = 0;
@@ -558,7 +594,8 @@ static void usage(const char *prog) {
             "       [--data-dir DIR] [--probe-interval-ms N]\n"
             "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
             "       [--dead-retention SECONDS]\n"
-            "       [--phi-accrual] [--phi-threshold N]\n",
+            "       [--phi-accrual] [--phi-threshold N]\n"
+            "       [--control-port PORT]\n",
             prog);
 }
 
@@ -572,6 +609,7 @@ int main(int argc, char **argv) {
     g_cfg.dead_retention_ms = 60000; /* 60 s */
     g_cfg.phi_accrual = 0;
     g_cfg.phi_threshold = 8.0;
+    g_cfg.control_port = -1; /* disabled unless --control-port is given */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -607,6 +645,12 @@ int main(int argc, char **argv) {
             g_cfg.phi_threshold = atof(argv[++i]);
             if (g_cfg.phi_threshold <= 0) {
                 fprintf(stderr, "--phi-threshold must be a positive number\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--control-port") == 0 && i + 1 < argc) {
+            g_cfg.control_port = atoi(argv[++i]);
+            if (g_cfg.control_port <= 0 || g_cfg.control_port > 65535) {
+                fprintf(stderr, "--control-port must be a port number\n");
                 return 2;
             }
         } else {
@@ -719,11 +763,38 @@ int main(int argc, char **argv) {
         perror("pthread_create prober");
         return 1;
     }
+    /* TCP control plane, if enabled: a separate thread serving the
+     * hooks on the control port. The listen socket is shut down by
+     * on_signal, which wakes the accept loop so the thread can join. */
+    pthread_t control = 0;
+    int have_control = 0;
+    if (g_cfg.control_port > 0) {
+        g_control_sock = control_listen(g_cfg.control_port);
+        if (g_control_sock < 0) {
+            fprintf(stderr, "control plane: listen on port %d failed: %s\n",
+                    g_cfg.control_port, strerror(errno));
+            return 1;
+        }
+        g_hooks.ctx = NULL;
+        g_hooks.snapshot = snapshot_hook;
+        g_hooks.force_leave = force_leave_hook;
+        g_hooks.phi_enabled = phi_enabled_hook;
+        g_hooks.self_id = g_self_id;
+        g_hooks.start_ms = g_start_ms;
+        if (pthread_create(&control, NULL, control_thread, NULL) != 0) {
+            perror("pthread_create control");
+            return 1;
+        }
+        have_control = 1;
+        log_line("CONTROL 127.0.0.1:%d", g_cfg.control_port);
+    }
     while (!g_stop) pause();
     pthread_join(receiver, NULL);
     pthread_join(prober, NULL);
+    if (have_control) pthread_join(control, NULL);
     log_line("STOP %s", g_self_id);
     close(g_sock);
     if (g_send_sock != g_sock) close(g_send_sock);
+    if (g_control_sock >= 0) close(g_control_sock);
     return 0;
 }

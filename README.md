@@ -31,6 +31,11 @@ building block, not a production service mesh.
   suspected when its phi — -log10 of the probability of a gap this
   long — crosses a configurable threshold (default 8.0), instead of
   after a fixed ack timeout. The fixed-timeout path stays the default.
+- TCP control plane (opt-in, `--control-port`): a line-based protocol
+  for asking a running node for its membership (`MEMBERS`), its status
+  (`STATUS`), or force-removing a member (`LEAVE <id>`). See
+  "Control plane" below. Query it with the bundled `pulse-ctl` client
+  or plain netcat.
 
 ## What it is not
 
@@ -43,9 +48,11 @@ building block, not a production service mesh.
 - Dead members are garbage-collected after a retention period (default
   60 s, `--dead-retention`): the entry is dropped, a tombstone stops
   gossip from resurrecting it, and a rejoining node comes back at a
-  higher incarnation. Removals are not sent on the wire — each node
-  GCs on its own retention timer, and tombstones (kept twice as long)
-  stop a peer that still holds the DEAD entry from re-adding it here.
+  higher incarnation. Tombstones ride along in gossip digests as DEAD
+  entries, so a removal spreads to peers (which mark the member DEAD
+  and GC it on their own retention timer) instead of waiting for each
+  peer to notice the crash itself. A live member that hears itself
+  DEAD refutes by bumping its incarnation.
 
 ## Protocol
 
@@ -138,6 +145,7 @@ scripts/demo.sh
 | `--dead-retention` | 60 | Seconds a DEAD entry stays in the table before GC |
 | `--phi-accrual` | off | Suspect on phi instead of the fixed ack timeout |
 | `--phi-threshold` | 8.0 | Phi value at which a peer is suspected (phi mode only) |
+| `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `LEAVE`) |
 
 Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 `GC` (a DEAD entry removed after its retention expired), `ALIVE`,
@@ -150,6 +158,45 @@ Note on sending: `pulse-node` sends on a dedicated socket that is
 connect keeps gossip flowing there and is a no-op on a normal host. The
 receiving socket stays unconnected so it keeps accepting datagrams from
 any peer.
+
+## Control plane
+
+Start a node with `--control-port` and it listens on a TCP socket on
+localhost for one line-based command per connection, replying in plain
+text and closing the connection. No authentication — it is a local
+debugging and operations interface, not a public API; do not expose
+the port beyond localhost.
+
+```sh
+./pulse-node --port 17101 --control-port 18401 --data-dir /tmp/p1
+
+./pulse-ctl 127.0.0.1:18401 MEMBERS
+# MEMBER 127.0.0.1:17101 1 ALIVE -
+# MEMBER 127.0.0.1:17102 1 ALIVE 0.42
+# END
+
+./pulse-ctl 127.0.0.1:18401 STATUS
+# STATUS id=127.0.0.1:17101 uptime=42 alive=2 suspect=0 dead=0 total=2
+# END
+
+./pulse-ctl 127.0.0.1:18401 LEAVE 127.0.0.1:17102
+# OK 127.0.0.1:17102
+```
+
+Or with netcat, if it is installed:
+
+```sh
+printf 'MEMBERS\n' | nc 127.0.0.1 18401
+```
+
+Commands:
+
+| Command | Reply |
+| ------- | ----- |
+| `MEMBERS` | One `MEMBER <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <phi\|->` line per member, then `END`. Phi is the peer's current phi (two decimals) when phi-accrual is on and the peer has heartbeat history; `-` otherwise, including self. |
+| `STATUS` | One `STATUS id=<self> uptime=<seconds> alive=N suspect=N dead=N total=N` line, then `END`. |
+| `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
+| anything else | `ERR unknown command` |
 
 ## Tests
 
@@ -176,11 +223,17 @@ make test
   cluster in `--phi-accrual` mode converges, a killed node is SUSPECTED
   with a phi value and then marked DEAD by both survivors, and a
   restarted node comes back ALIVE.
+- `tests/test_control.sh`: integration test for the TCP control plane —
+  `MEMBERS` lists the node itself, `STATUS` reports id and totals,
+  unknown commands and bad `LEAVE` usage get clean `ERR` lines, a
+  second node appears in `MEMBERS` after joining, `LEAVE` removes it
+  from the listing immediately, the live node comes back via direct
+  contact, and `LEAVE` of a dead node removes it for good.
 
 ## Roadmap
 
 - ~~Garbage collection of old DEAD entries.~~ Done in 0.2.0.
 - ~~Phi-accrual failure detection as an alternative to fixed timeouts.~~ Done in 0.3.0.
-- A TCP control plane: query membership, force-leave a member.
+- ~~A TCP control plane: query membership, force-leave a member.~~ Done in 0.4.0.
 - Optional shared secret so only trusted devices can join.
 - IPv6.

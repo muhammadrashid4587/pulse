@@ -82,6 +82,13 @@ int member_mark_alive(member_table_t *t, const char *id,
                       int64_t now);
 
 int member_count_state(const member_table_t *t, member_state_t state);
+/* Force-remove a member (operator action, e.g. the control plane's
+ * LEAVE): drop the entry from the table and record a tombstone so
+ * gossip cannot resurrect it at the recorded incarnation or below.
+ * A live member that hears about its own removal refutes by bumping
+ * its incarnation and comes back; a dead one stays gone. Returns 1
+ * if the member was present, 0 if unknown. */
+int member_force_remove(member_table_t *t, const char *id, int64_t now);
 /* Garbage-collect DEAD members whose state is older than
  * dead_retention_ms. Each removal records a tombstone so gossip cannot
  * resurrect the entry, and tombstones older than

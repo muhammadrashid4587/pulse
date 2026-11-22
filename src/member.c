@@ -237,6 +237,15 @@ int member_mark_alive(member_table_t *t, const char *id,
     return changed;
 }
 
+int member_force_remove(member_table_t *t, const char *id, int64_t now) {
+    member_t *m = member_find(t, id);
+    if (!m) return 0;
+    tombstone_add(t, m->id, m->incarnation, now);
+    /* Swap-remove: the last entry moves into this slot. */
+    *m = t->members[--t->count];
+    return 1;
+}
+
 int member_count_state(const member_table_t *t, member_state_t state) {
     int n = 0;
     for (int i = 0; i < t->count; i++) {

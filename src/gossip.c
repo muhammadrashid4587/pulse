@@ -42,20 +42,41 @@ int gossip_send_join(int sock, const struct sockaddr_in *to,
 int gossip_send_digest(int sock, const struct sockaddr_in *to,
                        const char *from_id, uint32_t inc,
                        const member_table_t *t) {
-    char buf[PULSE_MAX_MSG];
+    /* Entry text is built first so the header count can cover both the
+     * member window and the tombstones appended after it. */
+    char entries[1280];
+    int off = 0;
     int n = t->count;
     if (n == 0) return 0;
     int start = rand() % n;
     int count = n < PULSE_GOSSIP_ENTRIES ? n : PULSE_GOSSIP_ENTRIES;
-    int off = snprintf(buf, sizeof buf, "GOSSIP %s %u %d", from_id, inc, count);
-    if (off < 0 || (size_t)off >= sizeof buf) return -1;
     for (int k = 0; k < count; k++) {
         const member_t *m = &t->members[(start + k) % n];
-        int w = snprintf(buf + off, sizeof buf - (size_t)off, " %s:%u:%c",
-                         m->id, m->incarnation, member_state_code(m->state));
-        if (w < 0 || (size_t)(off + w) >= sizeof buf) break;
+        int w = snprintf(entries + off, sizeof entries - (size_t)off,
+                         " %s:%u:%c", m->id, m->incarnation,
+                         member_state_code(m->state));
+        if (w < 0 || (size_t)(off + w) >= sizeof entries) break;
         off += w;
     }
+    /* Tombstones ride along as DEAD entries when there is room: a
+     * force-leave (or a GC removal) then spreads to peers, which mark
+     * the member DEAD and GC it on their own retention timer. A live
+     * member that hears itself DEAD refutes by bumping its incarnation,
+     * exactly as for a DEAD entry already in the table. */
+    int total = count;
+    for (int k = 0; k < t->tombstone_count && total < PULSE_GOSSIP_ENTRIES; k++) {
+        const tombstone_t *ts = &t->tombstones[k];
+        int w = snprintf(entries + off, sizeof entries - (size_t)off,
+                         " %s:%u:%c", ts->id, ts->incarnation,
+                         member_state_code(MEMBER_DEAD));
+        if (w < 0 || (size_t)(off + w) >= sizeof entries) break;
+        off += w;
+        total++;
+    }
+    char buf[PULSE_MAX_MSG];
+    int hoff = snprintf(buf, sizeof buf, "GOSSIP %s %u %d%s", from_id, inc,
+                        total, entries);
+    if (hoff < 0 || (size_t)hoff >= sizeof buf) return -1;
     return send_str(sock, to, buf);
 }
 
