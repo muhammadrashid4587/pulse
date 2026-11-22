@@ -53,6 +53,11 @@ building block, not a production service mesh.
   `JOIN` to the seed every ~5 s (logged as `REJOIN`) until the seed
   answers, so a late-starting seed still merges the cluster instead
   of leaving the node isolated forever. See "Seed rejoin" below.
+- Membership persistence: a node saves the peers it knows to
+  `<data-dir>/members` every ~5 s and on clean shutdown, and reloads
+  them on startup, so a restarted node re-discovers its old peers
+  even with no `--seed` — and re-probes every restored entry instead
+  of trusting it. See "Membership persistence" below.
 
 ## What it is not
 
@@ -167,7 +172,7 @@ scripts/demo.sh
 | `--port` | — (required) | UDP port to listen on |
 | `--id` | `127.0.0.1:<port>` | Member id; set it to a reachable address on multi-host clusters |
 | `--seed` | — (repeatable) | `host:port` of a known member to join through |
-| `--data-dir` | `.` | Directory holding the `incarnation` state file |
+| `--data-dir` | `.` | Directory holding the `incarnation` and `members` state files |
 | `--probe-interval-ms` | 100 | How often to probe a random peer |
 | `--ack-timeout-ms` | 100 | How long to wait for an ACK before an indirect probe |
 | `--suspect-timeout-ms` | 300 | How long a SUSPECT lasts before becoming DEAD |
@@ -344,6 +349,45 @@ a seed that is already ALIVE is never re-joined.
 # Node 2 logs REJOIN, node 1 logs JOIN, both report alive=2.
 ```
 
+## Membership persistence
+
+A node saves the peers it knows to `<data-dir>/members` every ~5 s
+and once more on clean shutdown (SIGINT/SIGTERM), one line per
+member — `id incarnation state age-seconds` — written atomically
+(tmp file + rename), and reloads the file on startup, logging
+`RESTORE <n> members`. A restarted node therefore re-discovers its
+old peers by probing them directly, even when it starts with no
+`--seed` at all.
+
+Nothing in the file is trusted. Every restored entry is re-probed
+through the normal failure-detection path, and a restored entry that
+stays silent goes SUSPECT then DEAD again like any other peer:
+
+- ALIVE entries come back ALIVE, with `last_seen` aged by the
+  recorded age, so the prober picks them up immediately.
+- SUSPECT and DEAD entries come back SUSPECT with a fresh clock, so
+  they get a full suspect window of probing before the sweep can
+  declare them DEAD. A peer that was DEAD when the node shut down
+  may have restarted since, and a peer that was SUSPECT may be fine
+  now — neither verdict survives the restart.
+- Entries the node never actually heard from (a seed that never
+  answered) are not saved: there is nothing to remember about them,
+  and the seed-rejoin retry already covers seeds. Self is never
+  saved either — self is re-added at startup with a higher
+  incarnation. A save with no peers writes an empty file, so a stale
+  file can never resurrect a shrunken cluster.
+- Malformed lines are skipped, not fatal: a hand-edited or truncated
+  file never stops a node from starting. A missing file loads zero
+  members, which is the first-start case.
+
+```sh
+# Terminal 1: 3-node cluster, then stop node 3 cleanly (Ctrl-C)
+./pulse-node --port 17103 --seed 127.0.0.1:17101 --data-dir /tmp/p3
+# Terminal 1 again: restart node 3 with NO seed, same data dir
+./pulse-node --port 17103 --data-dir /tmp/p3
+# Node 3 logs RESTORE 2 members and the cluster is back to alive=3.
+```
+
 ## Gossip fanout
 
 Every other probe cycle (every ~200 ms at the default 100 ms probe
@@ -436,6 +480,19 @@ make test
   ports, `pulse_addr_equal`/`pulse_addr_len`, bare-host parsing for
   `--bind`, gossip parsing of PING/JOIN/PING_REQ/GOSSIP messages
   carrying IPv6 ids, and membership-table operations on v6 ids.
+- `tests/test_persist.c`: unit tests for membership persistence —
+  save/load round-trips the id, incarnation, state, and age
+  (including a bracketed IPv6 id), self and never-contacted entries
+  are not saved, a DEAD entry loads back as SUSPECT (re-probed, not
+  trusted), malformed lines are skipped, an empty save leaves an
+  empty file, and ages clamp at one day.
+- `tests/test_persist.sh`: integration test for membership
+  persistence — a 3-node cluster converges, node 3 stops cleanly and
+  its peers land in the members file, node 3 restarts with no seed
+  and re-discovers both peers (`RESTORE 2 members`, alive=3 again),
+  and a node started from a hand-written members file converges
+  with the real peer while the bogus peer is suspected, marked
+  dead, and garbage-collected.
 - `tests/test_rejoin.sh`: integration test for seed rejoin — a node
   starts with its seed down, GCs the unanswering seed, the seed comes
   up later, and the node re-sends JOIN (REJOIN log line) until both
@@ -460,3 +517,4 @@ make test
 - ~~Prioritized gossip digests: the most recently changed SUSPECT/DEAD entries lead each digest (up to 4, most recent first), so failure news is never stuck behind the random window when the table is larger than the 16-entry digest.~~ Done in 0.9.0.
 - ~~Failure-detector metrics: detection latency (last heartbeat to SUSPECT) and suspect-to-dead duration, with transition counts, exposed as a `METRICS` command on the control plane.~~ Done in 0.10.0.
 - ~~Machine-readable cluster view: a `JSON` control-plane command returning status, members, and metrics as one JSON object, so tooling can poll cluster state without scraping the text protocol.~~ Done in 0.11.0.
+- ~~Membership persistence: save the known member list to disk periodically and on clean shutdown, and reload it on startup, so a restarted node re-discovers its old peers without a seed — re-probing every restored entry instead of trusting it.~~ Done in 0.12.0.

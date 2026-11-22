@@ -29,6 +29,7 @@
 #include "gossip.h"
 #include "member.h"
 #include "metrics.h"
+#include "persist.h"
 #include "phi.h"
 #include "secret.h"
 #include "control.h"
@@ -360,6 +361,12 @@ static void *receiver_thread(void *arg) {
     return NULL;
 }
 
+/* Save the membership table every 50 probe cycles (every ~5 s at the
+ * default 100 ms probe interval) so a crash loses at most a few
+ * seconds of membership knowledge. The save runs on a snapshot copy
+ * taken under the lock; the file write itself happens outside it. */
+#define PERSIST_EVERY_CYCLES 50
+
 /* One probe cycle: ping a random peer, escalate timed-out probes to
  * indirect probes, suspect peers whose indirect probes also fail, sweep
  * stale suspects to dead, gossip a digest, and log a STATUS line. */
@@ -622,6 +629,10 @@ static void probe_cycle(int cycle) {
         st_suspect = member_count_state(&g_table, MEMBER_SUSPECT);
         st_dead = member_count_state(&g_table, MEMBER_DEAD);
     }
+    /* 6. Periodic membership save (see PERSIST_EVERY_CYCLES). */
+    member_table_t persist_copy;
+    int do_persist = (cycle % PERSIST_EVERY_CYCLES == 0);
+    if (do_persist) persist_copy = g_table;
     pthread_mutex_unlock(&g_lock);
 
     for (int i = 0; i < n_actions; i++) {
@@ -658,6 +669,10 @@ static void probe_cycle(int cycle) {
     if (cycle % 10 == 0) {
         log_line("STATUS alive=%d suspect=%d dead=%d total=%d", st_alive,
                  st_suspect, st_dead, st_alive + st_suspect + st_dead);
+    }
+    if (do_persist) {
+        pulse_members_save(g_cfg.data_dir, &persist_copy, g_self_id,
+                           pulse_now_ms());
     }
 }
 
@@ -955,6 +970,18 @@ int main(int argc, char **argv) {
     self->last_seen_ms = g_start_ms;
     self->state_since_ms = g_start_ms;
 
+    /* Membership persistence: reload the peers this node knew before
+     * its last shutdown, so a restarted node re-probes its old peers
+     * instead of starting from only the seed list. Restored entries
+     * are re-probed, never trusted (see persist.h); a restart with no
+     * --seed still rejoins the cluster. Loaded before the seeds so a
+     * seed that is also a restored peer keeps its restored entry. */
+    int n_restored =
+        pulse_members_load(g_cfg.data_dir, &g_table, g_self_id,
+                           pulse_now_ms());
+    if (n_restored > 0)
+        log_line("RESTORE %d members", n_restored);
+
     for (int i = 0; i < g_cfg.seed_count; i++) {
         struct sockaddr_storage seed_addr;
         if (member_parse_addr(g_cfg.seeds[i], &seed_addr) != 0) {
@@ -1024,6 +1051,13 @@ int main(int argc, char **argv) {
     pthread_join(receiver, NULL);
     pthread_join(prober, NULL);
     if (have_control) pthread_join(control, NULL);
+    /* Clean shutdown: save the membership one last time, so the next
+     * start restores the peers known at the moment of shutdown. */
+    pthread_mutex_lock(&g_lock);
+    member_table_t final_copy = g_table;
+    pthread_mutex_unlock(&g_lock);
+    pulse_members_save(g_cfg.data_dir, &final_copy, g_self_id,
+                       pulse_now_ms());
     log_line("STOP %s", g_self_id);
     close(g_sock);
     if (g_send_sock != g_sock) close(g_send_sock);
