@@ -133,7 +133,10 @@ building block, not a production service mesh.
   removed from the file are dropped once they stop answering, and a
   peer that is still ALIVE is never dropped on the strength of a
   file edit alone — or the control plane's `RELOAD` command does the
-  same reload over TCP. See "Live peer-file reload" below.
+  same reload over TCP. The node also watches the file itself: once
+  a second it checks the file's mtime, and an edit re-runs the same
+  merge with no signal and no control-plane call. See "Live
+  peer-file reload" below.
 
 ## What it is not
 
@@ -273,7 +276,10 @@ Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 peers), `PEERS <n> from <file>` (initial peers loaded from a peer
 list file — see "Seedless bootstrap"), `PEERFILE RELOAD <file>
 peers=<n> added=<a> dropped=<d> kept=<k>` (a SIGHUP re-read the peer
-file — see "Live peer-file reload"), `PEERFILE ADD <id>` /
+file — see "Live peer-file reload"), `PEERFILE <file> changed on
+disk, auto-reloading` (the 1 s mtime watch saw the file change and
+re-ran the same merge with no signal — see "Live peer-file
+reload"), `PEERFILE ADD <id>` /
 `PEERFILE DROP <id>` / `PEERFILE KEEP <id> (still ALIVE)` (one line per
 peer the reload added, dropped, or kept), `SLOW <id> mean=Nms threshold=Mms` (a peer's mean probe RTT
 rose above `--slow-peer-rtt-ms`, once per slow episode — see
@@ -563,6 +569,31 @@ cannot read peer file <path>: <reason>` while the old list is kept.
 SIGHUP and RELOAD run the same code, serialized on one lock, so the
 two triggers can never interleave their seed-list edits and JOIN
 sends.
+
+And since 0.26.0 the node watches the file itself: once a second the
+prober thread stats `--peer-file`, and when its mtime moved since
+the last load or reload it re-runs the same merge — no signal, no
+control-plane call, no restart. The reload logs `PEERFILE <file>
+changed on disk, auto-reloading` first, then the usual `PEERFILE
+RELOAD` summary and `ADD`/`DROP`/`KEEP` lines, so an auto-reload is
+visible in the log exactly like a manual one. A SIGHUP or RELOAD
+reload refreshes the watch's baseline, so a manual reload never
+leaves the watch thinking the file changed and re-running the merge
+right after. The check is wall-clock (once a second), so it is
+unaffected by the adaptive probe interval, and it costs one `stat`
+per second and nothing else while the file is untouched.
+
+Three honest caveats. The watch sees the mtime, not the content: an
+edit that preserves the mtime (say, `cp -p`) is invisible to it, and
+SIGHUP or `RELOAD` is still the way to force a reload then. A kept
+peer — removed from the file while still ALIVE — that dies afterwards
+is only dropped at the next file change, when the merge re-examines
+it: the watch cannot know a peer died without a file edit to
+trigger on, so until the next edit the peer leaves the table the
+slow way, through the normal suspect-to-dead-to-GC path. And a
+deleted file is skipped quietly (a manual reload still reports it);
+when the file reappears with a new mtime the watch picks it up on
+the next check.
 
 ## Membership persistence
 
@@ -1138,6 +1169,17 @@ make test
   logged and skipped without disturbing the cluster; a SIGHUP on a
   node with no `--peer-file` is a no-op and the node keeps running;
   and no node restarts on SIGHUP (exactly one `START` line each).
+- `tests/test_peerfile_watch.sh`: integration test for
+  auto-reload on peer-file mtime change (0.26.0) — three nodes
+  converge from one shared file; removing node 3 from the file while
+  ALIVE makes node 1 log `PEERFILE KEEP` with no SIGHUP and no
+  `RELOAD` ever sent; killing node 3 and then making a comment-only
+  edit (no peer change, new mtime) drops the now-unreachable kept
+  peer at once (`PEERFILE DROP`, alive=2); adding node 4 to the file
+  and starting it logs `PEERFILE ADD` with the cluster back to
+  alive=3; and with the file untouched the `PEERFILE RELOAD` count
+  is stable across a 3 s idle window, so the watch does not spam
+  reloads. No node restarts (exactly one `START` line each).
 - `tests/test_control.c`: unit tests for the control-plane dispatch
   (0.25.0) — fake hooks serve canned state and the test drives the
   real `control_listen` / `control_serve` over loopback: `RELOAD`
@@ -1189,3 +1231,4 @@ make test
 - ~~Seedless bootstrap via a peer list file: a node reads its initial peers from a file (`--peer-file`, one `host:port` per line, comments and blank lines ignored), probes them on startup and joins the cluster without a `--seed` flag — the entries get exactly the `--seed` treatment (JOIN at startup, probing, ~5 s rejoin retry), bad lines are logged and skipped, and a missing file is a clean startup error instead of a silent solo start.~~ Done in 0.23.0.
 - ~~Live peer-file reload on SIGHUP: while a `--peer-file` is in use, SIGHUP re-reads the file and merges it into the seed list without restarting — newly listed peers get the `--seed` treatment (seed list, table, JOIN at once), peers removed from the file are dropped from the table only once they stop answering (a still-ALIVE peer is kept and remembered, so a later reload drops it the moment it goes quiet), a peer named with `--seed` is never added or dropped by a reload, self is never dropped, and a reload that cannot read the file keeps the old list; every reload is logged (`PEERFILE RELOAD` summary plus `ADD`/`DROP`/`KEEP` lines), and SIGHUP on a node with no `--peer-file` is a no-op.~~ Done in 0.24.0.
 - ~~RELOAD control-plane command over TCP: the same live peer-file reload SIGHUP triggers, driven from the control plane (`RELOAD`, answered `OK peers=N added=A dropped=D kept=K bad=B`) so an operator who cannot signal the process can still reload the roster; a node with no `--peer-file` answers `ERR no peer file`, an unreadable file answers `ERR cannot read peer file <path>: <reason>` and keeps the old list, and SIGHUP and RELOAD run the same code serialized on one lock so the two triggers can never interleave.~~ Done in 0.25.0.
+- ~~Auto-reload on peer-file mtime change: while a `--peer-file` is in use, the node stats the file once a second and re-runs the same reload merge when its mtime moves — no SIGHUP, no control-plane call, no restart — with the reload logged (`PEERFILE <file> changed on disk, auto-reloading` plus the usual summary) and the watch baseline refreshed by every manual reload so it never re-runs right after one; an edit that preserves the mtime is invisible to the watch, a kept peer that dies after its edit is dropped at the next file change (or by normal GC), and a deleted file is skipped quietly until it reappears.~~ Done in 0.26.0.

@@ -76,6 +76,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_meta.sh
 	bash tests/test_peerfile.sh
 	bash tests/test_peerfile_reload.sh
+	bash tests/test_peerfile_watch.sh
 	bash tests/test_reload.sh
 
 clean:

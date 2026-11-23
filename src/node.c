@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -133,6 +134,30 @@ static volatile sig_atomic_t g_reload_peer_file = 0;
  * lock: a SIGHUP reload and a RELOAD command must never interleave
  * their seed-list edits and JOIN sends. */
 static pthread_mutex_t g_reload_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Auto-reload on peer-file mtime change (0.26.0): the prober thread
+ * stats the peer file once a second (PEER_FILE_WATCH_INTERVAL_MS);
+ * when the mtime moved since the last load or reload, it runs the
+ * same reload merge SIGHUP and RELOAD trigger, so an edited roster
+ * is picked up with no signal and no control-plane call. The mtime
+ * is nanosecond-resolution (st_mtim), so two edits inside one second
+ * still count as a change unless the file is rewritten with
+ * identical content in the same nanosecond — in which case the
+ * reload would have been a no-op anyway. g_peer_file_mtime_known
+ * is 0 until the first successful stat, so a node whose file was
+ * unreadable at startup just records the baseline on its first
+ * good check instead of reloading at once. */
+#define PEER_FILE_WATCH_INTERVAL_MS 1000
+static struct timespec g_peer_file_mtime;
+static int g_peer_file_mtime_known = 0;
+static int64_t g_peer_file_last_check_ms = 0;
+
+/* stat the peer file and return 1 with *ts set when it exists. */
+static int peer_file_mtime(struct timespec *ts) {
+    struct stat st;
+    if (stat(g_cfg.peer_file, &st) != 0) return 0;
+    *ts = st.st_mtim;
+    return 1;
+}
 static uint32_t g_seq = 1;
 static pending_probe_t g_pending[MAX_PENDING];
 static pending_indirect_t g_indirect[MAX_PENDING];
@@ -683,6 +708,14 @@ static void reload_peer_file_locked(pulse_reload_result_t *r) {
         return;
     }
     r->read_ok = 1;
+    /* Auto-reload watch (0.26.0): this successful read is the new
+     * baseline — a SIGHUP/RELOAD reload must not leave the watch
+     * thinking the file changed and re-running the merge. */
+    struct timespec ts;
+    if (peer_file_mtime(&ts)) {
+        g_peer_file_mtime = ts;
+        g_peer_file_mtime_known = 1;
+    }
     /* Peers already named with --seed flags stay seeds whatever the
      * file says, so they take no part in the diff. */
     char wanted[16][PULSE_ID_LEN];
@@ -870,6 +903,31 @@ static void probe_cycle(int cycle) {
     if (g_reload_peer_file) {
         g_reload_peer_file = 0;
         reload_peer_file(NULL);
+    }
+
+    /* 0b. Auto-reload watch (0.26.0): once a second, stat the peer
+     * file; when its mtime moved since the last load or reload, run
+     * the same reload merge — no signal, no control-plane call. The
+     * check is wall-clock, so it is unaffected by the adaptive probe
+     * interval. A deleted file is skipped quietly (a manual reload
+     * still reports it); a file that reappears with a new mtime is
+     * picked up on the next check. */
+    if (g_cfg.peer_file[0] != '\0' &&
+        now - g_peer_file_last_check_ms >= PEER_FILE_WATCH_INTERVAL_MS) {
+        g_peer_file_last_check_ms = now;
+        struct timespec ts;
+        if (peer_file_mtime(&ts)) {
+            if (g_peer_file_mtime_known &&
+                (ts.tv_sec != g_peer_file_mtime.tv_sec ||
+                 ts.tv_nsec != g_peer_file_mtime.tv_nsec)) {
+                log_line("PEERFILE %s changed on disk, auto-reloading",
+                         g_cfg.peer_file);
+                reload_peer_file(NULL);
+            } else if (!g_peer_file_mtime_known) {
+                g_peer_file_mtime = ts;
+                g_peer_file_mtime_known = 1;
+            }
+        }
     }
 
     /* 1. Probe a random peer. In phi-accrual mode the PING still goes
@@ -1555,6 +1613,13 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "peer file %s: %d peers dropped, seed list full (16)\n",
                     g_cfg.peer_file, n_peer_dropped);
+        /* Auto-reload watch (0.26.0): record the file's mtime now so
+         * the prober only reloads when the file actually changes. */
+        struct timespec mtime_ts;
+        if (peer_file_mtime(&mtime_ts)) {
+            g_peer_file_mtime = mtime_ts;
+            g_peer_file_mtime_known = 1;
+        }
     }
 
     g_start_ms = pulse_now_ms();
