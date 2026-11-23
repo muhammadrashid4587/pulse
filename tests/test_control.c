@@ -28,7 +28,13 @@
  * covered here too: a filtered stream's snapshot holds only the
  * filtered peer, only matching events arrive, and a bad filter is
  * refused up front; the filter end to end is covered by
- * tests/test_watch_filter.sh. */
+ * tests/test_watch_filter.sh. WATCH replay / resume (0.31.0) is
+ * covered here too: FROM <seq> replays the buffered events from
+ * that seq after the snapshot and END, before live events; a FROM
+ * below the oldest buffered event replays from the oldest instead,
+ * after a GAP line; FROM 0 replays from the oldest; a FROM past
+ * the latest starts live; and a bad FROM is refused up front; the
+ * replay end to end is covered by tests/test_watch_replay.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -169,6 +175,11 @@ static int watch_next_hook(void *ctx, uint64_t last_seq,
 static uint64_t watch_latest_seq_hook(void *ctx) {
     (void)ctx;
     return pulse_event_latest_seq(&g_watch_log);
+}
+
+static uint64_t watch_oldest_seq_hook(void *ctx) {
+    (void)ctx;
+    return pulse_event_oldest_seq(&g_watch_log);
 }
 
 static void *serve_thread(void *arg) {
@@ -509,6 +520,7 @@ int main(void) {
     pulse_event_log_init(&g_watch_log);
     g_hooks.watch_next = watch_next_hook;
     g_hooks.watch_latest_seq = watch_latest_seq_hook;
+    g_hooks.watch_oldest_seq = watch_oldest_seq_hook;
     int wfd = watch_connect(18991);
     CHECK(wfd >= 0);
     if (wfd >= 0) {
@@ -587,6 +599,144 @@ int main(void) {
         close(ffd);
     }
 
+    /* WATCH replay / resume (0.31.0): FROM <seq> replays the
+     * buffered events from that seq, in order, after the snapshot
+     * and END — and live events recorded after the replay keep
+     * streaming on the same connection. The log is NOT
+     * re-initialised here: the wfd/ffd blocks above already left
+     * seqs 1-6 in it, so three more events are recorded (seqs
+     * 7-9) and a FROM 8 replays seqs 8-9 but not 7. Re-initialising
+     * the log would be wrong: the earlier WATCH threads may still
+     * be inside pulse_event_wait on it (they exit within a second
+     * of their client closing, and nothing waits for them), so
+     * resetting its mutex/condvar under them is undefined
+     * behaviour that wedges a waiter and strands the log lock. */
+    pulse_event_record(&g_watch_log, PULSE_EVENT_JOINED,
+                       "127.0.0.1:17901", 1, 1700000100);
+    pulse_event_record(&g_watch_log, PULSE_EVENT_SUSPECTED,
+                       "127.0.0.1:17903", 2, 1700000101);
+    pulse_event_record(&g_watch_log, PULSE_EVENT_DEAD,
+                       "127.0.0.1:17901", 1, 1700000102);
+    int rfd = watch_connect(18991);
+    CHECK(rfd >= 0);
+    if (rfd >= 0) {
+        const char *rcmd = "WATCH FROM 8\n";
+        CHECK(send(rfd, rcmd, strlen(rcmd), 0) == (ssize_t)strlen(rcmd));
+        char rbuf[4096];
+        size_t rlen = 0;
+        rbuf[0] = '\0';
+        CHECK(watch_read_until(rfd, rbuf, sizeof rbuf, &rlen, "END\n",
+                               3000));
+        CHECK(strncmp(rbuf, "OK watching\n", 12) == 0);
+        CHECK(watch_read_until(rfd, rbuf, sizeof rbuf, &rlen,
+                               "EVENT 8 SUSPECTED 127.0.0.1:17903 2 1700000101\n",
+                               3000));
+        CHECK(watch_read_until(rfd, rbuf, sizeof rbuf, &rlen,
+                               "EVENT 9 DEAD 127.0.0.1:17901 1 1700000102\n",
+                               3000));
+        CHECK(strstr(rbuf, "EVENT 7 ") == NULL);
+        /* Live events after the replay keep streaming. */
+        pulse_event_record(&g_watch_log, PULSE_EVENT_REVIVED,
+                           "127.0.0.1:17901", 1, 1700000103);
+        CHECK(watch_read_until(rfd, rbuf, sizeof rbuf, &rlen,
+                               "EVENT 10 REVIVED 127.0.0.1:17901 1 1700000103\n",
+                               3000));
+        close(rfd);
+    }
+
+    /* FROM with a filter: the replay is filtered exactly like the
+     * live stream — only JOINED for 17901 arrives, and the
+     * filtered-out seqs are still consumed, so the numbers jump. */
+    int pfd = watch_connect(18991);
+    CHECK(pfd >= 0);
+    if (pfd >= 0) {
+        const char *pcmd = "WATCH FROM 7 JOINED 127.0.0.1:17901\n";
+        CHECK(send(pfd, pcmd, strlen(pcmd), 0) == (ssize_t)strlen(pcmd));
+        char pbuf[4096];
+        size_t plen = 0;
+        pbuf[0] = '\0';
+        CHECK(watch_read_until(pfd, pbuf, sizeof pbuf, &plen, "END\n",
+                               3000));
+        CHECK(strncmp(pbuf, "OK watching\n", 12) == 0);
+        CHECK(watch_read_until(pfd, pbuf, sizeof pbuf, &plen,
+                               "EVENT 7 JOINED 127.0.0.1:17901 1 1700000100\n",
+                               3000));
+        CHECK(watch_read_until(pfd, pbuf, sizeof pbuf, &plen,
+                               "EVENT 999", 1500) == 0);
+        CHECK(strstr(pbuf, "EVENT 8 SUSPECTED") == NULL);
+        CHECK(strstr(pbuf, "EVENT 9 DEAD") == NULL);
+        CHECK(strstr(pbuf, "EVENT 10 REVIVED") == NULL);
+        close(pfd);
+    }
+
+    /* The gap (0.31.0): 130 more events push the oldest held seq
+     * from 1 to 13 (10 + 130 = 140 recorded, the ring holds the
+     * last 128), so a FROM 2 has been evicted — the stream signals
+     * "GAP 2 13" and replays from seq 13 instead of dropping the
+     * connection. FROM 0 replays from the oldest with no GAP
+     * line, and a FROM past the latest (9999) starts live: the
+     * next recorded event arrives as seq 141 and nothing is
+     * replayed. */
+    for (int i = 0; i < 130; i++)
+        pulse_event_record(&g_watch_log, PULSE_EVENT_JOINED,
+                           "127.0.0.1:17901", 1, 1700000200 + i);
+    int gfd = watch_connect(18991);
+    CHECK(gfd >= 0);
+    if (gfd >= 0) {
+        const char *gcmd = "WATCH FROM 2\n";
+        CHECK(send(gfd, gcmd, strlen(gcmd), 0) == (ssize_t)strlen(gcmd));
+        char gbuf[8192];
+        size_t glen = 0;
+        gbuf[0] = '\0';
+        CHECK(watch_read_until(gfd, gbuf, sizeof gbuf, &glen, "END\n",
+                               3000));
+        CHECK(strncmp(gbuf, "OK watching\n", 12) == 0);
+        CHECK(watch_read_until(gfd, gbuf, sizeof gbuf, &glen,
+                               "GAP 2 13\n", 3000));
+        CHECK(watch_read_until(gfd, gbuf, sizeof gbuf, &glen,
+                               "EVENT 13 JOINED 127.0.0.1:17901 1 1700000202\n",
+                               3000));
+        CHECK(strstr(gbuf, "EVENT 2 ") == NULL);
+        CHECK(strstr(gbuf, "EVENT 12 ") == NULL);
+        close(gfd);
+    }
+    int zfd = watch_connect(18991);
+    CHECK(zfd >= 0);
+    if (zfd >= 0) {
+        const char *zcmd = "WATCH FROM 0\n";
+        CHECK(send(zfd, zcmd, strlen(zcmd), 0) == (ssize_t)strlen(zcmd));
+        char zbuf[8192];
+        size_t zlen = 0;
+        zbuf[0] = '\0';
+        CHECK(watch_read_until(zfd, zbuf, sizeof zbuf, &zlen, "END\n",
+                               3000));
+        CHECK(strncmp(zbuf, "OK watching\n", 12) == 0);
+        CHECK(strstr(zbuf, "GAP ") == NULL);
+        CHECK(watch_read_until(zfd, zbuf, sizeof zbuf, &zlen,
+                               "EVENT 13 JOINED 127.0.0.1:17901 1 1700000202\n",
+                               3000));
+        close(zfd);
+    }
+    int ufd = watch_connect(18991);
+    CHECK(ufd >= 0);
+    if (ufd >= 0) {
+        const char *ucmd = "WATCH FROM 9999\n";
+        CHECK(send(ufd, ucmd, strlen(ucmd), 0) == (ssize_t)strlen(ucmd));
+        char ubuf[4096];
+        size_t ulen = 0;
+        ubuf[0] = '\0';
+        CHECK(watch_read_until(ufd, ubuf, sizeof ubuf, &ulen, "END\n",
+                               3000));
+        CHECK(strncmp(ubuf, "OK watching\n", 12) == 0);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_JOINED,
+                           "127.0.0.1:17903", 2, 1700000300);
+        CHECK(watch_read_until(ufd, ubuf, sizeof ubuf, &ulen,
+                               "EVENT 141 JOINED 127.0.0.1:17903 2 1700000300\n",
+                               3000));
+        CHECK(strstr(ubuf, "EVENT 13 ") == NULL);
+        close(ufd);
+    }
+
     /* A bad filter is refused up front, and the connection closes. */
     CHECK(send_cmd(18991, "WATCH BOGUS\n", reply, sizeof reply) > 0);
     CHECK(strcmp(reply,
@@ -596,6 +746,20 @@ int main(void) {
     CHECK(strcmp(reply,
                  "ERR invalid watch filter invalid peer id "
                  "127.0.0.1:notaport\n") == 0);
+
+    /* A bad FROM is refused up front too (0.31.0): a missing
+     * sequence number, a non-numeric one, and a duplicate FROM. */
+    CHECK(send_cmd(18991, "WATCH FROM\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply,
+                 "ERR invalid watch filter FROM requires a sequence "
+                 "number\n") == 0);
+    CHECK(send_cmd(18991, "WATCH FROM abc\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply,
+                 "ERR invalid watch filter invalid FROM seq abc\n") == 0);
+    CHECK(send_cmd(18991, "WATCH FROM 1 FROM 2\n", reply,
+                   sizeof reply) > 0);
+    CHECK(strcmp(reply,
+                 "ERR invalid watch filter duplicate FROM\n") == 0);
 
     shutdown(fd, SHUT_RDWR);
     close(fd);
@@ -614,6 +778,7 @@ int main(void) {
          * cleanly instead of crashing on a NULL hook. */
         g_hooks.watch_next = NULL;
         g_hooks.watch_latest_seq = NULL;
+        g_hooks.watch_oldest_seq = NULL;
         CHECK(send_cmd(18992, "WATCH\n", reply, sizeof reply) > 0);
         CHECK(strcmp(reply, "ERR watch not supported\n") == 0);
         shutdown(fd, SHUT_RDWR);

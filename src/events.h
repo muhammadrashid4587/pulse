@@ -77,6 +77,11 @@ void pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
  * empty): a WATCH with no argument starts live from here. */
 uint64_t pulse_event_latest_seq(pulse_event_log_t *log);
 
+/* The oldest sequence number still held in the ring (0 when the log
+ * is empty): a WATCH FROM <seq> below this one has been evicted and
+ * can only replay from here, with a gap signalled. */
+uint64_t pulse_event_oldest_seq(pulse_event_log_t *log);
+
 /* The earliest event with seq > after_seq. Returns 1 with *out
  * filled, 0 when no such event arrived within timeout_ms, and -1
  * when the event after after_seq has already scrolled out of the

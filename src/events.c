@@ -69,6 +69,13 @@ uint64_t pulse_event_latest_seq(pulse_event_log_t *log) {
     return seq;
 }
 
+uint64_t pulse_event_oldest_seq(pulse_event_log_t *log) {
+    pthread_mutex_lock(&log->lock);
+    uint64_t seq = log->count > 0 ? log->next_seq - (uint64_t)log->count : 0;
+    pthread_mutex_unlock(&log->lock);
+    return seq;
+}
+
 int pulse_event_wait(pulse_event_log_t *log, uint64_t after_seq,
                      pulse_event_t *out, int timeout_ms) {
     struct timespec deadline;

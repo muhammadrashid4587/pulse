@@ -371,7 +371,7 @@ Commands:
 | `RELOAD` | Re-read `--peer-file` and merge it into the seed list — the same reload SIGHUP triggers, for an operator who cannot send the node a signal: `OK peers=N added=A dropped=D kept=K bad=B`. `peers` is how many peers the file lists; `added`/`dropped`/`kept` are the merge outcome (a still-ALIVE peer removed from the file is kept, never dropped on a file edit alone); `bad` is how many lines were skipped as malformed. No `--peer-file`: `ERR no peer file`. Unreadable file: `ERR cannot read peer file <path>: <reason>`, and the old list is kept. |
 | `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N slow_peers=N peer_file=<path\|-> last_reload=<unix\|-> last_mtime=<unix\|-> pf_peers=<N\|-> pf_added=<N\|-> pf_dropped=<N\|-> pf_kept=<N\|-> pf_bad=<N\|->` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. The peer-file fields (0.28.0) are the `--peer-file` state — the path, the wall-clock time of the last successful load or reload, the file's mtime at that load, and the counts from that load (the same numbers as the `PEERFILE RELOAD` log line) — and are all `-` when the node runs without `--peer-file`; see "Peer-file state in METRICS and JSON". |
 | `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning") — and `source`, where the peer came from (`seed`, `peer-file`, `discovered`, or `self`, the same provenance `PEERS` reports). The metrics object also carries `slow_peers`, the count of currently slow members. A top-level `peer_file` object carries the `--peer-file` state (path, `last_reload` / `last_mtime` as unix seconds, and the counts from the last load), or `null` when the node runs without `--peer-file` (0.28.0). Built for tooling that polls cluster state without scraping the text protocol. |
-| `WATCH [types] [ids]` | A long-lived stream: `OK watching`, then one `SNAPSHOT <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <last-seen-ms\|-> <seed\|peer-file\|discovered\|self>` line per member (the `PEERS` shape), then `END`, then one `EVENT <seq> <JOINED\|SUSPECTED\|DEAD\|REVIVED\|DROPPED\|REFUTED> <id> <incarnation> <unix-seconds>` line per membership event as it happens, until the client closes the connection. Sequence numbers are 1-based and monotonic for the node's life; a slow consumer that falls more than the event log holds gets `ERR gap: events lost, reconnect` and must reconnect and re-read the snapshot. Runs on its own thread, so other commands keep answering while a client watches. An optional filter (0.30.0) narrows the stream server-side: a comma-separated type list (`WATCH JOINED,DEAD`), a comma-separated peer-id list (`WATCH 127.0.0.1:17102`), or both, in any order — the snapshot is narrowed by the id list too, a filtered-out event still consumes its sequence number so a filtered stream's numbers jump by design, and a bad filter is refused up front with `ERR invalid watch filter <reason>`. See "Control-plane event stream (WATCH)" below. |
+| `WATCH [types] [ids] [FROM <seq>]` | A long-lived stream: `OK watching`, then one `SNAPSHOT <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <last-seen-ms\|-> <seed\|peer-file\|discovered\|self>` line per member (the `PEERS` shape), then `END`, then one `EVENT <seq> <JOINED\|SUSPECTED\|DEAD\|REVIVED\|DROPPED\|REFUTED> <id> <incarnation> <unix-seconds>` line per membership event as it happens, until the client closes the connection. Sequence numbers are 1-based and monotonic for the node's life; a slow consumer that falls more than the event log holds gets `ERR gap: events lost, reconnect` and must reconnect and re-read the snapshot. Runs on its own thread, so other commands keep answering while a client watches. An optional filter (0.30.0) narrows the stream server-side: a comma-separated type list (`WATCH JOINED,DEAD`), a comma-separated peer-id list (`WATCH 127.0.0.1:17102`), or both, in any order — the snapshot is narrowed by the id list too, a filtered-out event still consumes its sequence number so a filtered stream's numbers jump by design, and a bad filter is refused up front with `ERR invalid watch filter <reason>`. Replay / resume (0.31.0): `WATCH FROM <seq>` replays the buffered events from that seq, in order, after the snapshot and `END` and before live events, so a reconnecting client catches up instead of starting from now — `FROM 0` replays from the oldest buffered event, a `FROM` past the latest starts live, and a `FROM` below the oldest buffered event replays from the oldest instead, after a `GAP <requested> <oldest>` line; `FROM` composes with the type/id filters, in any order, and a bad `FROM` is refused up front. See "Control-plane event stream (WATCH)" below. |
 | anything else | `ERR unknown command` |
 
 ## Shared secret
@@ -778,6 +778,61 @@ and only an `ERR gap` line means the client fell behind. A bad
 filter is refused up front — `WATCH BOGUS` answers `ERR invalid
 watch filter unknown event type BOGUS` and the connection closes —
 instead of opening a stream that silently drops everything.
+
+A watcher that disconnects and reconnects can also resume instead
+of starting from now (0.31.0): `WATCH FROM <seq>` replays the
+buffered events from that sequence number, in order, after the
+snapshot and `END` and before live events —
+
+```sh
+./pulse-ctl 127.0.0.1:18401 WATCH FROM 4
+# OK watching
+# SNAPSHOT 127.0.0.1:17101 1 ALIVE - self
+# SNAPSHOT 127.0.0.1:17102 1 ALIVE 12 peer-file
+# END
+# EVENT 4 JOINED 127.0.0.1:17102 1 1795450003
+# EVENT 9 DEAD 127.0.0.1:17102 1 1795450008
+# ... live events continue after the replay
+```
+
+The snapshot still goes first: it is the current table, the replay
+is the transitions the client missed, and a client dedupes by
+sequence number when an event appears in both (an event that lands
+between the snapshot and the replay is in both, exactly as with the
+plain live stream). `FROM 0` replays from the oldest buffered
+event — the whole ring — and a `FROM` past the latest sequence
+starts live, with nothing to replay yet: the next event to be
+recorded is the first one the client sees. `FROM` composes with
+the type/id filters, in any order (`WATCH FROM 5 JOINED,DEAD`,
+`WATCH JOINED,DEAD FROM 5`), and the filter applies to replayed
+events exactly as to live ones — a filtered-out replayed event
+still consumes its sequence number, so the replayed numbers jump
+by design.
+
+The ring only holds the last 128 events, so a resume point older
+than that has been evicted: instead of dropping the connection,
+the stream signals the loss and replays from the oldest event it
+still holds —
+
+```sh
+./pulse-ctl 127.0.0.1:18401 WATCH FROM 2
+# OK watching
+# SNAPSHOT 127.0.0.1:17101 1 ALIVE - self
+# END
+# GAP 2 7
+# EVENT 7 JOINED 127.0.0.1:17102 1 1795450010
+# ... the replay continues from seq 7, then live events
+```
+
+`GAP <requested> <oldest>` says the requested seq is gone and the
+replay starts at `<oldest>` instead; the stream stays open, unlike
+a consumer that falls behind mid-stream, which still gets
+`ERR gap: events lost, reconnect` and must reconnect. A bad `FROM`
+is refused up front — `WATCH FROM` answers `ERR invalid watch
+filter FROM requires a sequence number`, `WATCH FROM xyz` answers
+`ERR invalid watch filter invalid FROM seq xyz`, and a second
+`FROM` answers `ERR invalid watch filter duplicate FROM` — and
+the connection closes.
 
 Three honest caveats. The event log is a bounded ring (the last 128
 events): a consumer that falls more than a ring behind — a client
@@ -1423,9 +1478,16 @@ make test
   `ERR watch not supported` with no watch hooks. `WATCH` filtering
   (0.30.0) is covered the same way: a filtered stream's snapshot
   holds only the filtered peer, only matching events arrive, and a
-  bad filter is refused up front. The `WATCH`
+  bad filter is refused up front. `WATCH` replay / resume
+  (0.31.0) is covered the same way: `FROM <seq>` replays the
+  buffered events from that seq after the snapshot and `END`,
+  before live events; a `FROM` below the oldest buffered event
+  replays from the oldest instead, after a `GAP` line; `FROM 0`
+  replays from the oldest; a `FROM` past the latest starts live;
+  and a bad `FROM` is refused up front. The `WATCH`
   events end to end are covered by `tests/test_watch.sh`, and the
-  filter end to end by `tests/test_watch_filter.sh`.
+  filter end to end by `tests/test_watch_filter.sh`, and the
+  replay end to end by `tests/test_watch_replay.sh`.
 - `tests/test_peerfile_metrics.sh`: integration test for
   METRICS/JSON exposure of peer-file state (0.28.0) — two nodes
   converge from one shared peer file (with a bad line) and `METRICS`
@@ -1499,6 +1561,22 @@ make test
   the stopped node `DEAD` while it is stopped — with its default
   timeout the second node would gossip a `DEAD` to node 1 first,
   and the first stream would correctly carry it before the kill.
+- `tests/test_watch_replay.sh`: integration test for `WATCH`
+  replay / resume (0.31.0) — two nodes converge from one shared
+  peer file and a live `WATCH` on node 1 records the sequence
+  numbers of a third node's lifecycle (JOINED when it joins
+  through `--seed`, SUSPECTED then DEAD when it is killed); a
+  second `WATCH` opened after the kill with `FROM <join-seq>`
+  replays exactly JOINED, SUSPECTED, DEAD with the same sequence
+  numbers and no `GAP` line, since nothing was evicted; restarting
+  node 3 streams REVIVED live on the resumed stream, after the
+  replay; a `WATCH FROM 0` replays from the oldest buffered event
+  and carries the JOINED too; and a bad `FROM` is refused up front
+  (`WATCH FROM` and `WATCH FROM xyz` answer `ERR invalid watch
+  filter ...`). The gap path — a `FROM` below the oldest buffered
+  event, answered with a `GAP` line and a replay from the oldest —
+  needs 128 events to evict the ring, so it is covered
+  deterministically in the unit test instead.
 
 ## Roadmap
 
@@ -1533,3 +1611,4 @@ make test
 - ~~Control-plane event stream (`WATCH`): a long-lived TCP connection that pushes membership events as they happen — `JOINED`, `SUSPECTED`, `DEAD`, `REVIVED`, `DROPPED`, `REFUTED`, each with a sequence number, the member id, its incarnation and the unix time — with the same id/incarnation/state shape as `PEERS` for the opening snapshot, so tooling can watch a cluster without polling `STATUS` / `MEMBERS` / `JSON` once a second; a slow consumer is dropped instead of buffering unboundedly, and the stream starts with a full snapshot so a late subscriber does not miss the current table.~~ Done in 0.29.0.
 - ~~Per-peer event filtering on the `WATCH` stream: a watcher can subscribe to only certain event types, only certain peer ids, or both — `WATCH JOINED,DEAD`, `WATCH 127.0.0.1:17102`, or `WATCH JOINED,DEAD 127.0.0.1:17102`, in any order — with the filter applied server-side before sending, so a filtered-out event never crosses the wire; the snapshot is narrowed by the id list too, so a watcher subscribed to one peer sees only that peer, a filtered-out event still consumes its sequence number so a filtered stream's numbers jump by design, and a bad filter is refused up front with `ERR invalid watch filter <reason>`.~~ Done in 0.30.0.
 - ~~Control-plane sends use `MSG_NOSIGNAL`: a client that goes away mid-send fails the send instead of killing the node with `SIGPIPE` — a `WATCH` client disconnecting just as an `EVENT` is being written would otherwise take the whole process down with it.~~ Done in 0.30.0.
+- ~~WATCH replay / resume from a sequence number: a watcher can reconnect with `WATCH FROM <seq>` and the server replays the buffered events from that seq, in order, after the snapshot and `END` and before live events, so a client that dropped catches up instead of starting from now — `FROM 0` replays from the oldest buffered event, a `FROM` past the latest starts live, and a `FROM` below the oldest buffered event replays from the oldest instead, after a `GAP <requested> <oldest>` line that says how much was lost, with the stream staying open; `FROM` composes with the type/id filters in any order, and a bad `FROM` is refused up front with `ERR invalid watch filter <reason>`.~~ Done in 0.31.0.

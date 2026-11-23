@@ -1516,6 +1516,14 @@ static uint64_t watch_latest_seq_hook(void *ctx) {
     return pulse_event_latest_seq(&g_event_log);
 }
 
+/* WATCH replay (0.31.0): the oldest sequence still held in the
+ * ring, so a FROM below it can be answered with a GAP line and a
+ * replay from here instead of a dropped connection. */
+static uint64_t watch_oldest_seq_hook(void *ctx) {
+    (void)ctx;
+    return pulse_event_oldest_seq(&g_event_log);
+}
+
 /* Set one annotation on this node itself (control plane META): update
  * the self entry, stamp it changed so the next digest gossips it, and
  * persist the set to the data dir so it survives a restart. Returns
@@ -2092,6 +2100,7 @@ int main(int argc, char **argv) {
         g_hooks.peer_file_state = peer_file_state_hook;
         g_hooks.watch_next = watch_next_hook;
         g_hooks.watch_latest_seq = watch_latest_seq_hook;
+        g_hooks.watch_oldest_seq = watch_oldest_seq_hook;
         g_hooks.set_meta = set_meta_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
         g_hooks.peer_source = peer_source_hook;

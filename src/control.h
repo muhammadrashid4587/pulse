@@ -105,7 +105,7 @@
  *       state (path, last_reload / last_mtime as unix seconds, and
  *       the counts from the last load), or null when the node runs
  *       without --peer-file.
- *   WATCH [types] [ids]
+ *   WATCH [types] [ids] [FROM <seq>]
  *       A long-lived stream of membership events, for tooling that
  *       watches a cluster instead of polling MEMBERS or JSON once a
  *       second. The reply starts with "OK watching", then one
@@ -146,6 +146,19 @@
  *       numbers jump by design — a jump means filtered-out events,
  *       not lost ones. A bad filter is refused up front:
  *       ERR invalid watch filter <reason>.
+ *       Replay / resume (0.31.0): "WATCH FROM <seq>" replays the
+ *       buffered events from that sequence number — in order,
+ *       after the snapshot and END, before live events — so a
+ *       client that reconnects can catch up instead of starting
+ *       from now. FROM 0 replays from the oldest buffered event.
+ *       A FROM past the latest sequence starts live (nothing to
+ *       replay yet). A FROM below the oldest buffered event — the
+ *       requested event has been evicted from the 128-event ring
+ *       — replays from the oldest buffered event instead, after
+ *       a "GAP <requested> <oldest>" line that says how much was
+ *       lost. FROM composes with the type/id filters, in any
+ *       order ("WATCH FROM 5 JOINED,DEAD"); a bad FROM is refused
+ *       up front: ERR invalid watch filter <reason>.
  *   anything else
  *       ERR unknown command
  *
@@ -255,6 +268,12 @@ typedef struct {
      * recorded yet): a WATCH stream starts live from here, after
      * its snapshot. NULL when the node does not support watching. */
     uint64_t (*watch_latest_seq)(void *ctx);
+    /* The oldest event sequence number still held in the log (0
+     * when no event has been recorded yet): a WATCH FROM below
+     * this one has been evicted, so the stream replays from here
+     * after a GAP line. NULL when the node does not support
+     * watching. */
+    uint64_t (*watch_oldest_seq)(void *ctx);
     const char *self_id;
     int64_t start_ms; /* monotonic ms when the node started */
 } control_hooks_t;

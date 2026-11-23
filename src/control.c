@@ -486,6 +486,12 @@ typedef struct {
     int have_ids;
     char ids[PULSE_MAX_MEMBERS][PULSE_ID_LEN];
     int n_ids;
+    /* Replay / resume (0.31.0): "FROM <seq>" asks the stream to
+     * replay buffered events from that sequence number before
+     * going live. have_from is 0 for a plain live WATCH. from_seq
+     * 0 means "from the oldest buffered event". */
+    int have_from;
+    uint64_t from_seq;
 } watch_filter_t;
 
 /* Parse one comma-separated filter token. A token containing ':' is
@@ -532,10 +538,43 @@ static int parse_watch_filter_token(const char *token, watch_filter_t *f,
     return 0;
 }
 
+/* Parse one FROM token: the token after "FROM" must be a decimal
+ * sequence number (digits only, fits in a uint64_t). Returns 0 on
+ * success, -1 with err filled. A second FROM is refused: one
+ * resume point per stream. */
+static int parse_watch_from(const char *tok, watch_filter_t *f,
+                            char *err, size_t errcap) {
+    if (f->have_from) {
+        snprintf(err, errcap, "duplicate FROM");
+        return -1;
+    }
+    if (!tok || tok[0] == '\0') {
+        snprintf(err, errcap, "FROM requires a sequence number");
+        return -1;
+    }
+    for (const char *p = tok; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            snprintf(err, errcap, "invalid FROM seq %s", tok);
+            return -1;
+        }
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(tok, &end, 10);
+    if (errno != 0 || end == tok || *end != '\0') {
+        snprintf(err, errcap, "invalid FROM seq %s", tok);
+        return -1;
+    }
+    f->have_from = 1;
+    f->from_seq = (uint64_t)v;
+    return 0;
+}
+
 /* Parse the argument of a WATCH command into a filter: a type list,
  * an id list, or both, in any order, each list comma-separated and
- * each token whitespace-separated. A NULL or empty argument is an
- * unfiltered WATCH. Returns 0 on success, -1 with err filled. */
+ * each token whitespace-separated, plus an optional "FROM <seq>"
+ * replay point (0.31.0). A NULL or empty argument is an unfiltered
+ * live WATCH. Returns 0 on success, -1 with err filled. */
 static int parse_watch_filter(const char *arg, watch_filter_t *f,
                               char *err, size_t errcap) {
     memset(f, 0, sizeof *f);
@@ -545,6 +584,14 @@ static int parse_watch_filter(const char *arg, watch_filter_t *f,
     char *save = NULL;
     for (char *tok = strtok_r(copy, " \t", &save); tok;
          tok = strtok_r(NULL, " \t", &save)) {
+        if (strcmp(tok, "FROM") == 0) {
+            /* Consume the sequence number right after FROM: the
+             * loop's next strtok_r call then continues past it. */
+            char *seq_tok = strtok_r(NULL, " \t", &save);
+            if (parse_watch_from(seq_tok, f, err, errcap) != 0)
+                return -1;
+            continue;
+        }
         if (parse_watch_filter_token(tok, f, err, errcap) != 0)
             return -1;
     }
@@ -601,7 +648,23 @@ static int watch_filter_match_id(const watch_filter_t *f, const char *id) {
  * jump by design — a jump means filtered-out events, not lost ones,
  * and only a gap ERR means the client fell behind. A bad filter is
  * refused up front with "ERR invalid watch filter <reason>" and
- * the connection closes. */
+ * the connection closes.
+ *
+ * Replay / resume (0.31.0): "WATCH FROM <seq>" replays the
+ * buffered events from that sequence number — in order, after the
+ * snapshot and END, before live events — so a client that
+ * reconnects catches up instead of starting from now. The
+ * snapshot still goes first: it is the current table, the replay
+ * is the transitions the client missed, and a client dedupes by
+ * sequence number when an event appears in both. FROM 0 replays
+ * from the oldest buffered event; a FROM past the latest sequence
+ * starts live, with nothing to replay yet. A FROM below the oldest
+ * buffered event — the requested event has been evicted from the
+ * 128-event ring — replays from the oldest buffered event instead,
+ * after a "GAP <requested> <oldest>" line that says how much was
+ * lost; the stream stays open, unlike the mid-stream gap below.
+ * FROM composes with the type/id filters, in any order, and the
+ * filter applies to replayed events exactly as to live ones. */
 static void handle_watch(int fd, const control_hooks_t *hooks,
                          const char *arg) {
     watch_filter_t filter;
@@ -620,8 +683,33 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
     int (*watch_next)(void *ctx, uint64_t last_seq, pulse_event_t *out,
                       int timeout_ms) = hooks->watch_next;
     uint64_t (*watch_latest_seq)(void *ctx) = hooks->watch_latest_seq;
+    uint64_t (*watch_oldest_seq)(void *ctx) = hooks->watch_oldest_seq;
     void (*snapshot)(void *ctx, member_table_t *out) = hooks->snapshot;
-    uint64_t seq = watch_latest_seq(hooks->ctx);
+    uint64_t latest = watch_latest_seq(hooks->ctx);
+    uint64_t oldest = watch_oldest_seq(hooks->ctx);
+    /* The first sequence number to deliver: latest + 1 means live
+     * only (nothing buffered to send). With FROM, the requested
+     * seq — clamped to what the ring still holds, with a gap
+     * signalled when the request fell off the ring. */
+    uint64_t start = latest + 1;
+    int gap = 0;
+    uint64_t gap_from = 0;
+    if (filter.have_from) {
+        if (oldest == 0) {
+            start = 1; /* log empty: wait for the first event */
+        } else if (filter.from_seq == 0) {
+            start = oldest;
+        } else if (filter.from_seq < oldest) {
+            gap = 1;
+            gap_from = filter.from_seq;
+            start = oldest;
+        } else if (filter.from_seq > latest) {
+            start = latest + 1; /* future: start live */
+        } else {
+            start = filter.from_seq;
+        }
+    }
+    uint64_t seq = start - 1;
     member_table_t t;
     snapshot(hooks->ctx, &t);
     if (send_all(fd, "OK watching\n") != 0) {
@@ -643,10 +731,29 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
         close(fd);
         return;
     }
+    if (gap) {
+        snprintf(line, sizeof line, "GAP %llu %llu\n",
+                 (unsigned long long)gap_from,
+                 (unsigned long long)oldest);
+        if (send_all(fd, line) != 0) {
+            close(fd);
+            return;
+        }
+    }
+    /* first_wait is still set while no event has been consumed:
+     * a gap on the very first wait means the replay point was
+     * evicted between the snapshot and the wait (a burst of 128
+     * events in that window) — re-read the ring and resume from
+     * the new oldest with a GAP line, instead of dropping a
+     * stream that only just opened. Once an event has been
+     * consumed the client is live, and a gap then means it fell
+     * behind mid-stream: ERR and close, as before. */
+    int first_wait = 1;
     for (;;) {
         pulse_event_t ev;
         int r = watch_next(hooks->ctx, seq, &ev, 1000);
         if (r == 1) {
+            first_wait = 0;
             /* Always consume the sequence number, even for a
              * filtered-out event: the next wait is for the event
              * after this one, or the same event would be returned
@@ -659,6 +766,20 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
                      ev.incarnation, (long long)ev.unix_ts);
             if (send_all(fd, line) != 0) break;
         } else if (r == -1) {
+            if (first_wait && filter.have_from) {
+                uint64_t new_oldest = watch_oldest_seq(hooks->ctx);
+                if (new_oldest == 0) {
+                    send_all(fd, "ERR gap: events lost, reconnect\n");
+                    break;
+                }
+                snprintf(line, sizeof line, "GAP %llu %llu\n",
+                         (unsigned long long)start,
+                         (unsigned long long)new_oldest);
+                if (send_all(fd, line) != 0) break;
+                seq = new_oldest - 1;
+                first_wait = 0;
+                continue;
+            }
             send_all(fd, "ERR gap: events lost, reconnect\n");
             break;
         } else {
@@ -699,7 +820,8 @@ static void *watch_thread(void *arg) {
  * when the reply was already sent and the caller should close. */
 static int start_watch(int fd, const control_hooks_t *hooks,
                        const char *arg) {
-    if (!hooks->watch_next || !hooks->watch_latest_seq) {
+    if (!hooks->watch_next || !hooks->watch_latest_seq ||
+        !hooks->watch_oldest_seq) {
         send_all(fd, "ERR watch not supported\n");
         return 0;
     }
