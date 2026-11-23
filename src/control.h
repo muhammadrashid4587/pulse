@@ -26,6 +26,17 @@
  *       restart. Bad syntax: ERR invalid meta <arg>; a ninth distinct
  *       key: ERR meta full (max 8); missing argument:
  *       ERR usage: META <key=value>.
+ *   RELOAD
+ *       Re-read --peer-file and merge it into the seed list — the
+ *       same reload SIGHUP triggers, for an operator who cannot send
+ *       the node a signal: OK peers=N added=A dropped=D kept=K
+ *       bad=B. peers is how many peers the file lists; added/dropped/
+ *       kept are the merge outcome (a still-ALIVE peer removed from
+ *       the file is kept, never dropped on the strength of a file
+ *       edit alone); bad is how many lines were skipped as malformed.
+ *       No --peer-file: ERR no peer file. Unreadable file:
+ *       ERR cannot read peer file <path>: <reason>, and the old list
+ *       is kept. See "Live peer-file reload".
  *   STATUS
  *       STATUS id=<self-id> uptime=<seconds> alive=N suspect=N dead=N
  *       total=N, then END.
@@ -75,6 +86,25 @@
  * time; the server is a control interface, not a data path.
  */
 
+/* RELOAD control-plane command (0.25.0): the outcome of re-reading
+ * --peer-file, filled in by the node's reload hook. have_file is 0
+ * when the node was started without --peer-file; read_ok is 0 when
+ * the file could not be read, and error then holds the reason
+ * ("cannot read peer file <path>: <strerror>"). peers is how many
+ * peers the file lists; added/dropped/kept are the merge outcome
+ * (the same numbers as the PEERFILE RELOAD log line); bad is how many
+ * lines were skipped as malformed. */
+typedef struct {
+    int have_file;
+    int read_ok;
+    int peers;
+    int added;
+    int dropped;
+    int kept;
+    int bad;
+    char error[640];
+} pulse_reload_result_t;
+
 typedef struct {
     void *ctx;
     /* Copy the membership table into out (hook locks as needed). */
@@ -82,6 +112,10 @@ typedef struct {
     /* Force-remove a member. Returns 1 if removed, 0 if the member is
      * unknown, -1 if the id is this node itself. */
     int (*force_leave)(void *ctx, const char *id);
+    /* Re-read --peer-file and merge it into the seed list — the same
+     * reload SIGHUP triggers — filling out with the outcome. NULL
+     * when the node does not support it: RELOAD then replies ERR. */
+    void (*reload_peer_file)(void *ctx, pulse_reload_result_t *out);
     /* Copy the failure-detector metrics into out (hook locks as needed). */
     void (*metrics)(void *ctx, pulse_metrics_t *out);
     /* Set one annotation on this node itself. Returns 0 on success,

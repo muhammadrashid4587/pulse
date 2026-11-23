@@ -38,7 +38,8 @@ building block, not a production service mesh.
   for asking a running node for its membership (`MEMBERS`), its status
   (`STATUS`), its failure-detector metrics (`METRICS`), the whole
   picture as one machine-readable JSON object (`JSON`), setting an
-  annotation on the node (`META <key=value>`), or
+  annotation on the node (`META <key=value>`), triggering a live
+  peer-file reload (`RELOAD`), or
   force-removing a member (`LEAVE <id>`). See
   "Control plane" below. Query it with the bundled `pulse-ctl` client
   or plain netcat.
@@ -131,7 +132,8 @@ building block, not a production service mesh.
   re-reads the file — newly listed peers join the cluster, peers
   removed from the file are dropped once they stop answering, and a
   peer that is still ALIVE is never dropped on the strength of a
-  file edit alone. See "Live peer-file reload" below.
+  file edit alone — or the control plane's `RELOAD` command does the
+  same reload over TCP. See "Live peer-file reload" below.
 
 ## What it is not
 
@@ -259,7 +261,7 @@ scripts/demo.sh
 | `--phi-accrual` | off | Suspect on phi instead of the fixed ack timeout |
 | `--phi-threshold` | 8.0 | Phi value at which a peer is suspected (phi mode only) |
 | `--sync-interval-ms` | 10000 | How often to exchange full tables (anti-entropy SYNC) with a random peer |
-| `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `LEAVE`) |
+| `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `LEAVE`, `RELOAD`) |
 | `--secret` / `--shared-secret` | — (none) | Shared secret for joins: only peers presenting the same secret are accepted |
 | `--meta KEY=VALUE` | — (none) | An annotation this node carries about itself (repeatable, at most 8): gossiped with its membership entry, shown in `MEMBERS`/`JSON`, persisted across restarts |
 | `--ipv6` | off | Run over IPv6: bind `::`, ids are `[::1]:port`, control plane on `::1` |
@@ -314,6 +316,9 @@ the port beyond localhost.
 ./pulse-ctl 127.0.0.1:18401 LEAVE 127.0.0.1:17102
 # OK 127.0.0.1:17102
 
+./pulse-ctl 127.0.0.1:18401 RELOAD
+# OK peers=3 added=1 dropped=0 kept=0 bad=0
+
 ./pulse-ctl 127.0.0.1:18401 METRICS
 # METRICS suspected=1 dead=1 refutes=0 joins=2 adaptive_fast_cycles=3 suspect_refuted=0 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1 refute_latency_ms mean=- max=- samples=0 slow_peers=0
 # END
@@ -337,6 +342,7 @@ Commands:
 | `STATUS` | One `STATUS id=<self> uptime=<seconds> alive=N suspect=N dead=N total=N` line, then `END`. |
 | `META <key=value>` | Set one annotation on this node itself: `OK <key=value>`. The change is gossiped with the next digest and persisted to the data dir, so it survives a restart. Bad syntax: `ERR invalid meta <arg>`; a ninth distinct key: `ERR meta full (max 8)`; missing argument: `ERR usage: META <key=value>`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
+| `RELOAD` | Re-read `--peer-file` and merge it into the seed list — the same reload SIGHUP triggers, for an operator who cannot send the node a signal: `OK peers=N added=A dropped=D kept=K bad=B`. `peers` is how many peers the file lists; `added`/`dropped`/`kept` are the merge outcome (a still-ALIVE peer removed from the file is kept, never dropped on a file edit alone); `bad` is how many lines were skipped as malformed. No `--peer-file`: `ERR no peer file`. Unreadable file: `ERR cannot read peer file <path>: <reason>`, and the old list is kept. |
 | `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N slow_peers=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. |
 | `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning"). The metrics object also carries `slow_peers`, the count of currently slow members. Built for tooling that polls cluster state without scraping the text protocol. |
 | anything else | `ERR unknown command` |
@@ -545,6 +551,18 @@ with `sigaction`, not `signal`: with this program's strict POSIX
 feature macros, `signal` has System V semantics and the handler
 would reset to the default after the first delivery, so the second
 SIGHUP would kill the node.
+
+The same reload is available over the control plane as `RELOAD`
+(0.25.0): `./pulse-ctl 127.0.0.1:18401 RELOAD` re-reads the file from
+the control thread and answers `OK peers=N added=A dropped=D kept=K
+bad=B` — the same numbers as the `PEERFILE RELOAD` log line — so an
+operator who cannot signal the process (a container, a supervised
+service) can still trigger a reload. A node with no `--peer-file`
+answers `ERR no peer file`, and an unreadable file answers `ERR
+cannot read peer file <path>: <reason>` while the old list is kept.
+SIGHUP and RELOAD run the same code, serialized on one lock, so the
+two triggers can never interleave their seed-list edits and JOIN
+sends.
 
 ## Membership persistence
 
@@ -1120,6 +1138,29 @@ make test
   logged and skipped without disturbing the cluster; a SIGHUP on a
   node with no `--peer-file` is a no-op and the node keeps running;
   and no node restarts on SIGHUP (exactly one `START` line each).
+- `tests/test_control.c`: unit tests for the control-plane dispatch
+  (0.25.0) — fake hooks serve canned state and the test drives the
+  real `control_listen` / `control_serve` over loopback: `RELOAD`
+  answers `OK peers=3 added=1 dropped=0 kept=0 bad=0` on success,
+  `ERR no peer file` with no peer file, and `ERR cannot read peer
+  file ...` for an unreadable file; a node with no reload hook
+  answers `ERR reload not supported` instead of crashing on a NULL
+  hook; and `MEMBERS` on an empty table is just `END`, with an
+  unknown command still a clean `ERR unknown command`.
+- `tests/test_reload.sh`: integration test for the `RELOAD`
+  control-plane command (0.25.0) — the same scenarios as the SIGHUP
+  reload test, driven over TCP instead: three nodes converge from
+  one shared file; removing node 3 from the file and sending `RELOAD`
+  keeps it ALIVE (`OK peers=2 added=0 dropped=0 kept=1 bad=0`,
+  `PEERFILE KEEP`); killing node 3 and sending `RELOAD` once it is
+  suspected drops it at once (`OK peers=2 added=0 dropped=1 kept=0
+  bad=0`, alive=2, gone from `JSON`); adding node 4 and sending
+  `RELOAD` adds it (alive=3); an unchanged file is a clean no-op and
+  a bad line is logged and skipped (`bad=1`); `RELOAD` on a node with
+  no `--peer-file` is refused (`ERR no peer file`) and on a node
+  whose file was deleted is refused (`ERR cannot read peer file ...`)
+  with the old list kept; and no node restarts on `RELOAD` (exactly
+  one `START` line each).
 
 ## Roadmap
 
@@ -1147,3 +1188,4 @@ make test
 - ~~Slow-peer warning: a peer whose mean probe RTT rises above a configurable threshold (`--slow-peer-rtt-ms`, 0 = disabled) is flagged `"slow":true` per member in `JSON` with a `slow_peers` count in `METRICS` and `JSON`, and the node logs a `SLOW` line once per slow episode (cleared on recovery, so a re-crossing warns again) — the mean, not the last RTT, so one slow probe is noise and only a consistently slow peer warns, while the peer is still ALIVE instead of only after it is suspected.~~ Done in 0.22.0.
 - ~~Seedless bootstrap via a peer list file: a node reads its initial peers from a file (`--peer-file`, one `host:port` per line, comments and blank lines ignored), probes them on startup and joins the cluster without a `--seed` flag — the entries get exactly the `--seed` treatment (JOIN at startup, probing, ~5 s rejoin retry), bad lines are logged and skipped, and a missing file is a clean startup error instead of a silent solo start.~~ Done in 0.23.0.
 - ~~Live peer-file reload on SIGHUP: while a `--peer-file` is in use, SIGHUP re-reads the file and merges it into the seed list without restarting — newly listed peers get the `--seed` treatment (seed list, table, JOIN at once), peers removed from the file are dropped from the table only once they stop answering (a still-ALIVE peer is kept and remembered, so a later reload drops it the moment it goes quiet), a peer named with `--seed` is never added or dropped by a reload, self is never dropped, and a reload that cannot read the file keeps the old list; every reload is logged (`PEERFILE RELOAD` summary plus `ADD`/`DROP`/`KEEP` lines), and SIGHUP on a node with no `--peer-file` is a no-op.~~ Done in 0.24.0.
+- ~~RELOAD control-plane command over TCP: the same live peer-file reload SIGHUP triggers, driven from the control plane (`RELOAD`, answered `OK peers=N added=A dropped=D kept=K bad=B`) so an operator who cannot signal the process can still reload the roster; a node with no `--peer-file` answers `ERR no peer file`, an unreadable file answers `ERR cannot read peer file <path>: <reason>` and keeps the old list, and SIGHUP and RELOAD run the same code serialized on one lock so the two triggers can never interleave.~~ Done in 0.25.0.

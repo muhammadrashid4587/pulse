@@ -7,7 +7,7 @@ HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h src/met
 
 .PHONY: all test clean
 
-all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile
+all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile test_control
 
 pulse-node: $(NODE_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $(NODE_SRC) $(LDFLAGS)
@@ -45,7 +45,10 @@ test_meta: tests/test_meta.c src/member.c src/phi.c src/gossip.c src/secret.c sr
 test_peerfile: tests/test_peerfile.c src/member.c src/phi.c src/peerfile.c src/member.h src/phi.h src/peerfile.h
 	$(CC) $(CFLAGS) -o $@ tests/test_peerfile.c src/member.c src/phi.c src/peerfile.c $(LDFLAGS)
 
-test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile
+test_control: tests/test_control.c src/control.c src/member.c src/phi.c src/metrics.c src/control.h src/member.h src/phi.h src/metrics.h
+	$(CC) $(CFLAGS) -o $@ tests/test_control.c src/control.c src/member.c src/phi.c src/metrics.c $(LDFLAGS)
+
+test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile test_control
 	./test_member
 	./test_phi
 	./test_secret
@@ -56,6 +59,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	./test_adaptive
 	./test_meta
 	./test_peerfile
+	./test_control
 	bash tests/test_cluster.sh
 	bash tests/test_gc.sh
 	bash tests/test_rejoin.sh
@@ -72,6 +76,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_meta.sh
 	bash tests/test_peerfile.sh
 	bash tests/test_peerfile_reload.sh
+	bash tests/test_reload.sh
 
 clean:
-	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile
+	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile test_control

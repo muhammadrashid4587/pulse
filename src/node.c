@@ -128,6 +128,11 @@ static volatile sig_atomic_t g_stop = 0;
  * on its next cycle, where the reload runs under the normal lock
  * discipline instead of inside a signal handler. */
 static volatile sig_atomic_t g_reload_peer_file = 0;
+/* RELOAD control-plane command (0.25.0) runs the same reload from the
+ * control thread, so the two entry points are serialized on this
+ * lock: a SIGHUP reload and a RELOAD command must never interleave
+ * their seed-list edits and JOIN sends. */
+static pthread_mutex_t g_reload_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_seq = 1;
 static pending_probe_t g_pending[MAX_PENDING];
 static pending_indirect_t g_indirect[MAX_PENDING];
@@ -652,19 +657,32 @@ static void *receiver_thread(void *arg) {
  * A reload that cannot read the file keeps the old list: a deleted
  * or typo'd file must not drop the node to a solo start. Bad lines
  * are logged and skipped, exactly as at startup. Runs on the prober
- * thread: the file read and the JOIN sends happen outside g_lock,
- * the seed-list and table updates under it (the rejoin block in
- * probe_cycle reads the seed list under the same lock). */
-static void reload_peer_file(void) {
-    if (g_cfg.peer_file[0] == '\0') return; /* no file, nothing to do */
+ * thread (SIGHUP) or the control thread (RELOAD, 0.25.0), serialized
+ * by g_reload_lock: the file read and the JOIN sends happen outside
+ * g_lock, the seed-list and table updates under it (the rejoin block
+ * in probe_cycle reads the seed list under the same lock). The
+ * outcome is reported back in *r, so the control plane can answer
+ * the operator; the SIGHUP path passes NULL and just gets the logs. */
+static void reload_peer_file_locked(pulse_reload_result_t *r) {
+    if (g_cfg.peer_file[0] == '\0') {
+        r->have_file = 0;
+        return; /* no file, nothing to do */
+    }
+    r->have_file = 1;
     char peers[16][PULSE_ID_LEN];
     int n_peers = 0, n_bad = 0;
     if (pulse_peerfile_load(g_cfg.peer_file, peers, 16, &n_peers,
                             &n_bad) != 0) {
+        int e = errno;
+        r->read_ok = 0;
+        snprintf(r->error, sizeof r->error,
+                 "cannot read peer file %s: %s", g_cfg.peer_file,
+                 strerror(e));
         log_line("PEERFILE reload %s: cannot read: %s", g_cfg.peer_file,
-                 strerror(errno));
+                 strerror(e));
         return;
     }
+    r->read_ok = 1;
     /* Peers already named with --seed flags stay seeds whatever the
      * file says, so they take no part in the diff. */
     char wanted[16][PULSE_ID_LEN];
@@ -817,6 +835,26 @@ static void reload_peer_file(void) {
         log_line("PEERFILE RELOAD %s peers=%d added=%d dropped=%d kept=%d",
                  g_cfg.peer_file, n_peers, n_added - n_full, n_dropped,
                  g_cfg.kept_peer_count);
+    /* Report the outcome (same numbers as the summary line) so the
+     * control plane can answer a RELOAD with it. */
+    r->peers = n_peers;
+    r->added = n_added - n_full;
+    r->dropped = n_dropped;
+    r->kept = g_cfg.kept_peer_count;
+    r->bad = n_bad;
+}
+
+/* Entry point for both reload triggers: SIGHUP (via the prober
+ * thread, which passes NULL and just gets the logs) and the RELOAD
+ * control-plane command (which gets the outcome back). The lock
+ * serializes the two, so they can never interleave. */
+static void reload_peer_file(pulse_reload_result_t *out) {
+    pulse_reload_result_t r;
+    memset(&r, 0, sizeof r);
+    pthread_mutex_lock(&g_reload_lock);
+    reload_peer_file_locked(&r);
+    pthread_mutex_unlock(&g_reload_lock);
+    if (out) *out = r;
 }
 
 /* One probe cycle: ping a random peer, escalate timed-out probes to
@@ -831,7 +869,7 @@ static void probe_cycle(int cycle) {
      * discipline instead of inside a signal handler. */
     if (g_reload_peer_file) {
         g_reload_peer_file = 0;
-        reload_peer_file();
+        reload_peer_file(NULL);
     }
 
     /* 1. Probe a random peer. In phi-accrual mode the PING still goes
@@ -1226,6 +1264,14 @@ static int force_leave_hook(void *ctx, const char *id) {
     pthread_mutex_unlock(&g_lock);
     if (removed) log_line("LEAVE %s", id);
     return removed;
+}
+
+/* RELOAD control-plane command (0.25.0): run the same peer-file
+ * reload SIGHUP triggers, from the control thread, and report the
+ * outcome to the operator. */
+static void reload_peer_file_hook(void *ctx, pulse_reload_result_t *out) {
+    (void)ctx;
+    reload_peer_file(out);
 }
 
 /* Set one annotation on this node itself (control plane META): update
@@ -1774,6 +1820,7 @@ int main(int argc, char **argv) {
         g_hooks.snapshot = snapshot_hook;
         g_hooks.metrics = metrics_hook;
         g_hooks.force_leave = force_leave_hook;
+        g_hooks.reload_peer_file = reload_peer_file_hook;
         g_hooks.set_meta = set_meta_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
         g_hooks.slow_rtt_threshold_ms = g_cfg.slow_peer_rtt_ms;

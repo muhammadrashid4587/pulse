@@ -299,6 +299,31 @@ static void handle_meta(int fd, const control_hooks_t *hooks,
     send_all(fd, line);
 }
 
+/* RELOAD (0.25.0): re-read --peer-file through the node's reload hook
+ * — the same reload SIGHUP triggers — and report the outcome. The
+ * error buffer is 640 bytes, so a 768-byte line holds "ERR " plus the
+ * whole reason. */
+static void handle_reload(int fd, const control_hooks_t *hooks) {
+    if (!hooks->reload_peer_file) {
+        send_all(fd, "ERR reload not supported\n");
+        return;
+    }
+    pulse_reload_result_t r;
+    hooks->reload_peer_file(hooks->ctx, &r);
+    char line[768];
+    if (!r.have_file) {
+        send_all(fd, "ERR no peer file\n");
+    } else if (!r.read_ok) {
+        snprintf(line, sizeof line, "ERR %s\n", r.error);
+        send_all(fd, line);
+    } else {
+        snprintf(line, sizeof line,
+                 "OK peers=%d added=%d dropped=%d kept=%d bad=%d\n",
+                 r.peers, r.added, r.dropped, r.kept, r.bad);
+        send_all(fd, line);
+    }
+}
+
 static void handle_connection(int fd, const control_hooks_t *hooks) {
     char line[CONTROL_MAX_LINE];
     int n = read_line(fd, line, sizeof line);
@@ -323,6 +348,8 @@ static void handle_connection(int fd, const control_hooks_t *hooks) {
         handle_leave(fd, hooks, arg);
     } else if (strcmp(line, "META") == 0) {
         handle_meta(fd, hooks, arg);
+    } else if (strcmp(line, "RELOAD") == 0) {
+        handle_reload(fd, hooks);
     } else if (strcmp(line, "METRICS") == 0) {
         handle_metrics(fd, hooks);
     } else if (strcmp(line, "JSON") == 0) {
