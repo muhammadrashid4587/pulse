@@ -170,13 +170,28 @@ static void note_contact(const gmsg_t *msg,
 /* Merge a membership message into the table: a GOSSIP digest or a SYNC
  * full table — the entries merge the same way (higher incarnation wins;
  * DEAD > SUSPECT > ALIVE at equal incarnation). The sender is alive by
- * direct contact. A SYNC is answered with our own full table, so one
- * exchange converges both sides; a GOSSIP gets no reply, the periodic
- * digest round is one-way. */
+ * direct contact. A SYNC is answered with our own full table when the
+ * exchange taught us something new, so one exchange converges both
+ * sides; a GOSSIP gets no reply, the periodic digest round is one-way.
+ * The answer is conditional on purpose: an unconditional answer would
+ * ping-pong forever, each SYNC answered by a SYNC at network speed,
+ * and the pair would burn a CPU core exchanging identical tables.
+ * (That is what 0.13.0 did: every SYNC was answered, so the first
+ * periodic SYNC started an endless reply loop. Answering only when
+ * the merge added or changed a member, the sender was new or revived,
+ * or we refuted a verdict about ourselves keeps the one-round-trip
+ * convergence — the reply carries strictly newer information — and
+ * lets the exchange go quiet once both sides agree.) */
 static void handle_membership_msg(const gmsg_t *msg,
                                   const struct sockaddr_storage *from_addr,
                                   int reply_sync) {
     int refute = 0;
+    /* The exchange taught us something new: a new or revived sender, a
+     * refuted verdict about ourselves, or a merged entry that added or
+     * changed a member. Only then is a SYNC answered with our own full
+     * table; a SYNC that changes nothing gets no reply, which is what
+     * stops two converged nodes from answering each other forever. */
+    int learned = 0;
     char new_ids[8][PULSE_ID_LEN];
     int new_count = 0;
     /* State transitions learned from gossip (e.g. a peer's digest
@@ -190,6 +205,7 @@ static void handle_membership_msg(const gmsg_t *msg,
     int revived = member_mark_alive(&g_table, msg->from_id, from_addr,
                                     msg->from_inc, pulse_now_ms());
     if (is_new) metrics_note_join(&g_metrics);
+    if (is_new || revived) learned = 1;
     for (int i = 0; i < msg->entry_count; i++) {
         const member_t *e = &msg->entries[i];
         member_t *before = member_find(&g_table, e->id);
@@ -198,10 +214,15 @@ static void handle_membership_msg(const gmsg_t *msg,
                              e->incarnation, e->state, pulse_now_ms());
         if ((r & MERGE_SELF_SUSPECTED) && !refute) {
             refute = 1;
+            learned = 1;
             metrics_note_refute(&g_metrics);
         }
-        if (r & MERGE_NEW) metrics_note_join(&g_metrics);
+        if (r & MERGE_NEW) {
+            learned = 1;
+            metrics_note_join(&g_metrics);
+        }
         if (r & MERGE_CHANGED) {
+            learned = 1;
             /* A transition learned from gossip: count it, but
              * there is no local latency to measure. */
             member_t *after = member_find(&g_table, e->id);
@@ -250,10 +271,11 @@ static void handle_membership_msg(const gmsg_t *msg,
     }
     if (refute)
         log_line("REFUTE %s inc=%u", g_self_id, g_incarnation);
-    if (reply_sync) {
+    if (reply_sync && learned) {
         /* Answer a full table with our own, so the exchange converges
-         * both sides in one round trip. Sent from a snapshot taken
-         * under the lock, like the JOIN reply. */
+         * both sides in one round trip — but only when the exchange
+         * taught us something new (see above). Sent from a snapshot
+         * taken under the lock, like the JOIN reply. */
         member_table_t copy;
         pthread_mutex_lock(&g_lock);
         copy = g_table;
@@ -342,7 +364,14 @@ static void handle_message(const gmsg_t *msg) {
             pthread_mutex_lock(&g_lock);
             copy = g_table;
             pthread_mutex_unlock(&g_lock);
-            gossip_send_digest(g_send_sock, &from_addr, g_self_id, g_incarnation, &copy);
+            /* Answer a JOIN with the whole table (SYNC), not the capped
+             * 16-entry digest: a joiner that lands in a cluster larger
+             * than the digest would otherwise wait for gossip rounds to
+             * rotate the missing members through, while the seed
+             * already holds the full picture. The joiner merges the
+             * SYNC and answers with its own full table, so one
+             * exchange converges both sides. */
+            gossip_send_full_table(g_send_sock, &from_addr, g_self_id, g_incarnation, &copy);
             break;
         }
 
@@ -455,7 +484,7 @@ static void probe_cycle(int cycle) {
      * JOIN to each seed that is not currently ALIVE, so the cluster
      * heals when the seed comes up. The seed is deliberately NOT
      * re-added to the table here: it comes back through the normal
-     * path (the seed answers the JOIN with a digest, and direct
+     * path (the seed answers the JOIN with a full-table SYNC, and direct
      * contact re-adds it), so a seed that never answers — wrong
      * secret, wrong family, genuinely dead — stays GC'd instead of
      * cycling back into the table. A seed of the other address

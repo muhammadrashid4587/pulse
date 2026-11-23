@@ -65,9 +65,15 @@ building block, not a production service mesh.
   covers unclean deaths. See "Graceful leave" below.
 - Anti-entropy: every ~10 s a node exchanges its whole membership
   table with a random peer (`SYNC`), and the peer answers with its own
-  full table, so a node that missed many incremental digests converges
-  in one exchange instead of waiting for the random window to rotate
-  the missing entries through. See "Anti-entropy" below.
+  full table when the exchange taught it something new, so a node that
+  missed many incremental digests converges in one exchange instead of
+  waiting for the random window to rotate the missing entries through.
+  A `SYNC` that changes nothing gets no reply: an unconditional answer
+  would ping-pong forever, each `SYNC` answered by a `SYNC` at network
+  speed. See "Anti-entropy" below. A `JOIN` is answered with a `SYNC`
+  for the same reason: a joiner gets the seed's whole table at once
+  instead of waiting for gossip rounds to rotate the missing members
+  through.
 
 ## What it is not
 
@@ -346,7 +352,7 @@ at all. Two 1-node clusters, permanently.
 So every ~5 s the node re-sends `JOIN` to each seed that is not
 currently ALIVE in its membership table (logged as `REJOIN <id>`
 when the seed had already been garbage-collected). When the seed
-comes up it answers the `JOIN` with a membership digest, both sides
+comes up it answers the `JOIN` with a full-table SYNC, both sides
 learn about each other, and the cluster merges. The seed is
 deliberately not re-added to the table by the retry itself: it comes
 back through the normal path (direct contact re-adds it), so a seed
@@ -439,6 +445,25 @@ SYNCs walk the whole table and a stale peer still converges within a
 couple of exchanges instead of re-receiving the same head of the
 table forever. A table that fits — every IPv4 table, and small IPv6
 ones — converges in exactly one exchange.
+
+A `JOIN` is answered with a `SYNC` for the same reason. Before that,
+the seed answered with the capped 16-entry digest, so a joiner
+landing in a cluster larger than the digest had to wait for gossip
+rounds to rotate the missing members through — the seed already held
+the full picture and the joiner had no reason to wait for it. The
+joiner merges the `SYNC` and answers with its own full table, so one
+exchange converges both sides, exactly as in the periodic case.
+
+A `SYNC` is answered only when the exchange taught the receiver
+something new — a new or revived sender, a refuted verdict about
+itself, or a merged entry that added or changed a member. A `SYNC`
+that changes nothing gets no reply. That condition matters: 0.13.0
+answered every `SYNC` unconditionally, so the first periodic exchange
+started an endless reply loop, each `SYNC` answered by a `SYNC` at
+network speed, and a converged pair burned a CPU core exchanging
+identical tables. Answering only on new information keeps the
+one-round-trip convergence — the reply always carries strictly newer
+information — and lets the exchange go quiet once both sides agree.
 
 ## Gossip fanout
 
@@ -558,6 +583,14 @@ make test
   cluster with `--sync-interval-ms 2000` converges, both nodes log a
   periodic `SYNC` line to each other within a few seconds, and both
   stay converged on alive=2 after the exchange.
+- `tests/test_join_sync.sh`: integration test for JOIN answered with
+  a full-table SYNC — a raw JOIN datagram sent to a lone node is
+  answered with a SYNC carrying the node's table (not a GOSSIP
+  digest), and a 4th node joining a converged 3-node cluster reports
+  alive=4 within a few seconds, with the seed converging too. Also
+  checks the SYNC reply loop is gone: once converged, both nodes
+  stay near idle (under 15% of a core over 3 s) instead of burning
+  CPU answering each other's SYNCs forever.
 - `tests/test_leave.sh`: integration test for graceful leave — a
   3-node cluster converges, node 3 stops cleanly and both survivors
   mark it DEAD within 400 ms (the probe path alone needs ~500 ms, so
@@ -589,3 +622,5 @@ make test
 - ~~Membership persistence: save the known member list to disk periodically and on clean shutdown, and reload it on startup, so a restarted node re-discovers its old peers without a seed — re-probing every restored entry instead of trusting it.~~ Done in 0.12.0.
 - ~~Anti-entropy full-table sync: periodically exchange the whole membership table with a random peer (SYNC, answered with the peer's own full table), so a node that missed many incremental digests converges in one exchange; tables too big for one datagram rotate across successive SYNCs.~~ Done in 0.13.0.
 - ~~Graceful leave: a node that stops cleanly announces its departure to its peers (a GOSSIP digest with its own entry DEAD), so they mark it DEAD at once instead of waiting for the probe timeout; a crash sends nothing, so the probe path still covers unclean deaths, and a restart at a higher incarnation refutes the DEAD entry.~~ Done in 0.14.0.
+- ~~JOIN answered with a full-table SYNC: a joiner gets the seed's whole membership table at once instead of the capped 16-entry digest, so it converges immediately instead of waiting for gossip rounds to rotate the missing members through; the joiner answers with its own full table, so one exchange converges both sides.~~ Done in 0.15.0.
+- ~~SYNC replies only on new information: a SYNC is answered with the receiver's full table only when the exchange taught it something new (new/revived sender, refutation, or a merged entry that added or changed a member); a SYNC that changes nothing gets no reply, fixing the 0.13.0 reply ping-pong in which a converged pair burned a CPU core exchanging identical tables forever.~~ Done in 0.15.0.

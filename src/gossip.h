@@ -31,9 +31,16 @@
  * carries the sender's whole membership table, so a peer that missed
  * many incremental digests converges in one exchange instead of waiting
  * for the random window to rotate the missing entries through. A node
- * that receives a SYNC answers with its own full table, so one exchange
- * converges both sides. Entries use the same "id:inc:state" encoding
- * and the same merge rule as GOSSIP.
+ * that receives a SYNC answers with its own full table when the
+ * exchange taught it something new (a new or revived sender, a
+ * refuted verdict about itself, or a merged entry that added or
+ * changed a member), so one exchange converges both sides; a SYNC
+ * that changes nothing gets no reply, which is what stops two
+ * converged nodes answering each other with identical tables forever.
+ * Entries use the same "id:inc:state" encoding and the same merge
+ * rule as GOSSIP. A JOIN is answered with a SYNC for the same reason:
+ * a joiner gets the seed's whole table at once instead of waiting for
+ * gossip rounds to rotate the missing members through.
  *
  * When a shared secret is configured (gossip_set_secret), every message
  * carries a trailing " <tag>" token: the first 8 bytes of
