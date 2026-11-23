@@ -168,7 +168,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }
-    char dmean[16], smean[16];
+    char dmean[16], smean[16], dhist[64];
     if (m.detect_samples > 0)
         snprintf(dmean, sizeof dmean, "%lld",
                  (long long)(m.detect_sum_ms / m.detect_samples));
@@ -179,14 +179,15 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                  (long long)(m.suspect_dead_sum_ms / m.suspect_dead_samples));
     else
         snprintf(smean, sizeof smean, "null");
+    metrics_detect_hist_json(&m, dhist, sizeof dhist);
     w = snprintf(buf + used, sizeof buf - used,
         "],\"metrics\":{\"suspected\":%lld,\"dead\":%lld,\"refutes\":%lld,"
         "\"joins\":%lld,\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
-        "\"samples\":%lld},\"suspect_to_dead_ms\":{\"mean\":%s,\"max\":%lld,"
-        "\"samples\":%lld}}}\nEND\n",
+        "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
+        "\"max\":%lld,\"samples\":%lld}}}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
         (long long)m.joins, dmean, (long long)m.detect_max_ms,
-        (long long)m.detect_samples, smean,
+        (long long)m.detect_samples, dhist, smean,
         (long long)m.suspect_dead_max_ms,
         (long long)m.suspect_dead_samples);
     if (w < 0 || (size_t)w >= sizeof buf - used) return;

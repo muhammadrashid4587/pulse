@@ -25,6 +25,11 @@ int main(void) {
     CHECK(strstr(buf, "suspected=0 dead=0 refutes=0 joins=0") != NULL);
     CHECK(strstr(buf, "detect_latency_ms mean=- max=- samples=0") != NULL);
     CHECK(strstr(buf, "suspect_to_dead_ms mean=- max=- samples=0") != NULL);
+    CHECK(m.detect_hist[0] == 0 && m.detect_hist[4] == 0);
+    CHECK(strstr(buf, "hist=[0,0,0,0,0]") != NULL);
+    char hbuf[64];
+    metrics_detect_hist_json(&m, hbuf, sizeof hbuf);
+    CHECK(strcmp(hbuf, "0,0,0,0,0") == 0);
 
     /* Locally detected suspicions feed the latency stats: mean is the
      * integer mean, max is the largest sample. */
@@ -37,14 +42,38 @@ int main(void) {
     metrics_format(&m, buf, sizeof buf);
     CHECK(strstr(buf, "detect_latency_ms mean=150 max=200 samples=2") != NULL);
 
+    /* The histogram buckets each sample: 50 -> <100, 100 -> 100-249,
+     * 250 -> 250-499, 500 -> 500-999, 1000 -> >=1000. Boundaries land
+     * in the higher bucket, so a sample exactly at a bound is never
+     * counted as faster than it was. */
+    metrics_note_suspect(&m, 50);
+    metrics_note_suspect(&m, 100);
+    metrics_note_suspect(&m, 250);
+    metrics_note_suspect(&m, 500);
+    metrics_note_suspect(&m, 1000);
+    metrics_note_suspect(&m, 5000);
+    CHECK(m.detect_hist[0] == 1);
+    CHECK(m.detect_hist[1] == 3); /* 100, 100, 200 */
+    CHECK(m.detect_hist[2] == 1); /* 250 */
+    CHECK(m.detect_hist[3] == 1); /* 500 */
+    CHECK(m.detect_hist[4] == 2); /* 1000, 5000 */
+    CHECK(m.detect_hist[0] + m.detect_hist[1] + m.detect_hist[2] +
+          m.detect_hist[3] + m.detect_hist[4] == m.detect_samples);
+    metrics_format(&m, buf, sizeof buf);
+    CHECK(strstr(buf, "hist=[1,3,1,1,2]") != NULL);
+    metrics_detect_hist_json(&m, hbuf, sizeof hbuf);
+    CHECK(strcmp(hbuf, "1,3,1,1,2") == 0);
+
     /* A suspicion learned from gossip bumps the count but adds no
      * latency sample: there is no local heartbeat to measure. */
     metrics_note_suspect(&m, -1);
-    CHECK(m.suspected == 3);
-    CHECK(m.detect_samples == 2);
+    CHECK(m.suspected == 9);
+    CHECK(m.detect_samples == 8);
+    CHECK(m.detect_hist[0] + m.detect_hist[1] + m.detect_hist[2] +
+          m.detect_hist[3] + m.detect_hist[4] == m.detect_samples);
     metrics_format(&m, buf, sizeof buf);
-    CHECK(strstr(buf, "suspected=3") != NULL);
-    CHECK(strstr(buf, "detect_latency_ms mean=150 max=200 samples=2") != NULL);
+    CHECK(strstr(buf, "suspected=9") != NULL);
+    CHECK(strstr(buf, "hist=[1,3,1,1,2]") != NULL);
 
     /* Same split for SUSPECT -> DEAD: a locally swept dead member
      * records how long it sat suspect; a gossiped one does not. */

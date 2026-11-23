@@ -253,11 +253,11 @@ the port beyond localhost.
 # OK 127.0.0.1:17102
 
 ./pulse-ctl 127.0.0.1:18401 METRICS
-# METRICS suspected=1 dead=1 refutes=0 joins=2 detect_latency_ms mean=203 max=203 samples=1 suspect_to_dead_ms mean=301 max=301 samples=1
+# METRICS suspected=1 dead=1 refutes=0 joins=2 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1
 # END
 
 ./pulse-ctl 127.0.0.1:18401 JSON
-# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"detect_latency_ms":{"mean":203,"max":203,"samples":1},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1}}}
+# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1}}}
 # END
 ```
 
@@ -274,8 +274,8 @@ Commands:
 | `MEMBERS` | One `MEMBER <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <phi\|->` line per member, then `END`. Phi is the peer's current phi (two decimals) when phi-accrual is on and the peer has heartbeat history; `-` otherwise, including self. |
 | `STATUS` | One `STATUS id=<self> uptime=<seconds> alive=N suspect=N dead=N total=N` line, then `END`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
-| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N detect_latency_ms mean=X max=Y samples=N suspect_to_dead_ms mean=X max=Y samples=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. |
-| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. Built for tooling that polls cluster state without scraping the text protocol. |
+| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. |
+| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Built for tooling that polls cluster state without scraping the text protocol. |
 | anything else | `ERR unknown command` |
 
 ## Shared secret
@@ -569,17 +569,21 @@ make test
   with a phi value and then marked DEAD by both survivors, and a
   restarted node comes back ALIVE.
 - `tests/test_metrics.c`: unit tests for the metrics module — a fresh
-  struct formats with zero counts and `-` latencies, locally detected
-  suspicions feed mean/max detection latency, gossip-learned
-  transitions bump the counts without adding a latency sample, and
-  refutes/joins are plain counters.
+  struct formats with zero counts and `-` latencies and an all-zero
+  histogram, locally detected suspicions feed mean/max detection latency
+  and bucket into the histogram (<100, 100–249, 250–499, 500–999,
+  ≥1000 ms, with boundary samples landing in the higher bucket),
+  gossip-learned transitions bump the counts without adding a latency
+  sample or a histogram count, and refutes/joins are plain counters.
 - `tests/test_control.sh`: integration test for the TCP control plane —
   `MEMBERS` lists the node itself, `STATUS` reports id and totals,
   `METRICS` reports zero counts and no samples on a fresh node and
-  the detected kill with measured latencies after a peer dies, `JSON`
-  returns one line of valid JSON with the node itself as the only
-  member and zeroed metrics on a fresh node, and after a kill it lists
-  the dead member with state `DEAD` and numeric latency means,
+  the detected kill with measured latencies and a histogram after a
+  peer dies, `JSON` returns one line of valid JSON with the node itself
+  as the only member and zeroed metrics (including an all-zero
+  histogram) on a fresh node, and after a kill it lists
+  the dead member with state `DEAD` and numeric latency means and a
+  histogram,
   unknown commands and bad `LEAVE` usage get clean `ERR` lines, a
   second node appears in `MEMBERS` after joining, `LEAVE` removes it
   from the listing immediately, the live node comes back via direct
@@ -678,3 +682,4 @@ make test
 - ~~JOIN answered with a full-table SYNC: a joiner gets the seed's whole membership table at once instead of the capped 16-entry digest, so it converges immediately instead of waiting for gossip rounds to rotate the missing members through; the joiner answers with its own full table, so one exchange converges both sides.~~ Done in 0.15.0.
 - ~~SYNC replies only on new information: a SYNC is answered with the receiver's full table only when the exchange taught it something new (new/revived sender, refutation, or a merged entry that added or changed a member); a SYNC that changes nothing gets no reply, fixing the 0.13.0 reply ping-pong in which a converged pair burned a CPU core exchanging identical tables forever.~~ Done in 0.15.0.
 - ~~Gossip delta encoding: instead of sending the full membership table in every gossip exchange, send only entries that changed since the peer's last known version (per-peer versions tracked from a table version bumped on every change, each entry stamped with the version it last changed at), falling back to a full SYNC when the peer has no recorded version or is more than a digest's worth of changes behind; a converged cluster sends no gossip bytes at all until something changes, and the periodic anti-entropy SYNC heals any delta lost to UDP.~~ Done in 0.16.0.
+- ~~Detection-latency histogram: the locally measured detection latencies are bucketed (<100, 100–249, 250–499, 500–999, ≥1000 ms) alongside the existing mean/max, and exposed as `hist` in the `METRICS` text line and as `detect_latency_ms.hist` in `JSON`, so the mean cannot hide a slow tail — a detection that usually lands in ~200 ms but sometimes takes over a second is exactly what the ward-device use case needs to see.~~ Done in 0.17.0.
