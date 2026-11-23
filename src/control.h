@@ -19,6 +19,19 @@
  *       otherwise (including self, which has no phi history).
  *       Annotations are the member's comma-separated "k=v,k=v" list,
  *       '-' when it carries none.
+ *   PEERS
+ *       One line per member, then END:
+ *       PEER <id> <incarnation> <ALIVE|SUSPECT|DEAD> <last-seen-ms|'-'>
+ *           <seed|peer-file|discovered|self>
+ *       last-seen-ms is how many ms since this node last heard
+ *       directly from the peer; '-' for self (it never probes
+ *       itself) and for a peer never heard from (a seed that never
+ *       answered). The source says where the peer came from: a
+ *       --seed flag, the --peer-file roster, a peer removed from
+ *       the file but kept because it was still ALIVE, or gossip /
+ *       a JOIN from a peer the node was never told about
+ *       (discovered). A peer named with both --seed and --peer-file
+ *       reports as seed: the flag outranks the file.
  *   META <key=value>
  *       Set one annotation on this node itself (at most 8): OK
  *       <key=value>. The change is gossiped to the cluster with the
@@ -125,6 +138,13 @@ typedef struct {
     int (*set_meta)(void *ctx, const char *key, const char *value);
     /* 1 when phi-accrual suspicion is on (phi values are meaningful). */
     int (*phi_enabled)(void *ctx);
+    /* Where a member came from, for the PEERS command: "seed" (a
+     * --seed flag), "peer-file" (the --peer-file roster, or a peer
+     * removed from it but kept because it was still ALIVE),
+     * "discovered" (learned from gossip or a JOIN, never seeded),
+     * or "self". NULL when the node does not track provenance:
+     * PEERS then reports every non-self member as "discovered". */
+    const char *(*peer_source)(void *ctx, const char *id);
     /* Slow-peer RTT threshold in ms (0 = warning disabled): a peer
      * whose mean probe RTT is above this counts as slow, and is
      * reported as "slow" per member in JSON and as slow_peers in

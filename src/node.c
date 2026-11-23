@@ -1313,6 +1313,45 @@ static int phi_enabled_hook(void *ctx) {
     return g_cfg.phi_accrual;
 }
 
+/* PEERS control-plane command (0.27.0): where a member came from.
+ * Precedence: self, then a --seed flag (the flag outranks the file,
+ * exactly as the reload does), then the --peer-file roster — or the
+ * kept list, a peer removed from the file but kept because it was
+ * still ALIVE — then anything else is discovered: learned from
+ * gossip or a JOIN, never seeded. Returns a string literal; the
+ * caller must not free it. The seed lists are read under g_lock,
+ * since a reload can rebuild them. */
+static const char *peer_source_hook(void *ctx, const char *id) {
+    (void)ctx;
+    if (strcmp(id, g_self_id) == 0) return "self";
+    pthread_mutex_lock(&g_lock);
+    const char *source = "discovered";
+    for (int i = 0; i < g_cfg.seed_flag_count; i++) {
+        if (strcmp(g_cfg.seeds[i], id) == 0) {
+            source = "seed";
+            break;
+        }
+    }
+    if (strcmp(source, "discovered") == 0) {
+        for (int i = 0; i < g_cfg.peer_file_seed_count; i++) {
+            if (strcmp(g_cfg.peer_file_seeds[i], id) == 0) {
+                source = "peer-file";
+                break;
+            }
+        }
+    }
+    if (strcmp(source, "discovered") == 0) {
+        for (int i = 0; i < g_cfg.kept_peer_count; i++) {
+            if (strcmp(g_cfg.kept_peers[i], id) == 0) {
+                source = "peer-file";
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return source;
+}
+
 static int force_leave_hook(void *ctx, const char *id) {
     (void)ctx;
     if (strcmp(id, g_self_id) == 0) return -1;
@@ -1888,6 +1927,7 @@ int main(int argc, char **argv) {
         g_hooks.reload_peer_file = reload_peer_file_hook;
         g_hooks.set_meta = set_meta_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
+        g_hooks.peer_source = peer_source_hook;
         g_hooks.slow_rtt_threshold_ms = g_cfg.slow_peer_rtt_ms;
         g_hooks.self_id = g_self_id;
         g_hooks.start_ms = g_start_ms;

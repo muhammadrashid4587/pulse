@@ -106,6 +106,39 @@ static void handle_members(int fd, const control_hooks_t *hooks) {
     send_all(fd, "END\n");
 }
 
+static void handle_peers(int fd, const control_hooks_t *hooks) {
+    member_table_t t;
+    hooks->snapshot(hooks->ctx, &t);
+    int64_t now = pulse_now_ms();
+    /* A peer line is short: id, incarnation, state, last-seen, source. */
+    char line[256];
+    for (int i = 0; i < t.count; i++) {
+        const member_t *m = &t.members[i];
+        /* Last-seen is ms since direct contact. Self never probes
+         * itself (its last_seen is just startup time), and a peer
+         * never heard from has last_seen_ms 0 — both report '-'. */
+        char seenbuf[32];
+        if (strcmp(m->id, hooks->self_id) == 0 || m->last_seen_ms <= 0) {
+            snprintf(seenbuf, sizeof seenbuf, "-");
+        } else {
+            snprintf(seenbuf, sizeof seenbuf, "%lld",
+                     (long long)(now - m->last_seen_ms));
+        }
+        const char *source = "discovered";
+        if (hooks->peer_source) {
+            const char *s = hooks->peer_source(hooks->ctx, m->id);
+            if (s && s[0] != '\0') source = s;
+        } else if (strcmp(m->id, hooks->self_id) == 0) {
+            source = "self";
+        }
+        snprintf(line, sizeof line, "PEER %s %u %s %s %s\n", m->id,
+                 m->incarnation, member_state_name(m->state), seenbuf,
+                 source);
+        if (send_all(fd, line) != 0) return;
+    }
+    send_all(fd, "END\n");
+}
+
 static void handle_status(int fd, const control_hooks_t *hooks) {
     member_table_t t;
     hooks->snapshot(hooks->ctx, &t);
@@ -342,6 +375,8 @@ static void handle_connection(int fd, const control_hooks_t *hooks) {
     }
     if (strcmp(line, "MEMBERS") == 0) {
         handle_members(fd, hooks);
+    } else if (strcmp(line, "PEERS") == 0) {
+        handle_peers(fd, hooks);
     } else if (strcmp(line, "STATUS") == 0) {
         handle_status(fd, hooks);
     } else if (strcmp(line, "LEAVE") == 0) {

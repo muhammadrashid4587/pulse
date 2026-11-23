@@ -1,13 +1,18 @@
-/* Unit tests for the TCP control plane dispatch (RELOAD, 0.25.0):
+/* Unit tests for the TCP control plane dispatch (RELOAD, 0.25.0;
+ * PEERS, 0.27.0):
  * fake hooks serve canned state, and the test drives the real
  * control_listen / control_serve over loopback, checking the exact
  * reply lines for RELOAD success, no peer file, an unreadable file,
- * and a node with no reload hook — plus MEMBERS on an empty table
- * and an unknown command, so the dispatch around RELOAD is covered
- * too. The node-level merge itself is covered by the integration
- * test (tests/test_reload.sh) and the SIGHUP reload tests. */
+ * and a node with no reload hook — plus PEERS lines (id, state,
+ * last-seen, source) for a canned table, and MEMBERS on an empty
+ * table and an unknown command, so the dispatch around RELOAD is
+ * covered too. The node-level merge itself is covered by the
+ * integration test (tests/test_reload.sh) and the SIGHUP reload
+ * tests; PEERS provenance end to end is covered by
+ * tests/test_peers.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -34,9 +39,39 @@ static int checks = 0, failures = 0;
  * 2 = unreadable file. */
 static int g_reload_mode = 0;
 
+/* Canned membership for PEERS: self, a --seed peer (heard from
+ * recently), a --peer-file peer (heard from recently), and a
+ * discovered peer never heard from (last_seen_ms 0). g_peers_empty
+ * makes the snapshot return an empty table instead. */
+static int g_peers_empty = 0;
+
 static void snapshot_hook(void *ctx, member_table_t *out) {
     (void)ctx;
-    memset(out, 0, sizeof *out);
+    member_table_init(out);
+    if (g_peers_empty) return;
+    int64_t now = pulse_now_ms();
+    struct sockaddr_storage addr;
+    memset(&addr, 0, sizeof addr);
+    member_t *m;
+    m = member_add(out, "127.0.0.1:17999", &addr, 1);
+    if (m) m->last_seen_ms = now;
+    m = member_add(out, "127.0.0.1:17901", &addr, 1);
+    if (m) m->last_seen_ms = now;
+    m = member_add(out, "127.0.0.1:17903", &addr, 2);
+    if (m) m->last_seen_ms = now;
+    m = member_add(out, "127.0.0.1:17902", &addr, 1);
+    if (m) {
+        m->state = MEMBER_DEAD;
+        m->last_seen_ms = 0; /* never heard from */
+    }
+}
+
+static const char *peer_source_hook(void *ctx, const char *id) {
+    (void)ctx;
+    if (strcmp(id, "127.0.0.1:17999") == 0) return "self";
+    if (strcmp(id, "127.0.0.1:17901") == 0) return "seed";
+    if (strcmp(id, "127.0.0.1:17903") == 0) return "peer-file";
+    return "discovered";
 }
 
 static void metrics_hook(void *ctx, pulse_metrics_t *out) {
@@ -126,6 +161,7 @@ int main(void) {
     g_hooks.reload_peer_file = reload_hook;
     g_hooks.set_meta = NULL;
     g_hooks.phi_enabled = phi_enabled_hook;
+    g_hooks.peer_source = peer_source_hook;
     g_hooks.slow_rtt_threshold_ms = 0;
     g_hooks.self_id = "127.0.0.1:17999";
     g_hooks.start_ms = pulse_now_ms();
@@ -162,10 +198,72 @@ int main(void) {
 
     /* MEMBERS on an empty table is just END; an unknown command is
      * still a clean ERR, so the dispatch around RELOAD is intact. */
+    g_peers_empty = 1;
     CHECK(send_cmd(18991, "MEMBERS\n", reply, sizeof reply) > 0);
     CHECK(strcmp(reply, "END\n") == 0);
     CHECK(send_cmd(18991, "BOGUS\n", reply, sizeof reply) > 0);
     CHECK(strcmp(reply, "ERR unknown command\n") == 0);
+
+    /* PEERS on an empty table is just END too. */
+    CHECK(send_cmd(18991, "PEERS\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply, "END\n") == 0);
+    g_peers_empty = 0;
+
+    /* PEERS on the canned table: one line per member, then END.
+     * Last-seen is timing-dependent (0 or 1 ms for a peer heard from
+     * just now), so it is checked as "-" or all digits, never an
+     * exact number; id, incarnation, state and source are exact. */
+    CHECK(send_cmd(18991, "PEERS\n", reply, sizeof reply) > 0);
+    {
+        const char *want_id[4] = {"127.0.0.1:17999", "127.0.0.1:17901",
+                                  "127.0.0.1:17903", "127.0.0.1:17902"};
+        unsigned want_inc[4] = {1, 1, 2, 1};
+        const char *want_state[4] = {"ALIVE", "ALIVE", "ALIVE", "DEAD"};
+        const char *want_seen[4] = {"-", "digits", "digits", "-"};
+        const char *want_src[4] = {"self", "seed", "peer-file",
+                                   "discovered"};
+        int nlines = 0;
+        char *save = NULL;
+        char *line = strtok_r(reply, "\n", &save);
+        while (line) {
+            if (strcmp(line, "END") == 0) break;
+            CHECK(nlines < 4);
+            if (nlines < 4) {
+                char id[64], state[16], seen[32], src[16];
+                unsigned inc = 0;
+                CHECK(sscanf(line, "PEER %63s %u %15s %31s %15s", id,
+                             &inc, state, seen, src) == 5);
+                CHECK(strcmp(id, want_id[nlines]) == 0);
+                CHECK(inc == want_inc[nlines]);
+                CHECK(strcmp(state, want_state[nlines]) == 0);
+                if (strcmp(want_seen[nlines], "-") == 0) {
+                    CHECK(strcmp(seen, "-") == 0);
+                } else {
+                    int all_digits = seen[0] != '\0';
+                    for (int i = 0; seen[i]; i++)
+                        if (!isdigit((unsigned char)seen[i]))
+                            all_digits = 0;
+                    CHECK(all_digits);
+                }
+                CHECK(strcmp(src, want_src[nlines]) == 0);
+            }
+            nlines++;
+            line = strtok_r(NULL, "\n", &save);
+        }
+        CHECK(nlines == 4);
+        CHECK(line != NULL && strcmp(line, "END") == 0);
+    }
+
+    /* A node with no peer_source hook: PEERS still answers, with
+     * every non-self member as "discovered" and self as "self". */
+    g_hooks.peer_source = NULL;
+    CHECK(send_cmd(18991, "PEERS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "PEER 127.0.0.1:17999 1 ALIVE - self\n") != NULL);
+    CHECK(strstr(reply, "PEER 127.0.0.1:17901 1 ALIVE ") != NULL);
+    CHECK(strstr(reply, " discovered\n") != NULL);
+    CHECK(strstr(reply, " seed\n") == NULL);
+    CHECK(strstr(reply, " peer-file\n") == NULL);
+    g_hooks.peer_source = peer_source_hook;
 
     shutdown(fd, SHUT_RDWR);
     close(fd);

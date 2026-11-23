@@ -37,7 +37,8 @@ building block, not a production service mesh.
 - TCP control plane (opt-in, `--control-port`): a line-based protocol
   for asking a running node for its membership (`MEMBERS`), its status
   (`STATUS`), its failure-detector metrics (`METRICS`), the whole
-  picture as one machine-readable JSON object (`JSON`), setting an
+  picture as one machine-readable JSON object (`JSON`), each peer with
+  its last-seen time and where it came from (`PEERS`), setting an
   annotation on the node (`META <key=value>`), triggering a live
   peer-file reload (`RELOAD`), or
   force-removing a member (`LEAVE <id>`). See
@@ -264,7 +265,7 @@ scripts/demo.sh
 | `--phi-accrual` | off | Suspect on phi instead of the fixed ack timeout |
 | `--phi-threshold` | 8.0 | Phi value at which a peer is suspected (phi mode only) |
 | `--sync-interval-ms` | 10000 | How often to exchange full tables (anti-entropy SYNC) with a random peer |
-| `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `LEAVE`, `RELOAD`) |
+| `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `PEERS`, `LEAVE`, `RELOAD`) |
 | `--secret` / `--shared-secret` | — (none) | Shared secret for joins: only peers presenting the same secret are accepted |
 | `--meta KEY=VALUE` | — (none) | An annotation this node carries about itself (repeatable, at most 8): gossiped with its membership entry, shown in `MEMBERS`/`JSON`, persisted across restarts |
 | `--ipv6` | off | Run over IPv6: bind `::`, ids are `[::1]:port`, control plane on `::1` |
@@ -305,7 +306,7 @@ debugging and operations interface, not a public API; do not expose
 the port beyond localhost.
 
 ```sh
-./pulse-node --port 17101 --control-port 18401 --data-dir /tmp/p1
+./pulse-node --port 17101 --peer-file peers --control-port 18401 --data-dir /tmp/p1
 
 ./pulse-ctl 127.0.0.1:18401 MEMBERS
 # MEMBER 127.0.0.1:17101 1 ALIVE - role=worker,zone=us-east-1
@@ -324,6 +325,12 @@ the port beyond localhost.
 
 ./pulse-ctl 127.0.0.1:18401 RELOAD
 # OK peers=3 added=1 dropped=0 kept=0 bad=0
+
+./pulse-ctl 127.0.0.1:18401 PEERS
+# PEER 127.0.0.1:17101 1 ALIVE - self
+# PEER 127.0.0.1:17102 1 ALIVE 12 peer-file
+# PEER 127.0.0.1:17103 1 ALIVE 8 discovered
+# END
 
 ./pulse-ctl 127.0.0.1:18401 METRICS
 # METRICS suspected=1 dead=1 refutes=0 joins=2 adaptive_fast_cycles=3 suspect_refuted=0 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1 refute_latency_ms mean=- max=- samples=0 slow_peers=0
@@ -345,6 +352,7 @@ Commands:
 | Command | Reply |
 | ------- | ----- |
 | `MEMBERS` | One `MEMBER <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <phi\|-> <annotations\|->` line per member, then `END`. Phi is the peer's current phi (two decimals) when phi-accrual is on and the peer has heartbeat history; `-` otherwise, including self. Annotations are the member's comma-separated `key=value` list, `-` when it carries none. |
+| `PEERS` | One `PEER <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <last-seen-ms\|-> <seed\|peer-file\|discovered\|self>` line per member, then `END`. Last-seen is the ms since this node last heard directly from the peer (`-` for self and for a peer never heard from, e.g. a seed that never answered); the source says where the peer came from — a `--seed` flag, the `--peer-file` roster (or a peer removed from it but kept because it was still ALIVE), or gossip/a JOIN from a peer the node was never told about. A peer named with both `--seed` and `--peer-file` reports as `seed`: the flag outranks the file. See "Peer provenance" below. |
 | `STATUS` | One `STATUS id=<self> uptime=<seconds> alive=N suspect=N dead=N total=N` line, then `END`. |
 | `META <key=value>` | Set one annotation on this node itself: `OK <key=value>`. The change is gossiped with the next digest and persisted to the data dir, so it survives a restart. Bad syntax: `ERR invalid meta <arg>`; a ninth distinct key: `ERR meta full (max 8)`; missing argument: `ERR usage: META <key=value>`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
@@ -594,6 +602,51 @@ slow way, through the normal suspect-to-dead-to-GC path. And a
 deleted file is skipped quietly (a manual reload still reports it);
 when the file reappears with a new mtime the watch picks it up on
 the next check.
+
+## Peer provenance
+
+A membership table answers "who is in the cluster", but not "how did
+this node hear about them" — and when a cluster is misbehaving that is
+the first question an operator asks: is that peer here because the
+roster says so, because a `--seed` flag named it, or because gossip
+spread it from somewhere else? The control plane's `PEERS` command
+(0.27.0) answers it, one line per member:
+
+```sh
+./pulse-ctl 127.0.0.1:18401 PEERS
+# PEER 127.0.0.1:17101 1 ALIVE - self
+# PEER 127.0.0.1:17102 1 ALIVE 12 peer-file
+# PEER 127.0.0.1:17103 1 ALIVE 8 discovered
+```
+
+Each line carries the member id, its incarnation, its state, the ms
+since this node last heard directly from it, and its source. The
+last-seen is `-` for self — it never probes itself, so its stored
+time is just startup — and for a peer never heard from, a seed that
+never answered: no contact, no number. For a live peer it is the gap
+since the last PING, ACK, gossip, or JOIN from that peer, so a peer
+whose last-seen keeps climbing toward the ack timeout is a peer about
+to be suspected, and the number is a local measurement — it is never
+gossiped, and it says nothing about what any other node last saw.
+
+The source is where *this* node got the peer from, and a `--seed`
+flag outranks the file, exactly as the reload does: a peer named with
+both reports as `seed`. A peer removed from the file but kept because
+it was still ALIVE still reports as `peer-file` — the file is where
+it came from, even though the file no longer lists it — until a later
+reload drops it, and then it is gone from the table entirely. A peer
+restored from `<data-dir>/members` after a restart reports as
+`discovered`: persistence remembers that the peer existed, not how
+the node first heard of it, and the peer is re-probed from scratch
+either way.
+
+One honest caveat. The source is this node's view, not the cluster's:
+a peer that is `peer-file` here may be `discovered` on a node whose
+file never listed it, and a peer that is `seed` here may be `peer-file`
+on a node that seeds from the roster. That is the point — `PEERS`
+shows why *this* node knows each member, so a roster typo, a stale
+seed flag, or a peer that only gossip ever mentioned can be told
+apart at a glance.
 
 ## Membership persistence
 
@@ -1188,7 +1241,14 @@ make test
   file ...` for an unreadable file; a node with no reload hook
   answers `ERR reload not supported` instead of crashing on a NULL
   hook; and `MEMBERS` on an empty table is just `END`, with an
-  unknown command still a clean `ERR unknown command`.
+  unknown command still a clean `ERR unknown command`. `PEERS`
+  (0.27.0) is covered the same way: a canned table of self, a seed
+  peer, a peer-file peer and a never-heard-from discovered peer
+  answers one `PEER` line each with the right id, incarnation,
+  state and source — a numeric last-seen for peers heard from, `-`
+  for self and for the never-heard-from peer — and `PEERS` on an
+  empty table is just `END`; with no peer-source hook at all, every
+  non-self member reports as `discovered` and self still as `self`.
 - `tests/test_reload.sh`: integration test for the `RELOAD`
   control-plane command (0.25.0) — the same scenarios as the SIGHUP
   reload test, driven over TCP instead: three nodes converge from
@@ -1203,6 +1263,15 @@ make test
   whose file was deleted is refused (`ERR cannot read peer file ...`)
   with the old list kept; and no node restarts on `RELOAD` (exactly
   one `START` line each).
+- `tests/test_peers.sh`: integration test for the `PEERS`
+  control-plane command (0.27.0) — three nodes converge from one
+  shared peer file and `PEERS` on node 1 lists the file peers as
+  `peer-file` and itself as `self` (numeric last-seen for the live
+  peers, `-` for self); a fourth node joining through `--seed` only
+  lists the seed as `seed` and the peers it learned from the seed's
+  SYNC as `discovered`; killing node 3 and waiting for node 1 to
+  mark it `DEAD` still lists it as `DEAD` and `peer-file`; and the
+  reply ends with `END`.
 
 ## Roadmap
 
@@ -1232,3 +1301,4 @@ make test
 - ~~Live peer-file reload on SIGHUP: while a `--peer-file` is in use, SIGHUP re-reads the file and merges it into the seed list without restarting — newly listed peers get the `--seed` treatment (seed list, table, JOIN at once), peers removed from the file are dropped from the table only once they stop answering (a still-ALIVE peer is kept and remembered, so a later reload drops it the moment it goes quiet), a peer named with `--seed` is never added or dropped by a reload, self is never dropped, and a reload that cannot read the file keeps the old list; every reload is logged (`PEERFILE RELOAD` summary plus `ADD`/`DROP`/`KEEP` lines), and SIGHUP on a node with no `--peer-file` is a no-op.~~ Done in 0.24.0.
 - ~~RELOAD control-plane command over TCP: the same live peer-file reload SIGHUP triggers, driven from the control plane (`RELOAD`, answered `OK peers=N added=A dropped=D kept=K bad=B`) so an operator who cannot signal the process can still reload the roster; a node with no `--peer-file` answers `ERR no peer file`, an unreadable file answers `ERR cannot read peer file <path>: <reason>` and keeps the old list, and SIGHUP and RELOAD run the same code serialized on one lock so the two triggers can never interleave.~~ Done in 0.25.0.
 - ~~Auto-reload on peer-file mtime change: while a `--peer-file` is in use, the node stats the file once a second and re-runs the same reload merge when its mtime moves — no SIGHUP, no control-plane call, no restart — with the reload logged (`PEERFILE <file> changed on disk, auto-reloading` plus the usual summary) and the watch baseline refreshed by every manual reload so it never re-runs right after one; an edit that preserves the mtime is invisible to the watch, a kept peer that dies after its edit is dropped at the next file change (or by normal GC), and a deleted file is skipped quietly until it reappears.~~ Done in 0.26.0.
+- ~~PEERS control-plane command over TCP: one `PEER <id> <incarnation> <state> <last-seen-ms|-> <seed\|peer-file\|discovered\|self>` line per member, then `END`, so an operator can see at a glance how long since each peer was last heard from directly and where the peer came from — a `--seed` flag, the `--peer-file` roster (or a peer removed from it but kept because it was still ALIVE), or gossip/a JOIN from a peer the node was never told about; the flag outranks the file, self reports as `self` with a `-` last-seen, and a peer never heard from reports `-` too.~~ Done in 0.27.0.
