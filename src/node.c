@@ -1114,6 +1114,35 @@ int main(int argc, char **argv) {
     pthread_join(receiver, NULL);
     pthread_join(prober, NULL);
     if (have_control) pthread_join(control, NULL);
+    /* Graceful leave: on a clean shutdown, tell every known peer we are
+     * leaving, so they mark us DEAD at once instead of waiting ~500 ms
+     * for the probe timeout to suspect us and the suspect timeout to
+     * declare us dead. The announcement is a normal GOSSIP digest of
+     * the table with our own entry marked DEAD at our current
+     * incarnation: DEAD beats ALIVE at equal incarnation, so peers
+     * merge it immediately (and log DEAD without a SUSPECT first). A
+     * crash (SIGKILL, power loss) sends nothing, so the probe path
+     * still covers unclean deaths; a restart rejoins at a higher
+     * incarnation, which refutes the DEAD entry. */
+    pthread_mutex_lock(&g_lock);
+    member_table_t leave_copy = g_table;
+    pthread_mutex_unlock(&g_lock);
+    member_t *leave_self = member_find(&leave_copy, g_self_id);
+    int n_notified = 0;
+    if (leave_self) {
+        leave_self->state = MEMBER_DEAD;
+        leave_self->state_since_ms = pulse_now_ms();
+        for (int i = 0; i < leave_copy.count; i++) {
+            member_t *m = &leave_copy.members[i];
+            if (strcmp(m->id, g_self_id) == 0) continue;
+            if (m->state == MEMBER_DEAD) continue;
+            if (gossip_send_digest(g_send_sock, &m->addr, g_self_id,
+                                   g_incarnation, &leave_copy) == 0)
+                n_notified++;
+        }
+    }
+    if (n_notified > 0)
+        log_line("LEAVE %s", g_self_id);
     /* Clean shutdown: save the membership one last time, so the next
      * start restores the peers known at the moment of shutdown. */
     pthread_mutex_lock(&g_lock);

@@ -83,8 +83,10 @@ else
     head -3 "$TMP/n1.log"
 fi
 
-# 2. Kill node 3; the survivors must mark it DEAD.
-kill "$(cat "$TMP/n3.pid")"
+# 2. Kill node 3 with SIGKILL — an unclean crash, so the survivors
+# must detect it by probing, not by a leave announcement (a clean
+# SIGTERM announces its leave; see test_leave.sh).
+kill -9 "$(cat "$TMP/n3.pid")"
 if wait_for "$TMP/n1.log" "DEAD [::1]:17503" 6 \
    && wait_for "$TMP/n2.log" "DEAD [::1]:17503" 6; then
     note ok "killed IPv6 node is marked DEAD by both survivors"

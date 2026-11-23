@@ -72,12 +72,15 @@ else
     echo "--- n3.log"; tail -20 "$TMP/n3.log"
 fi
 
-# 2. Kill node 3; the survivors must SUSPECT it — at least one of
+# 2. Kill node 3 — with SIGKILL, an unclean crash: a clean SIGTERM
+# would announce its leave and the survivors would mark it DEAD
+# straight away, never SUSPECTing it, so phi suspicion would never
+# be exercised. The survivors must SUSPECT it — at least one of
 # them by phi (the first suspicion always originates from a phi
 # evaluation; the other may learn it a cycle earlier via gossip) —
 # then mark it DEAD. Phi needs ~0.7 s of silence to cross 8 here,
 # plus the 300 ms suspect timeout, so allow 10 s.
-kill "$(cat "$TMP/n3.pid")"
+kill -9 "$(cat "$TMP/n3.pid")"
 if (wait_for "$TMP/n1.log" "SUSPECT 127.0.0.1:17303 phi=" 10 \
      || wait_for "$TMP/n2.log" "SUSPECT 127.0.0.1:17303 phi=" 10) \
    && wait_for "$TMP/n1.log" "SUSPECT 127.0.0.1:17303" 10 \

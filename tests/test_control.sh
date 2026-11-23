@@ -193,9 +193,12 @@ else
     note fail "live member comes back after LEAVE (direct contact)"
 fi
 
-# 5. Kill the second node; once the first marks it DEAD, LEAVE removes
-# it for good — a dead member cannot refute, so it stays gone.
-kill "$(cat "$TMP/n2.pid")"
+# 5. Kill the second node — with SIGKILL, an unclean crash: a clean
+# SIGTERM would announce its leave and the survivor would learn the
+# DEAD from gossip, recording no detection latency. Once the first
+# marks it DEAD, LEAVE removes it for good — a dead member cannot
+# refute, so it stays gone.
+kill -9 "$(cat "$TMP/n2.pid")"
 if wait_for "$TMP/n1.log" "DEAD 127.0.0.1:17402" 6; then
     note ok "killed node is marked DEAD"
 else

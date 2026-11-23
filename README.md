@@ -58,6 +58,11 @@ building block, not a production service mesh.
   them on startup, so a restarted node re-discovers its old peers
   even with no `--seed` — and re-probes every restored entry instead
   of trusting it. See "Membership persistence" below.
+- Graceful leave: a node that stops cleanly (SIGINT/SIGTERM)
+  announces its departure to its peers before exiting, so they mark
+  it DEAD at once instead of waiting ~500 ms for the probe timeout
+  to suspect it. A crash sends nothing, so the probe path still
+  covers unclean deaths. See "Graceful leave" below.
 - Anti-entropy: every ~10 s a node exchanges its whole membership
   table with a random peer (`SYNC`), and the peer answers with its own
   full table, so a node that missed many incremental digests converges
@@ -194,7 +199,8 @@ scripts/demo.sh
 
 Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 `GC` (a DEAD entry removed after its retention expired), `ALIVE`,
-`REFUTE`, `SYNC <id>` (a periodic full-table exchange was sent to that
+`REFUTE`, `LEAVE` (this node announced its clean shutdown to its
+peers), `SYNC <id>` (a periodic full-table exchange was sent to that
 peer), and a `STATUS alive=N suspect=N dead=N total=N` line
 every second.
 
@@ -397,6 +403,23 @@ stays silent goes SUSPECT then DEAD again like any other peer:
 # Node 3 logs RESTORE 2 members and the cluster is back to alive=3.
 ```
 
+## Graceful leave
+
+A node that stops cleanly (SIGINT/SIGTERM) tells its peers it is
+leaving before it exits: it sends each ALIVE/SUSPECT peer a GOSSIP
+digest of its table with its own entry marked DEAD at its current
+incarnation, and logs `LEAVE <id>`. DEAD beats ALIVE at equal
+incarnation, so the peers merge it immediately and log `DEAD` without
+a `SUSPECT` first — a planned stop (a ward device taken down for
+maintenance) clears out of the cluster at once instead of taking the
+~500 ms probe-timeout path.
+
+A crash sends nothing: SIGKILL, power loss, or a segfault leave no
+chance to announce, so the probe path still covers unclean deaths.
+And a restart is unaffected: the node rejoins at a higher incarnation
+(the incarnation file bumps on every start), which refutes the DEAD
+entry, so a gracefully-left node comes straight back to ALIVE.
+
 ## Anti-entropy
 
 A digest carries at most 16 entries, so a node that was partitioned
@@ -535,6 +558,14 @@ make test
   cluster with `--sync-interval-ms 2000` converges, both nodes log a
   periodic `SYNC` line to each other within a few seconds, and both
   stay converged on alive=2 after the exchange.
+- `tests/test_leave.sh`: integration test for graceful leave — a
+  3-node cluster converges, node 3 stops cleanly and both survivors
+  mark it DEAD within 400 ms (the probe path alone needs ~500 ms, so
+  a DEAD that fast can only come from the announcement), the leaving
+  node logs its `LEAVE` announcement, the survivors never log a
+  `SUSPECT` for it, and a restarted node comes back ALIVE. Crash
+  detection itself is still covered by the other tests, which kill
+  with SIGKILL so no announcement is sent.
 - `tests/test_ipv6.sh`: integration test for IPv6 — a 3-node `--ipv6`
   cluster converges, a killed node is marked DEAD by both survivors,
   the survivors agree, a restarted node comes back ALIVE, the control
@@ -557,3 +588,4 @@ make test
 - ~~Machine-readable cluster view: a `JSON` control-plane command returning status, members, and metrics as one JSON object, so tooling can poll cluster state without scraping the text protocol.~~ Done in 0.11.0.
 - ~~Membership persistence: save the known member list to disk periodically and on clean shutdown, and reload it on startup, so a restarted node re-discovers its old peers without a seed — re-probing every restored entry instead of trusting it.~~ Done in 0.12.0.
 - ~~Anti-entropy full-table sync: periodically exchange the whole membership table with a random peer (SYNC, answered with the peer's own full table), so a node that missed many incremental digests converges in one exchange; tables too big for one datagram rotate across successive SYNCs.~~ Done in 0.13.0.
+- ~~Graceful leave: a node that stops cleanly announces its departure to its peers (a GOSSIP digest with its own entry DEAD), so they mark it DEAD at once instead of waiting for the probe timeout; a crash sends nothing, so the probe path still covers unclean deaths, and a restart at a higher incarnation refutes the DEAD entry.~~ Done in 0.14.0.
