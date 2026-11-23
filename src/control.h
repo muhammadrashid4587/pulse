@@ -42,6 +42,7 @@
  *           adaptive_fast_cycles=N
  *           detect_latency_ms mean=X max=Y samples=N
  *           suspect_to_dead_ms mean=X max=Y samples=N
+ *           slow_peers=N
  *       detect_latency_ms is last-direct-contact -> SUSPECT for
  *       suspicions this node detected itself (mean/max in ms, "-" when
  *       there are no samples); suspect_to_dead_ms is SUSPECT -> DEAD.
@@ -50,6 +51,9 @@
  *       interval").
  *       Transitions learned from gossip bump the counts but add no
  *       latency sample, so samples can be smaller than the counts.
+ *       slow_peers is how many members currently count as slow: mean
+ *       probe RTT above --slow-peer-rtt-ms (0 when the warning is
+ *       disabled; see "Slow-peer warning").
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -57,7 +61,10 @@
  *       null otherwise (including self). Latency means are null when
  *       there are no samples; max is 0 then. Each member also carries
  *       "meta": its annotations as a JSON object ({} when it has
- *       none).
+ *       none), "rtt_ms" / "rtt_mean_ms" (null until a probe has been
+ *       answered), "slow" (true when the peer's mean probe RTT is
+ *       above --slow-peer-rtt-ms, false otherwise), and the metrics
+ *       object carries "slow_peers" (how many members are slow).
  *   anything else
  *       ERR unknown command
  *
@@ -84,6 +91,11 @@ typedef struct {
     int (*set_meta)(void *ctx, const char *key, const char *value);
     /* 1 when phi-accrual suspicion is on (phi values are meaningful). */
     int (*phi_enabled)(void *ctx);
+    /* Slow-peer RTT threshold in ms (0 = warning disabled): a peer
+     * whose mean probe RTT is above this counts as slow, and is
+     * reported as "slow" per member in JSON and as slow_peers in
+     * METRICS and JSON. */
+    int64_t slow_rtt_threshold_ms;
     const char *self_id;
     int64_t start_ms; /* monotonic ms when the node started */
 } control_hooks_t;

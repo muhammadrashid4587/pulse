@@ -483,14 +483,44 @@ int member_merge(member_table_t *t, const char *self_id, const char *id,
     return MERGE_NONE;
 }
 
-int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms) {
+int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,
+                    int64_t slow_threshold_ms) {
     if (rtt_ms < 0) return 0;
     member_t *m = member_find(t, id);
     if (!m) return 0;
     m->rtt_ms = rtt_ms;
     m->rtt_sum_ms += rtt_ms;
     m->rtt_samples++;
-    return 1;
+    /* Slow-peer warning (0.22.0): a first crossing above the threshold
+     * returns 2 so the caller warns once for the episode; the flag
+     * clears when the mean recovers, so a later crossing warns again.
+     * A threshold of 0 disables the warning entirely. */
+    if (!member_is_slow(m, slow_threshold_ms)) {
+        m->rtt_slow_warned = 0;
+        return 1;
+    }
+    if (m->rtt_slow_warned) return 1;
+    m->rtt_slow_warned = 1;
+    return 2;
+}
+
+int64_t member_rtt_mean_ms(const member_t *m) {
+    if (!m || m->rtt_samples == 0) return -1;
+    return m->rtt_sum_ms / m->rtt_samples;
+}
+
+int member_is_slow(const member_t *m, int64_t slow_threshold_ms) {
+    if (!m || slow_threshold_ms <= 0) return 0;
+    int64_t mean = member_rtt_mean_ms(m);
+    return mean >= 0 && mean > slow_threshold_ms;
+}
+
+int member_count_slow(const member_table_t *t, int64_t slow_threshold_ms) {
+    int n = 0;
+    for (int i = 0; i < t->count; i++) {
+        if (member_is_slow(&t->members[i], slow_threshold_ms)) n++;
+    }
+    return n;
 }
 
 int member_mark_suspect(member_table_t *t, const char *id, int64_t now) {

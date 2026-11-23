@@ -182,18 +182,58 @@ int main(void) {
     CHECK(m2->rtt_ms == -1);
     CHECK(m2->rtt_samples == 0);
     uint64_t v_before = t.version;
-    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 3) == 1);
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 3, 0) == 1);
     CHECK(m2->rtt_ms == 3);
     CHECK(m2->rtt_samples == 1);
     CHECK(m2->rtt_sum_ms == 3);
-    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 7) == 1);
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 7, 0) == 1);
     CHECK(m2->rtt_ms == 7);
     CHECK(m2->rtt_samples == 2);
     CHECK(m2->rtt_sum_ms == 10);
     CHECK(t.version == v_before); /* RTT is local, not gossip content */
-    CHECK(member_note_rtt(&t, "127.0.0.1:17999", 5) == 0);
-    CHECK(member_note_rtt(&t, "127.0.0.1:17102", -1) == 0);
+    CHECK(member_note_rtt(&t, "127.0.0.1:17999", 5, 0) == 0);
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", -1, 0) == 0);
     CHECK(m2->rtt_ms == 7);
+
+    /* slow-peer warning (0.22.0): a peer is slow when its mean RTT is
+     * above the threshold; the threshold is a strict greater-than
+     * (mean == threshold is not slow), 0 disables the warning, and a
+     * peer with no samples is never slow. member_note_rtt returns 2
+     * on the first crossing above the threshold (the caller warns
+     * once per episode), 1 while already warned, and 1 again once
+     * the mean recovers — a second crossing then returns 2 again. */
+    CHECK(member_rtt_mean_ms(m2) == 5);
+    CHECK(member_is_slow(m2, 0) == 0);  /* disabled */
+    CHECK(member_is_slow(m2, 5) == 0);  /* mean == threshold: not slow */
+    CHECK(member_is_slow(m2, 4) == 1);
+    CHECK(member_count_slow(&t, 4) == 1);
+    CHECK(member_count_slow(&t, 5) == 0);
+    CHECK(member_count_slow(&t, 0) == 0);
+    /* m2's mean is 5 (samples 3, 7). A 10 ms sample pushes the mean
+     * to 6, above a threshold of 5: first crossing returns 2. */
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 10, 5) == 2);
+    CHECK(member_rtt_mean_ms(m2) == 6);
+    CHECK(member_is_slow(m2, 5) == 1);
+    /* Still slow, already warned: no second warning. */
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 10, 5) == 1);
+    CHECK(member_rtt_mean_ms(m2) == 7);
+    /* Four 0 ms samples drag the mean to (30+0)/8 = 3, back below
+     * the threshold: the warning clears. */
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
+    CHECK(member_rtt_mean_ms(m2) == 3);
+    CHECK(member_is_slow(m2, 5) == 0);
+    CHECK(member_count_slow(&t, 5) == 0);
+    /* A fresh crossing after recovery warns again. */
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 100, 5) == 2);
+    CHECK(member_is_slow(m2, 5) == 1);
+    /* A peer with no samples is never slow, whatever the threshold. */
+    member_t *m3 = member_find(&t, "127.0.0.1:17103");
+    CHECK(m3->rtt_samples == 0);
+    CHECK(member_rtt_mean_ms(m3) == -1);
+    CHECK(member_is_slow(m3, 1) == 0);
 
     /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
     CHECK(member_gossip_fanout(0) == 1);

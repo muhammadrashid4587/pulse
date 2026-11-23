@@ -124,8 +124,17 @@ static void handle_status(int fd, const control_hooks_t *hooks) {
 static void handle_metrics(int fd, const control_hooks_t *hooks) {
     pulse_metrics_t m;
     hooks->metrics(hooks->ctx, &m);
+    member_table_t t;
+    hooks->snapshot(hooks->ctx, &t);
     char line[512];
     metrics_format(&m, line, sizeof line);
+    /* Slow-peer warning (0.22.0): how many members currently count
+     * as slow — mean probe RTT above the configured threshold. The
+     * count is derived from the table, not a metrics counter, since
+     * slowness is current state, not a transition. */
+    size_t used = strlen(line);
+    snprintf(line + used, sizeof line - used, " slow_peers=%d",
+             member_count_slow(&t, hooks->slow_rtt_threshold_ms));
     if (send_all(fd, line) != 0) return;
     send_all(fd, "\nEND\n");
 }
@@ -175,7 +184,10 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         /* Probe RTT (0.21.0): the last measured PING->ACK round trip
          * in ms, and the mean over all answered probes. Both are
          * null until a probe has been answered; self never probes
-         * itself, so self stays null. */
+         * itself, so self stays null. "slow" (0.22.0) is true when
+         * the peer's mean RTT is above the configured slow-peer
+         * threshold (false when the warning is disabled, or the peer
+         * has answered no probe yet). */
         char rttbuf[32], rttmeanbuf[32];
         if (mem->rtt_ms < 0 || mem->rtt_samples == 0) {
             snprintf(rttbuf, sizeof rttbuf, "null");
@@ -189,10 +201,13 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"meta\":%s,\"rtt_ms\":%s,"
-                     "\"rtt_mean_ms\":%s}",
+                     "\"rtt_mean_ms\":%s,\"slow\":%s}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, metajson,
-                     rttbuf, rttmeanbuf);
+                     rttbuf, rttmeanbuf,
+                     member_is_slow(mem, hooks->slow_rtt_threshold_ms)
+                         ? "true"
+                         : "false");
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }
@@ -216,7 +231,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
     w = snprintf(buf + used, sizeof buf - used,
         "],\"metrics\":{\"suspected\":%lld,\"dead\":%lld,\"refutes\":%lld,"
         "\"joins\":%lld,\"adaptive_fast_cycles\":%lld,"
-        "\"suspect_refuted\":%lld,"
+        "\"suspect_refuted\":%lld,\"slow_peers\":%d,"
         "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
         "\"max\":%lld,\"samples\":%lld},\"refute_latency_ms\":{\"mean\":%s,"
@@ -224,6 +239,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
         (long long)m.joins, (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
+        member_count_slow(&t, hooks->slow_rtt_threshold_ms),
         dmean, (long long)m.detect_max_ms,
         (long long)m.detect_samples, dhist, smean,
         (long long)m.suspect_dead_max_ms,

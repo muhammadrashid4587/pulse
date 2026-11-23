@@ -115,6 +115,13 @@ building block, not a production service mesh.
   answered probes — and reports them per member in `JSON` as
   `rtt_ms` / `rtt_mean_ms`, so an operator can see which peers are
   slow before they ever get suspected. See "Probe RTT" below.
+- Slow-peer warning: when a peer's mean probe RTT rises above a
+  configurable threshold (`--slow-peer-rtt-ms`), the node logs a
+  `SLOW` line once per episode and reports the peer as `"slow":true`
+  in `JSON` (with a `slow_peers` count in `METRICS` and `JSON`), so
+  a congested link or a struggling device is visible while the peer
+  is still ALIVE, instead of only after it is suspected. See
+  "Slow-peer warning" below.
 
 ## What it is not
 
@@ -235,6 +242,7 @@ scripts/demo.sh
 | `--probe-interval-ms` | 100 | How often to probe a random peer |
 | `--probe-interval-fast-ms` | half of `--probe-interval-ms` | Probe interval while any peer is SUSPECT (adaptive probe interval; floored at 25 ms, never slower than the base) |
 | `--ack-timeout-ms` | 100 | How long to wait for an ACK before an indirect probe |
+| `--slow-peer-rtt-ms` | 0 (disabled) | Warn when a peer's mean probe RTT is above this many ms (see "Slow-peer warning") |
 | `--suspect-timeout-ms` | 300 | How long a SUSPECT lasts before becoming DEAD |
 | `--dead-retention` | 60 | Seconds a DEAD entry stays in the table before GC |
 | `--phi-accrual` | off | Suspect on phi instead of the fixed ack timeout |
@@ -249,7 +257,9 @@ scripts/demo.sh
 Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 `GC` (a DEAD entry removed after its retention expired), `ALIVE`,
 `REFUTE`, `LEAVE` (this node announced its clean shutdown to its
-peers), `SYNC <id>` (a periodic full-table exchange was sent to that
+peers), `SLOW <id> mean=Nms threshold=Mms` (a peer's mean probe RTT
+rose above `--slow-peer-rtt-ms`, once per slow episode — see
+"Slow-peer warning"), `SYNC <id>` (a periodic full-table exchange was sent to that
 peer), `ADAPTIVE fast probe=Nms suspects=N` when the probe interval
 shortens while a peer is SUSPECT and `ADAPTIVE probe=Nms stable`
 when it returns to base, and a `STATUS alive=N suspect=N dead=N total=N` line
@@ -289,11 +299,11 @@ the port beyond localhost.
 # OK 127.0.0.1:17102
 
 ./pulse-ctl 127.0.0.1:18401 METRICS
-# METRICS suspected=1 dead=1 refutes=0 joins=2 adaptive_fast_cycles=3 suspect_refuted=0 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1 refute_latency_ms mean=- max=- samples=0
+# METRICS suspected=1 dead=1 refutes=0 joins=2 adaptive_fast_cycles=3 suspect_refuted=0 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1 refute_latency_ms mean=- max=- samples=0 slow_peers=0
 # END
 
 ./pulse-ctl 127.0.0.1:18401 JSON
-# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42,"meta":{},"rtt_ms":1,"rtt_mean_ms":0}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}}}
+# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null,"slow":false},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42,"meta":{},"rtt_ms":1,"rtt_mean_ms":0,"slow":false}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"slow_peers":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}}}
 # END
 ```
 
@@ -311,8 +321,8 @@ Commands:
 | `STATUS` | One `STATUS id=<self> uptime=<seconds> alive=N suspect=N dead=N total=N` line, then `END`. |
 | `META <key=value>` | Set one annotation on this node itself: `OK <key=value>`. The change is gossiped with the next digest and persisted to the data dir, so it survives a restart. Bad syntax: `ERR invalid meta <arg>`; a ninth distinct key: `ERR meta full (max 8)`; missing argument: `ERR usage: META <key=value>`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
-| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. |
-| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self). Built for tooling that polls cluster state without scraping the text protocol. |
+| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N slow_peers=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. |
+| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning"). The metrics object also carries `slow_peers`, the count of currently slow members. Built for tooling that polls cluster state without scraping the text protocol. |
 | anything else | `ERR unknown command` |
 
 ## Shared secret
@@ -728,6 +738,51 @@ bump the table version, so a restarted node starts at `null` again
 until its next probe is answered, and two nodes can legitimately
 disagree about a third peer's RTT.
 
+## Slow-peer warning
+
+The RTT numbers above are only useful if somebody is watching them.
+With `--slow-peer-rtt-ms N` a node watches them itself: a peer whose
+*mean* probe RTT rises above N ms counts as slow, and the node says
+so three ways — a `SLOW <id> mean=Nms threshold=Mms` log line, a
+`"slow":true` flag on that member in `JSON`, and a `slow_peers`
+count in `METRICS` and in the `JSON` metrics object. The default is
+0, which disables the warning entirely: without a threshold the node
+reports no slow peers and logs no `SLOW` lines, exactly as before.
+
+```sh
+./pulse-node --port 17101 --control-port 18401 --slow-peer-rtt-ms 50 --data-dir /tmp/p1
+./pulse-ctl 127.0.0.1:18401 JSON
+# {"id":"127.0.0.1:17101",...,"members":[{...,"rtt_ms":61,"rtt_mean_ms":58,"slow":true},...],"metrics":{...,"slow_peers":1,...}}
+```
+
+The comparison is on the mean, not the last RTT: one slow probe is
+noise — a scheduling stall, a single dropped packet — and the mean
+only climbs when the peer is consistently slow. The threshold is a
+strict greater-than, so a peer sitting exactly at the threshold is
+not slow. A peer that has answered no probe yet has no mean and is
+never slow, and self is never slow (a node never probes itself).
+
+The log line fires once per slow episode, not once per probe: the
+first sample that pushes the mean above the threshold logs `SLOW`,
+later samples while the peer stays slow log nothing, and when the
+mean recovers to the threshold or below the warning clears — so a
+peer that recovers and slows again warns again. That is the whole
+point of the warning: a peer whose RTT is climbing toward the ack
+timeout is a peer about to be suspected, and on a ward network that
+climb is the first sign of a congested link or a device struggling
+under load — visible here while the peer is still ALIVE, instead of
+only in the detection-latency histogram after it has already been
+suspected.
+
+Two honest caveats. The threshold is a single number for the whole
+cluster, so it has to fit the slowest healthy link: set it just
+below the ack timeout and a peer that is slow enough to be suspected
+soon is exactly the peer that warns. And slowness is local
+measurement, like the RTT itself: it is never gossiped, so two nodes
+can disagree about whether a third peer is slow, and a restarted
+node forgets which peers were slow until its probes measure them
+again.
+
 ## Tests
 
 ```sh
@@ -738,7 +793,12 @@ make test
   precedence, incarnation rules, refutation, state transitions, peer
   selection, and probe RTT recording (last/mean, unknown ids and
   negative samples ignored, recording an RTT is not a gossip-visible
-  change).
+  change). Slow-peer warning: a peer is slow only when its mean RTT
+  is strictly above the threshold (mean == threshold is not slow, a
+  threshold of 0 disables the warning, a peer with no samples is
+  never slow), `member_note_rtt` returns 2 on the first crossing
+  above the threshold and 1 while already warned, the warning clears
+  when the mean recovers, and a second crossing warns again.
 - `tests/test_cluster.sh`: integration test with real processes — 3 nodes
   converge, a killed node is marked DEAD by both survivors, the survivors
   agree on membership, and a restarted node (same data dir) is cleared
@@ -784,7 +844,12 @@ make test
   contact, and `LEAVE` of a dead node removes it for good.
   Probe RTT: after the join, `JSON` reports a numeric `rtt_ms` /
   `rtt_mean_ms` for the peer and `null` for self, and after the kill
-  the dead member still carries its measured RTT.
+  the dead member still carries its measured RTT. Slow-peer warning:
+  node 1 runs with `--slow-peer-rtt-ms 1` and loopback RTTs are 0-1 ms,
+  so the peer is not slow — `JSON` reports `"slow":false` for it and
+  `slow_peers` is 0 in `METRICS` and `JSON`, and a fresh node reports
+  `slow_peers=0` too (a positive crossing is covered by the unit
+  tests; loopback cannot be made deterministically slow).
 - `tests/test_secret.c`: unit tests for the join gate — SHA-256
   against FIPS 180-4 vectors (including one million 'a's), HMAC-SHA256
   against the RFC 4231 test case 2 vector, tag shape and
@@ -929,3 +994,4 @@ make test
 - ~~Suspicion-refutation window: a SUSPECT that comes back ALIVE is counted as a refuted suspicion (`suspect_refuted` in `METRICS` and `JSON`), with the time it sat SUSPECT recorded as a refute latency (mean/max/samples) — locally revived peers add a measured sample, gossip-learned refutations count only, and a DEAD peer coming back is a restart, not a refutation — so an operator can see how long false suspicions stay visible to the cluster.~~ Done in 0.19.0.
 - ~~Member metadata/annotations: each node carries up to 8 `key=value` annotations about itself (`role=worker`, `zone=us-east-1`, `version=1.2.3`), set with repeatable `--meta` flags or the control plane's `META` command, gossiped with its membership entry as an `;k=v,k=v` suffix (entries from older nodes parse unchanged), visible in `MEMBERS` and as a `meta` object per member in `JSON`, and persisted across restarts — the node's own set in `<data-dir>/meta` (flags win, otherwise the saved set is restored) and peers' sets as an optional fifth field in `<data-dir>/members`; an entry carrying no annotations never wipes stored ones.~~ Done in 0.20.0.
 - ~~Probe RTT per peer: each node measures the round-trip time of its direct probes (PING send to ACK receipt) per peer and reports the last RTT and the mean over all answered probes per member in `JSON` as `rtt_ms` / `rtt_mean_ms` (`null` until a probe has been answered, always `null` for self), so an operator can see which peers are slow before they are ever suspected.~~ Done in 0.21.0.
+- ~~Slow-peer warning: a peer whose mean probe RTT rises above a configurable threshold (`--slow-peer-rtt-ms`, 0 = disabled) is flagged `"slow":true` per member in `JSON` with a `slow_peers` count in `METRICS` and `JSON`, and the node logs a `SLOW` line once per slow episode (cleared on recovery, so a re-crossing warns again) — the mean, not the last RTT, so one slow probe is noise and only a consistently slow peer warns, while the peer is still ALIVE instead of only after it is suspected.~~ Done in 0.22.0.

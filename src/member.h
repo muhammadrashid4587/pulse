@@ -75,6 +75,14 @@ typedef struct {
     int64_t rtt_ms;
     int64_t rtt_sum_ms;
     int64_t rtt_samples;
+    /* Slow-peer warning (0.22.0): whether a SLOW log line has already
+     * been emitted for the current slow episode — a peer whose mean
+     * RTT is above the configured threshold. Set when the mean first
+     * crosses the threshold, cleared when it drops back below, so a
+     * persistently slow peer logs once per episode instead of once
+     * per probe, and a peer that recovers and slows again warns
+     * again. */
+    int rtt_slow_warned;
     /* Metadata the member carries about itself (role, zone, version,
      * ...): set at startup with --meta, changeable at runtime with
      * the control plane's META command, gossiped with the membership
@@ -206,10 +214,28 @@ int member_mark_alive(member_table_t *t, const char *id,
 
 /* Record a probe round-trip time for a peer: the ms between sending a
  * PING (direct, or via PING_REQ) and receiving its ACK. Updates the
- * last RTT and the running mean. Returns 1 when the member exists, 0
- * otherwise. Does not bump the table version: RTT is local
- * measurement, not gossip content. A negative sample is ignored. */
-int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms);
+ * last RTT and the running mean. slow_threshold_ms is the slow-peer
+ * threshold in ms (0 = disabled): when the peer's mean RTT first
+ * crosses above it, returns 2 so the caller can warn once for the
+ * episode (see rtt_slow_warned); the warning clears when the mean
+ * drops back to or below the threshold, so a recovery followed by a
+ * new crossing warns again. Returns 1 when the member exists and the
+ * sample was recorded without a new crossing, 0 otherwise. Does not
+ * bump the table version: RTT is local measurement, not gossip
+ * content. A negative sample is ignored. */
+int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,
+                    int64_t slow_threshold_ms);
+/* Mean probe RTT in ms over all answered probes, or -1 when the peer
+ * has answered none. */
+int64_t member_rtt_mean_ms(const member_t *m);
+/* 1 when the peer counts as slow: the slow-peer warning is enabled
+ * (threshold > 0), the peer has answered at least one probe, and its
+ * mean RTT is above the threshold. Self never probes itself, so self
+ * is never slow. */
+int member_is_slow(const member_t *m, int64_t slow_threshold_ms);
+/* How many members in the table currently count as slow (see
+ * member_is_slow). */
+int member_count_slow(const member_table_t *t, int64_t slow_threshold_ms);
 
 int member_count_state(const member_table_t *t, member_state_t state);
 /* Force-remove a member (operator action, e.g. the control plane's

@@ -62,6 +62,9 @@ typedef struct {
     int control_port;          /* TCP control plane port, -1 = disabled */
     int sync_interval_ms;      /* how often to exchange full tables
                                   (anti-entropy SYNC) with a random peer */
+    int64_t slow_peer_rtt_ms;  /* slow-peer warning threshold: warn when
+                                  a peer's mean probe RTT is above this
+                                  many ms, 0 = disabled (see member.h) */
     char secret[PULSE_SECRET_MAX]; /* shared secret for joins, "" = none */
     int ipv6;                  /* use IPv6 (bind ::, ids are "[::1]:port") */
     char bind_host[128];       /* bind address override, "" = wildcard */
@@ -452,9 +455,27 @@ static void handle_message(const gmsg_t *msg) {
                     break;
                 }
             }
-            if (rtt_ms >= 0)
-                member_note_rtt(&g_table, msg->from_id, rtt_ms);
+            /* Slow-peer warning (0.22.0): member_note_rtt returns 2
+             * when the peer's mean RTT first crosses above the
+             * configured threshold. Log once per episode (the flag
+             * in the table clears on recovery, so a re-crossing
+             * warns again). The log happens after the unlock: the
+             * log lock is separate, but there is no reason to hold
+             * the table lock across IO. */
+            int64_t slow_mean_ms = -1;
+            if (rtt_ms >= 0) {
+                int r = member_note_rtt(&g_table, msg->from_id, rtt_ms,
+                                        g_cfg.slow_peer_rtt_ms);
+                if (r == 2) {
+                    member_t *slow = member_find(&g_table, msg->from_id);
+                    if (slow) slow_mean_ms = member_rtt_mean_ms(slow);
+                }
+            }
             pthread_mutex_unlock(&g_lock);
+            if (slow_mean_ms >= 0)
+                log_line("SLOW %s mean=%lldms threshold=%lldms",
+                         msg->from_id, (long long)slow_mean_ms,
+                         (long long)g_cfg.slow_peer_rtt_ms);
             note_contact(msg, &from_addr);
             if (has_requester) {
                 /* Forward the ACK to the node that asked us to probe. */
@@ -1051,6 +1072,7 @@ static void usage(const char *prog) {
             "       [--data-dir DIR] [--probe-interval-ms N]\n"
             "       [--probe-interval-fast-ms N]\n"
             "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
+            "       [--slow-peer-rtt-ms N]\n"
             "       [--dead-retention SECONDS]\n"
             "       [--phi-accrual] [--phi-threshold N]\n"
             "       [--sync-interval-ms N]\n"
@@ -1073,6 +1095,7 @@ int main(int argc, char **argv) {
     g_cfg.phi_accrual = 0;
     g_cfg.phi_threshold = 8.0;
     g_cfg.sync_interval_ms = 10000; /* anti-entropy full-table exchange */
+    g_cfg.slow_peer_rtt_ms = 0; /* slow-peer warning disabled */
     g_cfg.control_port = -1; /* disabled unless --control-port is given */
 
     for (int i = 1; i < argc; i++) {
@@ -1118,6 +1141,12 @@ int main(int argc, char **argv) {
             g_cfg.sync_interval_ms = atoi(argv[++i]);
             if (g_cfg.sync_interval_ms <= 0) {
                 fprintf(stderr, "--sync-interval-ms must be a positive number of milliseconds\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--slow-peer-rtt-ms") == 0 && i + 1 < argc) {
+            g_cfg.slow_peer_rtt_ms = atoi(argv[++i]);
+            if (g_cfg.slow_peer_rtt_ms < 0) {
+                fprintf(stderr, "--slow-peer-rtt-ms must be 0 (disabled) or a positive number of milliseconds\n");
                 return 2;
             }
         } else if (strcmp(argv[i], "--control-port") == 0 && i + 1 < argc) {
@@ -1378,12 +1407,19 @@ int main(int argc, char **argv) {
     /* The secret itself is never logged; only that a secret is on. */
     const char *sec = g_cfg.secret[0] != '\0' ? " secret=on" : "";
     const char *v6 = family == AF_INET6 ? " ipv6=on" : "";
+    char slowbuf[32];
+    if (g_cfg.slow_peer_rtt_ms > 0)
+        snprintf(slowbuf, sizeof slowbuf, " slow-rtt=%lldms",
+                 (long long)g_cfg.slow_peer_rtt_ms);
+    else
+        slowbuf[0] = '\0';
     if (g_cfg.phi_accrual) {
-        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s%s", g_self_id,
-                 g_incarnation, g_cfg.port, g_cfg.phi_threshold, sec, v6);
+        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s%s%s", g_self_id,
+                 g_incarnation, g_cfg.port, g_cfg.phi_threshold, sec, v6,
+                 slowbuf);
     } else {
-        log_line("START %s inc=%u port=%d%s%s", g_self_id, g_incarnation,
-                 g_cfg.port, sec, v6);
+        log_line("START %s inc=%u port=%d%s%s%s", g_self_id, g_incarnation,
+                 g_cfg.port, sec, v6, slowbuf);
     }
     if (g_cfg.meta_count > 0) {
         char metabuf[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
@@ -1422,6 +1458,7 @@ int main(int argc, char **argv) {
         g_hooks.force_leave = force_leave_hook;
         g_hooks.set_meta = set_meta_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
+        g_hooks.slow_rtt_threshold_ms = g_cfg.slow_peer_rtt_ms;
         g_hooks.self_id = g_self_id;
         g_hooks.start_ms = g_start_ms;
         if (pthread_create(&control, NULL, control_thread, NULL) != 0) {

@@ -6,6 +6,9 @@
 #     returns one line of valid JSON with the node itself as the only
 #     member and zeroed metrics, unknown commands and bad LEAVE usage
 #     get clean ERR lines.
+#  1b. Slow-peer warning (0.22.0): node 1 runs with --slow-peer-rtt-ms
+#     1; loopback RTTs are 0-1 ms, so the peer is not slow — JSON and
+#     METRICS report slow_peers=0 and "slow":false for the peer.
 #  2. A second node joins; MEMBERS on the first lists both.
 #  3. LEAVE the second node on the first: OK, and it is gone from the
 #     first node's listing immediately. (It is alive, so direct contact
@@ -62,8 +65,12 @@ ctl() {
 mkdir -p "$TMP/n1" "$TMP/n2"
 
 # Ports 17401-17402 (gossip) and 18401-18402 (control) so this test
-# never clashes with the other suites.
-(cd "$TMP/n1" && exec "$BIN" --port 17401 --control-port 18401 > "$TMP/n1.log" 2>&1 & echo $! > "$TMP/n1.pid")
+# never clashes with the other suites. Node 1 runs with a 1 ms
+# slow-peer threshold (0.22.0): loopback probe RTTs are 0-1 ms, so no
+# peer is ever slow here — the test checks the wiring (the fields
+# exist, the threshold is honoured), while the threshold logic itself
+# is covered by the unit tests.
+(cd "$TMP/n1" && exec "$BIN" --port 17401 --control-port 18401 --slow-peer-rtt-ms 1 > "$TMP/n1.log" 2>&1 & echo $! > "$TMP/n1.pid")
 
 # 1. MEMBERS on a lone node lists itself; STATUS reports id and total=1.
 sleep 0.5
@@ -85,10 +92,12 @@ else
 fi
 
 # METRICS on a fresh node: no transitions yet, so the latency groups
-# have no samples.
+# have no samples. Slow-peer warning (0.22.0): no peers, so
+# slow_peers=0.
 metrics="$(ctl 18401 METRICS)"
 if echo "$metrics" | grep -q "METRICS suspected=0 dead=0" \
    && echo "$metrics" | grep -q "detect_latency_ms mean=- max=- samples=0" \
+   && echo "$metrics" | grep -q "slow_peers=0" \
    && echo "$metrics" | grep -q "^END$"; then
     note ok "METRICS on a fresh node reports zero counts and no samples"
 else
@@ -102,8 +111,9 @@ json="$(ctl 18401 JSON)"
 if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
    && echo "$json" | grep -q '"id":"127.0.0.1:17401"' \
    && echo "$json" | grep -q '"total":1' \
-   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17401","incarnation":1,"state":"ALIVE","phi":null,"meta":{},"rtt_ms":null,"rtt_mean_ms":null}\]' \
+   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17401","incarnation":1,"state":"ALIVE","phi":null,"meta":{},"rtt_ms":null,"rtt_mean_ms":null,"slow":false}\]' \
    && echo "$json" | grep -q '"metrics":{"suspected":0,"dead":0,"refutes":0,"joins":0' \
+   && echo "$json" | grep -q '"slow_peers":0' \
    && echo "$json" | grep -q '"detect_latency_ms":{"mean":null,"max":0,"samples":0,"hist":\[0,0,0,0,0\]}' \
    && echo "$json" | grep -q "^END$"; then
     note ok "JSON on a fresh node is valid JSON with self member and zeroed metrics"
@@ -161,6 +171,23 @@ else
     echo "--- ctl output:"; ctl 18401 JSON
 fi
 
+# 2c. Slow-peer warning (0.22.0): node 1 runs with a 1 ms threshold
+# and loopback RTTs are 0-1 ms, so the peer is not slow — JSON reports
+# "slow":false for it and slow_peers 0 in METRICS and JSON. (A
+# positive crossing is covered by the unit tests; loopback cannot be
+# made deterministically slow.)
+json="$(ctl 18401 JSON)"
+metrics="$(ctl 18401 METRICS)"
+if echo "$json" | grep -q '"id":"127.0.0.1:17402".*"slow":false' \
+   && echo "$json" | grep -q '"slow_peers":0' \
+   && echo "$metrics" | grep -q "slow_peers=0"; then
+    note ok "JSON/METRICS report a healthy loopback peer as not slow (slow_peers=0)"
+else
+    note fail "JSON/METRICS report a healthy loopback peer as not slow (slow_peers=0)"
+    echo "--- json:"; echo "$json"
+    echo "--- metrics:"; echo "$metrics"
+fi
+
 # 3. LEAVE the second node on the first: OK, and it is gone from the
 # listing immediately (checked right away — the live node refutes and
 # comes back within a gossip round or two, which is correct).
@@ -198,18 +225,23 @@ fi
 # probe interval: poll MEMBERS until it reappears. This also
 # synchronizes the test — the kill in step 5 only makes sense once the
 # member is back in the table (otherwise there is no peer for the
-# first node to mark DEAD).
+# first node to mark DEAD). Poll until the peer also has a numeric
+# probe RTT: the reappearance itself comes from direct contact, not
+# from a probe, so without this the kill in step 5 could land before
+# any probe round-trip was recorded and the dead member would carry
+# null RTTs.
 reappeared=0
 for i in $(seq 1 25); do
-    if ctl 18401 MEMBERS | grep -q "127.0.0.1:17402"; then
+    if ctl 18401 MEMBERS | grep -q "127.0.0.1:17402" \
+       && ctl 18401 JSON | head -n 1 | grep -q '"id":"127.0.0.1:17402".*"rtt_ms":[0-9][0-9]*,"rtt_mean_ms":[0-9][0-9]*'; then
         reappeared=1; break
     fi
     sleep 0.2
 done
 if [ "$reappeared" -eq 1 ]; then
-    note ok "live member comes back after LEAVE (direct contact)"
+    note ok "live member comes back after LEAVE (direct contact) with a measured probe RTT"
 else
-    note fail "live member comes back after LEAVE (direct contact)"
+    note fail "live member comes back after LEAVE (direct contact) with a measured probe RTT"
 fi
 
 # 5. Kill the second node — with SIGKILL, an unclean crash: a clean
@@ -243,7 +275,7 @@ fi
 # (not null).
 json="$(ctl 18401 JSON)"
 if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
-   && echo "$json" | grep -q '"id":"127.0.0.1:17402","incarnation":1,"state":"DEAD","phi":null,"meta":{},"rtt_ms":[0-9][0-9]*,"rtt_mean_ms":[0-9][0-9]*}' \
+   && echo "$json" | grep -q '"id":"127.0.0.1:17402","incarnation":1,"state":"DEAD","phi":null,"meta":{},"rtt_ms":[0-9][0-9]*,"rtt_mean_ms":[0-9][0-9]*,"slow":false}' \
    && echo "$json" | grep -q '"dead":1' \
    && echo "$json" | grep -qE '"suspected":[1-9][0-9]*' \
    && echo "$json" | grep -qE '"detect_latency_ms":\{"mean":[0-9]+,"max":[0-9]+,"samples":[1-9][0-9]*,"hist":\[[0-9,]+\]\}' \
