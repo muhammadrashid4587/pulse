@@ -2,12 +2,12 @@ CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g -Isrc
 LDFLAGS ?= -pthread -lm
 
-NODE_SRC = src/node.c src/member.c src/gossip.c src/phi.c src/secret.c src/control.c src/metrics.c src/persist.c src/adaptive.c
-HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h src/metrics.h src/persist.h src/adaptive.h
+NODE_SRC = src/node.c src/member.c src/gossip.c src/phi.c src/secret.c src/control.c src/metrics.c src/persist.c src/adaptive.c src/peerfile.c
+HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h src/metrics.h src/persist.h src/adaptive.h src/peerfile.h
 
 .PHONY: all test clean
 
-all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta
+all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile
 
 pulse-node: $(NODE_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $(NODE_SRC) $(LDFLAGS)
@@ -42,7 +42,10 @@ test_adaptive: tests/test_adaptive.c src/adaptive.c src/adaptive.h
 test_meta: tests/test_meta.c src/member.c src/phi.c src/gossip.c src/secret.c src/member.h src/phi.h src/gossip.h src/secret.h
 	$(CC) $(CFLAGS) -o $@ tests/test_meta.c src/member.c src/phi.c src/gossip.c src/secret.c $(LDFLAGS)
 
-test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta
+test_peerfile: tests/test_peerfile.c src/member.c src/phi.c src/peerfile.c src/member.h src/phi.h src/peerfile.h
+	$(CC) $(CFLAGS) -o $@ tests/test_peerfile.c src/member.c src/phi.c src/peerfile.c $(LDFLAGS)
+
+test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile
 	./test_member
 	./test_phi
 	./test_secret
@@ -52,6 +55,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	./test_persist
 	./test_adaptive
 	./test_meta
+	./test_peerfile
 	bash tests/test_cluster.sh
 	bash tests/test_gc.sh
 	bash tests/test_rejoin.sh
@@ -66,6 +70,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_adaptive.sh
 	bash tests/test_refute.sh
 	bash tests/test_meta.sh
+	bash tests/test_peerfile.sh
 
 clean:
-	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta
+	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile

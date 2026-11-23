@@ -31,6 +31,7 @@
 #include "member.h"
 #include "metrics.h"
 #include "persist.h"
+#include "peerfile.h"
 #include "phi.h"
 #include "secret.h"
 #include "control.h"
@@ -50,6 +51,9 @@ typedef struct {
     char data_dir[512];
     char seeds[16][PULSE_ID_LEN];
     int seed_count;
+    char peer_file[512];   /* --peer-file path, "" = none: initial peers
+                              read from a file instead of --seed flags
+                              (see peerfile.h) */
     int probe_interval_ms;
     int probe_interval_fast_ms; /* fast probe interval while any peer
                                    is SUSPECT, 0 = half the base
@@ -1069,6 +1073,7 @@ static void *prober_thread(void *arg) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s --port PORT [--id ID] [--seed HOST:PORT]...\n"
+            "       [--peer-file FILE]\n"
             "       [--data-dir DIR] [--probe-interval-ms N]\n"
             "       [--probe-interval-fast-ms N]\n"
             "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
@@ -1110,6 +1115,13 @@ int main(int argc, char **argv) {
                          argv[++i]);
             } else {
                 i++;
+            }
+        } else if (strcmp(argv[i], "--peer-file") == 0 && i + 1 < argc) {
+            snprintf(g_cfg.peer_file, sizeof g_cfg.peer_file, "%s",
+                     argv[++i]);
+            if (g_cfg.peer_file[0] == '\0') {
+                fprintf(stderr, "--peer-file must not be empty\n");
+                return 2;
             }
         } else if (strcmp(argv[i], "--data-dir") == 0 && i + 1 < argc) {
             snprintf(g_cfg.data_dir, sizeof g_cfg.data_dir, "%s", argv[++i]);
@@ -1212,6 +1224,35 @@ int main(int argc, char **argv) {
     if (g_cfg.port <= 0 || g_cfg.port > 65535) {
         usage(argv[0]);
         return 2;
+    }
+
+    /* Seedless bootstrap (0.23.0): peers listed in --peer-file join
+     * the seed list, so they get exactly the --seed treatment — a
+     * JOIN at startup, direct probing, and the ~5 s rejoin retry
+     * while they are not ALIVE. A missing or unreadable file is a
+     * clean startup error, not an empty peer list: silently starting
+     * alone would hide a typo'd path and leave the node isolated. */
+    int n_peers = 0, n_peer_bad = 0, n_peer_dropped = 0;
+    if (g_cfg.peer_file[0] != '\0') {
+        char peers[16][PULSE_ID_LEN];
+        if (pulse_peerfile_load(g_cfg.peer_file, peers, 16,
+                                &n_peers, &n_peer_bad) != 0) {
+            fprintf(stderr, "cannot read peer file %s: %s\n",
+                    g_cfg.peer_file, strerror(errno));
+            return 2;
+        }
+        for (int i = 0; i < n_peers; i++) {
+            if (g_cfg.seed_count < 16) {
+                snprintf(g_cfg.seeds[g_cfg.seed_count++], PULSE_ID_LEN,
+                         "%s", peers[i]);
+            } else {
+                n_peer_dropped++;
+            }
+        }
+        if (n_peer_dropped > 0)
+            fprintf(stderr,
+                    "peer file %s: %d peers dropped, seed list full (16)\n",
+                    g_cfg.peer_file, n_peer_dropped);
     }
 
     g_start_ms = pulse_now_ms();
@@ -1426,6 +1467,13 @@ int main(int argc, char **argv) {
         if (member_meta_format(self, metabuf, sizeof metabuf) < 0)
             metabuf[0] = '\0';
         log_line("META %s", metabuf);
+    }
+    if (g_cfg.peer_file[0] != '\0') {
+        if (n_peer_bad > 0)
+            log_line("PEERS %d from %s (%d bad lines skipped)", n_peers,
+                     g_cfg.peer_file, n_peer_bad);
+        else
+            log_line("PEERS %d from %s", n_peers, g_cfg.peer_file);
     }
 
     signal(SIGINT, on_signal);

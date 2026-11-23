@@ -122,6 +122,11 @@ building block, not a production service mesh.
   a congested link or a struggling device is visible while the peer
   is still ALIVE, instead of only after it is suspected. See
   "Slow-peer warning" below.
+- Seedless bootstrap: a node reads its initial peers from a file
+  (`--peer-file`, one `host:port` per line, comments and blank lines
+  ignored) and joins the cluster without a `--seed` flag — bad lines
+  are logged and skipped, a missing file is a clean startup error.
+  See "Seedless bootstrap" below.
 
 ## What it is not
 
@@ -238,6 +243,7 @@ scripts/demo.sh
 | `--port` | — (required) | UDP port to listen on |
 | `--id` | `127.0.0.1:<port>` | Member id; set it to a reachable address on multi-host clusters |
 | `--seed` | — (repeatable) | `host:port` of a known member to join through |
+| `--peer-file` | — | File of initial peers, one `host:port` per line (see "Seedless bootstrap") |
 | `--data-dir` | `.` | Directory holding the `incarnation` and `members` state files |
 | `--probe-interval-ms` | 100 | How often to probe a random peer |
 | `--probe-interval-fast-ms` | half of `--probe-interval-ms` | Probe interval while any peer is SUSPECT (adaptive probe interval; floored at 25 ms, never slower than the base) |
@@ -257,7 +263,8 @@ scripts/demo.sh
 Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 `GC` (a DEAD entry removed after its retention expired), `ALIVE`,
 `REFUTE`, `LEAVE` (this node announced its clean shutdown to its
-peers), `SLOW <id> mean=Nms threshold=Mms` (a peer's mean probe RTT
+peers), `PEERS <n> from <file>` (initial peers loaded from a peer
+list file — see "Seedless bootstrap"), `SLOW <id> mean=Nms threshold=Mms` (a peer's mean probe RTT
 rose above `--slow-peer-rtt-ms`, once per slow episode — see
 "Slow-peer warning"), `SYNC <id>` (a periodic full-table exchange was sent to that
 peer), `ADAPTIVE fast probe=Nms suspects=N` when the probe interval
@@ -428,6 +435,48 @@ a seed that is already ALIVE is never re-joined.
 ./pulse-node --port 17101 --data-dir /tmp/p1
 # Node 2 logs REJOIN, node 1 logs JOIN, both report alive=2.
 ```
+
+## Seedless bootstrap
+
+A `--seed` flag names one peer to join through, which makes the
+seed special: it has to be up first (or the rejoin retry has to
+wait for it), and every node's command line has to name it. A
+`--peer-file` file replaces that with a plain list — one
+`host:port` per line, blank lines and `#` comment lines ignored —
+that every node in the cluster can share:
+
+```
+# ward cluster peers
+127.0.0.1:17101
+127.0.0.1:17102
+127.0.0.1:17103
+```
+
+```sh
+./pulse-node --port 17101 --peer-file peers --data-dir /tmp/p1
+./pulse-node --port 17102 --peer-file peers --data-dir /tmp/p2
+./pulse-node --port 17103 --peer-file peers --data-dir /tmp/p3
+# All three converge on alive=3, in any start order, with no --seed.
+```
+
+Each entry behaves exactly like a `--seed` flag: the node sends it
+a `JOIN` at startup, probes it, and re-sends `JOIN` every ~5 s
+while it is not ALIVE, so a peer that starts late still merges.
+The file can list every member including the node itself — joining
+yourself is harmless — and a node can combine `--seed` flags with a
+peer file; both feed the same seed list (at most 16 entries total).
+The node logs `PEERS <n> from <file>` at startup.
+
+Two deliberate strictnesses. A malformed line is logged
+(`peer file <file> line <n>: skipping bad peer '<line>'`) and
+skipped, never fatal: a hand-edited file with one typo must not
+stop the node from joining through its good peers. But a missing
+or unreadable file is a clean startup error — the node prints
+`cannot read peer file <file>: <reason>` and exits nonzero before
+starting — because silently starting alone would hide a typo'd
+path and leave the node isolated with no sign anything was wrong.
+An empty file is not an error: a node with an empty peer file
+starts alone, exactly like one with no seeds.
 
 ## Membership persistence
 
@@ -970,6 +1019,21 @@ make test
   `--meta` flags restores the node's own annotations from the saved
   meta file and its peers' annotations from the members file, with
   peers seeing them again after the rejoin.
+- `tests/test_peerfile.c`: unit tests for the peer list file —
+  comments (including indented ones) and blank lines ignored,
+  valid IPv4 and bracketed IPv6 ids load, a bare IPv6 id
+  canonicalizes to bracketed form, bad lines (garbage, bad port,
+  missing port, unparseable host) are skipped and counted,
+  duplicates are dropped silently, CRLF endings work, the cap
+  counts overflow as bad, an empty file loads zero peers, and a
+  missing file is an error.
+- `tests/test_peerfile.sh`: integration test for seedless bootstrap
+  — a missing peer file is a clean startup error (nonzero exit, no
+  `START` line), three nodes started with `--peer-file` and no
+  `--seed` converge on alive=3 from one shared file (with a comment,
+  a blank line, and a bad line that is logged and skipped), and a
+  node whose file lists a peer that never answers still joins the
+  live cluster and GCs the dead entry.
 
 ## Roadmap
 
@@ -995,3 +1059,4 @@ make test
 - ~~Member metadata/annotations: each node carries up to 8 `key=value` annotations about itself (`role=worker`, `zone=us-east-1`, `version=1.2.3`), set with repeatable `--meta` flags or the control plane's `META` command, gossiped with its membership entry as an `;k=v,k=v` suffix (entries from older nodes parse unchanged), visible in `MEMBERS` and as a `meta` object per member in `JSON`, and persisted across restarts — the node's own set in `<data-dir>/meta` (flags win, otherwise the saved set is restored) and peers' sets as an optional fifth field in `<data-dir>/members`; an entry carrying no annotations never wipes stored ones.~~ Done in 0.20.0.
 - ~~Probe RTT per peer: each node measures the round-trip time of its direct probes (PING send to ACK receipt) per peer and reports the last RTT and the mean over all answered probes per member in `JSON` as `rtt_ms` / `rtt_mean_ms` (`null` until a probe has been answered, always `null` for self), so an operator can see which peers are slow before they are ever suspected.~~ Done in 0.21.0.
 - ~~Slow-peer warning: a peer whose mean probe RTT rises above a configurable threshold (`--slow-peer-rtt-ms`, 0 = disabled) is flagged `"slow":true` per member in `JSON` with a `slow_peers` count in `METRICS` and `JSON`, and the node logs a `SLOW` line once per slow episode (cleared on recovery, so a re-crossing warns again) — the mean, not the last RTT, so one slow probe is noise and only a consistently slow peer warns, while the peer is still ALIVE instead of only after it is suspected.~~ Done in 0.22.0.
+- ~~Seedless bootstrap via a peer list file: a node reads its initial peers from a file (`--peer-file`, one `host:port` per line, comments and blank lines ignored), probes them on startup and joins the cluster without a `--seed` flag — the entries get exactly the `--seed` treatment (JOIN at startup, probing, ~5 s rejoin retry), bad lines are logged and skipped, and a missing file is a clean startup error instead of a silent solo start.~~ Done in 0.23.0.
