@@ -1,15 +1,21 @@
 /* Unit tests for the TCP control plane dispatch (RELOAD, 0.25.0;
- * PEERS, 0.27.0):
+ * PEERS, 0.27.0; peer-file state in METRICS/JSON, 0.28.0):
  * fake hooks serve canned state, and the test drives the real
  * control_listen / control_serve over loopback, checking the exact
  * reply lines for RELOAD success, no peer file, an unreadable file,
  * and a node with no reload hook — plus PEERS lines (id, state,
  * last-seen, source) for a canned table, and MEMBERS on an empty
  * table and an unknown command, so the dispatch around RELOAD is
- * covered too. The node-level merge itself is covered by the
+ * covered too. METRICS and JSON (0.28.0) are covered the same way:
+ * the peer-file path, last reload time / last mtime, and the counts
+ * from the last load ride in the METRICS line and as a "peer_file"
+ * object in JSON, each member carries its "source" in JSON, and a
+ * node with no peer file (or no peer-file hook) reports "-" / null
+ * instead. The node-level merge itself is covered by the
  * integration test (tests/test_reload.sh) and the SIGHUP reload
  * tests; PEERS provenance end to end is covered by
- * tests/test_peers.sh. */
+ * tests/test_peers.sh, and the METRICS/JSON exposure end to end by
+ * tests/test_peerfile_metrics.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -38,6 +44,26 @@ static int checks = 0, failures = 0;
 /* What the fake reload hook reports. 0 = success, 1 = no peer file,
  * 2 = unreadable file. */
 static int g_reload_mode = 0;
+
+/* What the fake peer-file-state hook reports (0.28.0). 0 = a peer
+ * file with a last load, 1 = no peer file. */
+static int g_peerfile_mode = 0;
+
+static void peer_file_state_hook(void *ctx, pulse_peer_file_state_t *out) {
+    (void)ctx;
+    memset(out, 0, sizeof *out);
+    if (g_peerfile_mode == 0) {
+        out->have_file = 1;
+        snprintf(out->path, sizeof out->path, "/tmp/peers");
+        out->last_reload_unix = 1700000000;
+        out->last_mtime_unix = 1699999000;
+        out->peers = 3;
+        out->added = 1;
+        out->dropped = 0;
+        out->kept = 1;
+        out->bad = 0;
+    }
+}
 
 /* Canned membership for PEERS: self, a --seed peer (heard from
  * recently), a --peer-file peer (heard from recently), and a
@@ -159,6 +185,7 @@ int main(void) {
     g_hooks.metrics = metrics_hook;
     g_hooks.force_leave = force_leave_hook;
     g_hooks.reload_peer_file = reload_hook;
+    g_hooks.peer_file_state = peer_file_state_hook;
     g_hooks.set_meta = NULL;
     g_hooks.phi_enabled = phi_enabled_hook;
     g_hooks.peer_source = peer_source_hook;
@@ -177,7 +204,7 @@ int main(void) {
     pthread_t server;
     CHECK(pthread_create(&server, NULL, serve_thread, &fd) == 0);
 
-    char reply[1024];
+    char reply[4096];
 
     /* RELOAD success: the exact outcome line, no END trailer (like
      * LEAVE/META, a single-line reply). */
@@ -264,6 +291,64 @@ int main(void) {
     CHECK(strstr(reply, " seed\n") == NULL);
     CHECK(strstr(reply, " peer-file\n") == NULL);
     g_hooks.peer_source = peer_source_hook;
+
+    /* METRICS (0.28.0): the peer-file state rides at the end of the
+     * line — path, last reload time / last mtime as unix seconds,
+     * and the counts from the last load. Exact line: the canned
+     * metrics are all zero, so every other field is known too. */
+    g_peerfile_mode = 0;
+    CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply,
+                 "METRICS suspected=0 dead=0 refutes=0 joins=0 "
+                 "adaptive_fast_cycles=0 suspect_refuted=0 "
+                 "detect_latency_ms mean=- max=- samples=0 "
+                 "hist=[0,0,0,0,0] suspect_to_dead_ms mean=- max=- "
+                 "samples=0 refute_latency_ms mean=- max=- samples=0 "
+                 "slow_peers=0 peer_file=/tmp/peers "
+                 "last_reload=1700000000 last_mtime=1699999000 "
+                 "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
+                 "pf_bad=0\nEND\n") == 0);
+
+    /* JSON (0.28.0): the same state as a "peer_file" object, and
+     * each member carries its "source" — the peer-file peer is
+     * distinguishable from the discovered one. */
+    CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply,
+                 "\"peer_file\":{\"path\":\"/tmp/peers\","
+                 "\"last_reload\":1700000000,\"last_mtime\":1699999000,"
+                 "\"peers\":3,\"added\":1,\"dropped\":0,\"kept\":1,"
+                 "\"bad\":0}") != NULL);
+    CHECK(strstr(reply, "\"source\":\"self\"") != NULL);
+    CHECK(strstr(reply, "\"source\":\"seed\"") != NULL);
+    CHECK(strstr(reply, "\"source\":\"peer-file\"") != NULL);
+    CHECK(strstr(reply, "\"source\":\"discovered\"") != NULL);
+    /* The peer_file object sits at the top level, after metrics. */
+    {
+        const char *metrics = strstr(reply, "\"metrics\":{");
+        const char *pf = strstr(reply, "\"peer_file\":{");
+        CHECK(metrics != NULL && pf != NULL && pf > metrics);
+    }
+
+    /* No peer file: METRICS reports "-" for every peer-file field,
+     * and JSON reports "peer_file":null. */
+    g_peerfile_mode = 1;
+    CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply,
+                 "peer_file=- last_reload=- last_mtime=- pf_peers=- "
+                 "pf_added=- pf_dropped=- pf_kept=- pf_bad=-") != NULL);
+    CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "\"peer_file\":null") != NULL);
+    CHECK(strstr(reply, "\"peer_file\":{") == NULL);
+
+    /* A node with no peer-file-state hook at all reports no peer
+     * file instead of crashing on a NULL hook. */
+    g_hooks.peer_file_state = NULL;
+    CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "peer_file=- last_reload=-") != NULL);
+    CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "\"peer_file\":null") != NULL);
+    g_hooks.peer_file_state = peer_file_state_hook;
+    g_peerfile_mode = 0;
 
     shutdown(fd, SHUT_RDWR);
     close(fd);

@@ -75,6 +75,61 @@ static int read_line(int fd, char *buf, size_t cap) {
     return (int)n;
 }
 
+/* Where a member came from, for PEERS and JSON (0.27.0 / 0.28.0):
+ * the node's peer_source hook when it has one, else "self" for this
+ * node and "discovered" for everyone else. Returns a string literal;
+ * the caller must not free it. */
+static const char *peer_source_str(const control_hooks_t *hooks,
+                                   const char *id) {
+    if (hooks->peer_source) {
+        const char *s = hooks->peer_source(hooks->ctx, id);
+        if (s && s[0] != '\0') return s;
+    }
+    return strcmp(id, hooks->self_id) == 0 ? "self" : "discovered";
+}
+
+/* Peer-file state (0.28.0), shared by METRICS and JSON: fill out
+ * from the hook, or report "no peer file" when the node has no
+ * hook for it. */
+static void peer_file_state_or_none(const control_hooks_t *hooks,
+                                    pulse_peer_file_state_t *out) {
+    memset(out, 0, sizeof *out);
+    if (hooks->peer_file_state)
+        hooks->peer_file_state(hooks->ctx, out);
+}
+
+/* Copy s into dst, escaping backslash, quote and control characters
+ * for JSON. Returns 0 on success, -1 when dst is too small (dst is
+ * still NUL-terminated). Member ids need no escaping (they are
+ * host:port), but a peer-file path is user-supplied and may contain
+ * either. */
+static int json_escape(const char *s, char *dst, size_t cap) {
+    size_t n = 0;
+    int truncated = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        char esc[8];
+        int m = 0;
+        if (*p == '"' || *p == '\\') {
+            esc[0] = '\\';
+            esc[1] = (char)*p;
+            m = 2;
+        } else if (*p < 0x20) {
+            m = snprintf(esc, sizeof esc, "\\u%04x", *p);
+        } else {
+            esc[0] = (char)*p;
+            m = 1;
+        }
+        if (n + (size_t)m >= cap) {
+            truncated = 1;
+            break;
+        }
+        memcpy(dst + n, esc, (size_t)m);
+        n += (size_t)m;
+    }
+    if (cap > 0) dst[n < cap ? n : cap - 1] = '\0';
+    return truncated ? -1 : 0;
+}
+
 static void handle_members(int fd, const control_hooks_t *hooks) {
     member_table_t t;
     hooks->snapshot(hooks->ctx, &t);
@@ -124,13 +179,7 @@ static void handle_peers(int fd, const control_hooks_t *hooks) {
             snprintf(seenbuf, sizeof seenbuf, "%lld",
                      (long long)(now - m->last_seen_ms));
         }
-        const char *source = "discovered";
-        if (hooks->peer_source) {
-            const char *s = hooks->peer_source(hooks->ctx, m->id);
-            if (s && s[0] != '\0') source = s;
-        } else if (strcmp(m->id, hooks->self_id) == 0) {
-            source = "self";
-        }
+        const char *source = peer_source_str(hooks, m->id);
         snprintf(line, sizeof line, "PEER %s %u %s %s %s\n", m->id,
                  m->incarnation, member_state_name(m->state), seenbuf,
                  source);
@@ -159,7 +208,10 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
     hooks->metrics(hooks->ctx, &m);
     member_table_t t;
     hooks->snapshot(hooks->ctx, &t);
-    char line[512];
+    /* The metrics line plus slow_peers plus the peer-file fields
+     * (path up to 512 chars) can run long; 1 KB holds the whole
+     * line for any realistic path. snprintf truncates safely. */
+    char line[1024];
     metrics_format(&m, line, sizeof line);
     /* Slow-peer warning (0.22.0): how many members currently count
      * as slow — mean probe RTT above the configured threshold. The
@@ -168,6 +220,26 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
     size_t used = strlen(line);
     snprintf(line + used, sizeof line - used, " slow_peers=%d",
              member_count_slow(&t, hooks->slow_rtt_threshold_ms));
+    /* Peer-file state (0.28.0): the roster this node seeds from and
+     * what the last load of it did. A path with a space breaks the
+     * space-separated format — JSON is the machine-readable form —
+     * but a plain path reads fine here. */
+    pulse_peer_file_state_t pf;
+    peer_file_state_or_none(hooks, &pf);
+    used = strlen(line);
+    if (pf.have_file) {
+        snprintf(line + used, sizeof line - used,
+                 " peer_file=%s last_reload=%lld last_mtime=%lld "
+                 "pf_peers=%d pf_added=%d pf_dropped=%d pf_kept=%d "
+                 "pf_bad=%d",
+                 pf.path, (long long)pf.last_reload_unix,
+                 (long long)pf.last_mtime_unix, pf.peers, pf.added,
+                 pf.dropped, pf.kept, pf.bad);
+    } else {
+        snprintf(line + used, sizeof line - used,
+                 " peer_file=- last_reload=- last_mtime=- pf_peers=- "
+                 "pf_added=- pf_dropped=- pf_kept=- pf_bad=-");
+    }
     if (send_all(fd, line) != 0) return;
     send_all(fd, "\nEND\n");
 }
@@ -231,18 +303,47 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
             snprintf(rttmeanbuf, sizeof rttmeanbuf, "%lld",
                      (long long)(mem->rtt_sum_ms / mem->rtt_samples));
         }
+        /* "source" (0.28.0) is where this node got the peer from —
+         * "seed", "peer-file", "discovered" or "self" — the same
+         * provenance PEERS reports, so a peer-file peer is
+         * distinguishable from a discovered one in JSON too. */
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"meta\":%s,\"rtt_ms\":%s,"
-                     "\"rtt_mean_ms\":%s,\"slow\":%s}",
+                     "\"rtt_mean_ms\":%s,\"slow\":%s,\"source\":\"%s\"}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, metajson,
                      rttbuf, rttmeanbuf,
                      member_is_slow(mem, hooks->slow_rtt_threshold_ms)
                          ? "true"
-                         : "false");
+                         : "false",
+                     peer_source_str(hooks, mem->id));
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
+    }
+    /* Peer-file state (0.28.0): the same state METRICS reports, as
+     * a JSON object, or null when the node runs without --peer-file.
+     * The path is escaped: unlike member ids it is user-supplied
+     * and may contain a quote or a backslash. */
+    pulse_peer_file_state_t pf;
+    peer_file_state_or_none(hooks, &pf);
+    /* 1 KB holds the object for any realistic path: the fixed fields
+     * are ~110 bytes, so the escaped path is capped at 700 (a longer
+     * path is shortened, never cut mid-escape — json_escape only
+     * copies whole escape sequences). */
+    char pfjson[1024];
+    if (!pf.have_file) {
+        snprintf(pfjson, sizeof pfjson, "null");
+    } else {
+        char escpath[700];
+        json_escape(pf.path, escpath, sizeof escpath);
+        snprintf(pfjson, sizeof pfjson,
+                 "{\"path\":\"%s\",\"last_reload\":%lld,"
+                 "\"last_mtime\":%lld,\"peers\":%d,\"added\":%d,"
+                 "\"dropped\":%d,\"kept\":%d,\"bad\":%d}",
+                 escpath, (long long)pf.last_reload_unix,
+                 (long long)pf.last_mtime_unix, pf.peers, pf.added,
+                 pf.dropped, pf.kept, pf.bad);
     }
     char dmean[16], smean[16], rmean[16], dhist[64];
     if (m.detect_samples > 0)
@@ -268,7 +369,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
         "\"max\":%lld,\"samples\":%lld},\"refute_latency_ms\":{\"mean\":%s,"
-        "\"max\":%lld,\"samples\":%lld}}}\nEND\n",
+        "\"max\":%lld,\"samples\":%lld}},\"peer_file\":%s}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
         (long long)m.joins, (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
@@ -278,7 +379,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (long long)m.suspect_dead_max_ms,
         (long long)m.suspect_dead_samples,
         rmean, (long long)m.refute_max_ms,
-        (long long)m.refute_samples);
+        (long long)m.refute_samples, pfjson);
     if (w < 0 || (size_t)w >= sizeof buf - used) return;
     send_all(fd, buf);
 }

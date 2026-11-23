@@ -137,7 +137,12 @@ building block, not a production service mesh.
   same reload over TCP. The node also watches the file itself: once
   a second it checks the file's mtime, and an edit re-runs the same
   merge with no signal and no control-plane call. See "Live
-  peer-file reload" below.
+  peer-file reload" below. The last load is visible without reading
+  the log: `METRICS` and `JSON` report the peer-file path, the last
+  reload time and the file's mtime at that load, and the counts from
+  that load, and each member in `JSON` carries where it came from
+  (`source`), so a peer-file peer is distinguishable from a
+  discovered one. See "Peer-file state in METRICS and JSON" below.
 
 ## What it is not
 
@@ -333,11 +338,11 @@ the port beyond localhost.
 # END
 
 ./pulse-ctl 127.0.0.1:18401 METRICS
-# METRICS suspected=1 dead=1 refutes=0 joins=2 adaptive_fast_cycles=3 suspect_refuted=0 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1 refute_latency_ms mean=- max=- samples=0 slow_peers=0
+# METRICS suspected=1 dead=1 refutes=0 joins=2 adaptive_fast_cycles=3 suspect_refuted=0 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1 refute_latency_ms mean=- max=- samples=0 slow_peers=0 peer_file=peers last_reload=1795450000 last_mtime=1795449900 pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=0 pf_bad=0
 # END
 
 ./pulse-ctl 127.0.0.1:18401 JSON
-# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null,"slow":false},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42,"meta":{},"rtt_ms":1,"rtt_mean_ms":0,"slow":false}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"slow_peers":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}}}
+# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null,"slow":false,"source":"self"},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42,"meta":{},"rtt_ms":1,"rtt_mean_ms":0,"slow":false,"source":"peer-file"}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"slow_peers":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}},"peer_file":{"path":"peers","last_reload":1795450000,"last_mtime":1795449900,"peers":3,"added":1,"dropped":0,"kept":0,"bad":0}}
 # END
 ```
 
@@ -357,8 +362,8 @@ Commands:
 | `META <key=value>` | Set one annotation on this node itself: `OK <key=value>`. The change is gossiped with the next digest and persisted to the data dir, so it survives a restart. Bad syntax: `ERR invalid meta <arg>`; a ninth distinct key: `ERR meta full (max 8)`; missing argument: `ERR usage: META <key=value>`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
 | `RELOAD` | Re-read `--peer-file` and merge it into the seed list — the same reload SIGHUP triggers, for an operator who cannot send the node a signal: `OK peers=N added=A dropped=D kept=K bad=B`. `peers` is how many peers the file lists; `added`/`dropped`/`kept` are the merge outcome (a still-ALIVE peer removed from the file is kept, never dropped on a file edit alone); `bad` is how many lines were skipped as malformed. No `--peer-file`: `ERR no peer file`. Unreadable file: `ERR cannot read peer file <path>: <reason>`, and the old list is kept. |
-| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N slow_peers=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. |
-| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning"). The metrics object also carries `slow_peers`, the count of currently slow members. Built for tooling that polls cluster state without scraping the text protocol. |
+| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N slow_peers=N peer_file=<path\|-> last_reload=<unix\|-> last_mtime=<unix\|-> pf_peers=<N\|-> pf_added=<N\|-> pf_dropped=<N\|-> pf_kept=<N\|-> pf_bad=<N\|->` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. The peer-file fields (0.28.0) are the `--peer-file` state — the path, the wall-clock time of the last successful load or reload, the file's mtime at that load, and the counts from that load (the same numbers as the `PEERFILE RELOAD` log line) — and are all `-` when the node runs without `--peer-file`; see "Peer-file state in METRICS and JSON". |
+| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning") — and `source`, where the peer came from (`seed`, `peer-file`, `discovered`, or `self`, the same provenance `PEERS` reports). The metrics object also carries `slow_peers`, the count of currently slow members. A top-level `peer_file` object carries the `--peer-file` state (path, `last_reload` / `last_mtime` as unix seconds, and the counts from the last load), or `null` when the node runs without `--peer-file` (0.28.0). Built for tooling that polls cluster state without scraping the text protocol. |
 | anything else | `ERR unknown command` |
 
 ## Shared secret
@@ -602,6 +607,53 @@ slow way, through the normal suspect-to-dead-to-GC path. And a
 deleted file is skipped quietly (a manual reload still reports it);
 when the file reappears with a new mtime the watch picks it up on
 the next check.
+
+## Peer-file state in METRICS and JSON
+
+A reload is logged, but an operator polling the cluster should not
+have to scrape the log to answer "which roster is this node running
+from, and when did it last pick it up?" — so since 0.28.0 the
+peer-file state is exposed on the control plane, in both forms:
+
+```sh
+./pulse-ctl 127.0.0.1:18401 METRICS
+# METRICS ... slow_peers=0 peer_file=peers last_reload=1795450000 last_mtime=1795449900 pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=0 pf_bad=0
+
+./pulse-ctl 127.0.0.1:18401 JSON
+# {...,"peer_file":{"path":"peers","last_reload":1795450000,"last_mtime":1795449900,"peers":3,"added":1,"dropped":0,"kept":0,"bad":0}}
+```
+
+`peer_file` is the `--peer-file` path as given on the command line,
+`last_reload` is the wall-clock time (unix seconds) of the last
+successful load or reload, and `last_mtime` is the file's mtime
+(unix seconds) at that load — so a `last_mtime` older than the
+file's current mtime means the node has not picked up the latest
+edit yet, and a `last_reload` that never advances after an edit
+means the reloads are not reaching the node at all. The counts are
+the same numbers as the `PEERFILE RELOAD` log line for that load:
+`peers` listed in the file, `added` / `dropped` / `kept` from the
+merge, `bad` lines skipped as malformed. The initial load at
+startup counts as the first reload, with `added` the peers the file
+contributed to the seed list, so the fields are populated from the
+moment the node starts — there is no "no reload yet" state to
+special-case. A reload that cannot read the file leaves the state
+at the last successful load instead of blanking it, so the numbers
+always describe a roster the node actually holds; the failure is
+still in the log (`PEERFILE reload ... cannot read`).
+
+Each member in `JSON` also carries a `source` field — `seed`,
+`peer-file`, `discovered`, or `self` — the same provenance `PEERS`
+reports, so a peer-file peer is distinguishable from a discovered
+one in the machine-readable view too, including a kept peer
+(removed from the file but still ALIVE), which still reports
+`peer-file` until a later reload drops it.
+
+A node without `--peer-file` reports `-` for every peer-file field
+in `METRICS` and `"peer_file":null` in `JSON`; the per-member
+`source` still works there, since seeds and gossip exist without a
+file. One honest caveat: the `METRICS` line is space-separated, so
+a peer-file path containing a space breaks its field parsing —
+`JSON` is the machine-readable form, and its path is escaped.
 
 ## Peer provenance
 
@@ -1054,7 +1106,9 @@ make test
   the detected kill with measured latencies and a histogram after a
   peer dies, `JSON` returns one line of valid JSON with the node itself
   as the only member and zeroed metrics (including an all-zero
-  histogram) on a fresh node, and after a kill it lists
+  histogram) on a fresh node — the member carries `"source":"self"`,
+  and `"peer_file":null` since the node runs without `--peer-file` —
+  and after a kill it lists
   the dead member with state `DEAD` and numeric latency means and a
   histogram,
   unknown commands and bad `LEAVE` usage get clean `ERR` lines, a
@@ -1249,6 +1303,28 @@ make test
   for self and for the never-heard-from peer — and `PEERS` on an
   empty table is just `END`; with no peer-source hook at all, every
   non-self member reports as `discovered` and self still as `self`.
+  `METRICS` and `JSON` (0.28.0) are covered the same way: the exact
+  `METRICS` line carries the peer-file path, last reload time /
+  last mtime, and the counts from the last load, the `JSON` line
+  carries the same state as a top-level `peer_file` object and a
+  `source` on every member, and a node with no peer file — or no
+  peer-file hook at all — reports `-` / `null` instead of crashing.
+- `tests/test_peerfile_metrics.sh`: integration test for
+  METRICS/JSON exposure of peer-file state (0.28.0) — two nodes
+  converge from one shared peer file (with a bad line) and `METRICS`
+  reports the path, the counts from the initial load (`pf_peers=2
+  pf_added=2 pf_bad=1`), a plausible `last_reload` and a `last_mtime`
+  equal to the file's mtime, while `JSON` carries the same state as
+  a `peer_file` object and `source` per member (`self` / `peer-file`);
+  removing a live peer from the file and adding another, then
+  SIGHUP, shows the new counts (`pf_peers=2 pf_kept=1 pf_bad=0`,
+  `last_mtime` moved) with the kept peer still `peer-file` in
+  `JSON`; a SIGHUP and a `RELOAD` on an unchanged file both refresh
+  the state to the no-op reload (`added=0 dropped=0 kept=1`), and
+  `RELOAD` advances `last_reload`; a node with no `--peer-file`
+  reports `-` for every peer-file field in `METRICS` and
+  `"peer_file":null` in `JSON`, with its seed peer's source still
+  `seed`; and no node restarts (exactly one `START` line each).
 - `tests/test_reload.sh`: integration test for the `RELOAD`
   control-plane command (0.25.0) — the same scenarios as the SIGHUP
   reload test, driven over TCP instead: three nodes converge from
@@ -1302,3 +1378,5 @@ make test
 - ~~RELOAD control-plane command over TCP: the same live peer-file reload SIGHUP triggers, driven from the control plane (`RELOAD`, answered `OK peers=N added=A dropped=D kept=K bad=B`) so an operator who cannot signal the process can still reload the roster; a node with no `--peer-file` answers `ERR no peer file`, an unreadable file answers `ERR cannot read peer file <path>: <reason>` and keeps the old list, and SIGHUP and RELOAD run the same code serialized on one lock so the two triggers can never interleave.~~ Done in 0.25.0.
 - ~~Auto-reload on peer-file mtime change: while a `--peer-file` is in use, the node stats the file once a second and re-runs the same reload merge when its mtime moves — no SIGHUP, no control-plane call, no restart — with the reload logged (`PEERFILE <file> changed on disk, auto-reloading` plus the usual summary) and the watch baseline refreshed by every manual reload so it never re-runs right after one; an edit that preserves the mtime is invisible to the watch, a kept peer that dies after its edit is dropped at the next file change (or by normal GC), and a deleted file is skipped quietly until it reappears.~~ Done in 0.26.0.
 - ~~PEERS control-plane command over TCP: one `PEER <id> <incarnation> <state> <last-seen-ms|-> <seed\|peer-file\|discovered\|self>` line per member, then `END`, so an operator can see at a glance how long since each peer was last heard from directly and where the peer came from — a `--seed` flag, the `--peer-file` roster (or a peer removed from it but kept because it was still ALIVE), or gossip/a JOIN from a peer the node was never told about; the flag outranks the file, self reports as `self` with a `-` last-seen, and a peer never heard from reports `-` too.~~ Done in 0.27.0.
+- ~~METRICS/JSON exposure of peer-file state: `METRICS` reports the `--peer-file` path, the wall-clock time of the last successful load or reload, the file's mtime at that load, and the counts from that load (`pf_peers` / `pf_added` / `pf_dropped` / `pf_kept` / `pf_bad`), and `JSON` carries the same state as a top-level `peer_file` object (or `null` with no `--peer-file`) plus a `source` (`seed` / `peer-file` / `discovered` / `self`) on every member, so a peer-file peer is distinguishable from a discovered one in the machine-readable view too; the initial load at startup counts as the first reload, a failed reload leaves the last successful state untouched, and a node with no `--peer-file` reports `-` / `null`.~~ Done in 0.28.0.
+- Control-plane event stream (`WATCH`): a long-lived TCP connection that pushes membership events as they happen — `JOIN`, `SUSPECT`, `DEAD`, `ALIVE`, `REFUTE`, `LEAVE` — with the same id/incarnation/state shape as `PEERS`, so tooling can watch a cluster without polling `STATUS` / `MEMBERS` / `JSON` once a second; a slow consumer is dropped instead of buffering unboundedly, and the stream starts with a full snapshot so a late subscriber does not miss the current table.

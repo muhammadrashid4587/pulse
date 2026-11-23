@@ -150,6 +150,17 @@ static pthread_mutex_t g_reload_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct timespec g_peer_file_mtime;
 static int g_peer_file_mtime_known = 0;
 static int64_t g_peer_file_last_check_ms = 0;
+/* Peer-file state exposed in METRICS and JSON (0.28.0): what the
+ * last successful load or reload of --peer-file did. The initial
+ * load at startup counts as the first reload (added = the peers
+ * the file contributed to the seed list). A reload that cannot
+ * read the file leaves this at the last successful load, so the
+ * numbers always describe a roster the node actually holds.
+ * Written under g_lock at the end of a successful load/reload
+ * (both run serialized by g_reload_lock, and the startup load
+ * before any thread starts); read by the control-plane hook under
+ * the same lock. */
+static pulse_peer_file_state_t g_peerfile_state;
 
 /* stat the peer file and return 1 with *ts set when it exists. */
 static int peer_file_mtime(struct timespec *ts) {
@@ -875,6 +886,23 @@ static void reload_peer_file_locked(pulse_reload_result_t *r) {
     r->dropped = n_dropped;
     r->kept = g_cfg.kept_peer_count;
     r->bad = n_bad;
+    /* Peer-file state for METRICS and JSON (0.28.0): this load is
+     * now the last successful one. A failed load returns early
+     * above and leaves the previous state untouched. */
+    pthread_mutex_lock(&g_lock);
+    g_peerfile_state.have_file = 1;
+    snprintf(g_peerfile_state.path, sizeof g_peerfile_state.path,
+             "%s", g_cfg.peer_file);
+    g_peerfile_state.last_reload_unix = (int64_t)time(NULL);
+    g_peerfile_state.last_mtime_unix = g_peer_file_mtime_known
+                                           ? (int64_t)g_peer_file_mtime.tv_sec
+                                           : 0;
+    g_peerfile_state.peers = r->peers;
+    g_peerfile_state.added = r->added;
+    g_peerfile_state.dropped = r->dropped;
+    g_peerfile_state.kept = r->kept;
+    g_peerfile_state.bad = r->bad;
+    pthread_mutex_unlock(&g_lock);
 }
 
 /* Entry point for both reload triggers: SIGHUP (via the prober
@@ -1371,6 +1399,15 @@ static void reload_peer_file_hook(void *ctx, pulse_reload_result_t *out) {
     reload_peer_file(out);
 }
 
+/* METRICS / JSON peer-file state (0.28.0): the last successful
+ * load or reload of --peer-file. */
+static void peer_file_state_hook(void *ctx, pulse_peer_file_state_t *out) {
+    (void)ctx;
+    pthread_mutex_lock(&g_lock);
+    *out = g_peerfile_state;
+    pthread_mutex_unlock(&g_lock);
+}
+
 /* Set one annotation on this node itself (control plane META): update
  * the self entry, stamp it changed so the next digest gossips it, and
  * persist the set to the data dir so it survives a restart. Returns
@@ -1659,6 +1696,24 @@ int main(int argc, char **argv) {
             g_peer_file_mtime = mtime_ts;
             g_peer_file_mtime_known = 1;
         }
+        /* Peer-file state for METRICS and JSON (0.28.0): the initial
+         * load counts as the first reload — added is the peers the
+         * file contributed to the seed list (flag duplicates and
+         * overflow-dropped peers never joined it). */
+        pthread_mutex_lock(&g_lock);
+        g_peerfile_state.have_file = 1;
+        snprintf(g_peerfile_state.path, sizeof g_peerfile_state.path,
+                 "%s", g_cfg.peer_file);
+        g_peerfile_state.last_reload_unix = (int64_t)time(NULL);
+        g_peerfile_state.last_mtime_unix = g_peer_file_mtime_known
+                                               ? (int64_t)g_peer_file_mtime.tv_sec
+                                               : 0;
+        g_peerfile_state.peers = n_peers;
+        g_peerfile_state.added = g_cfg.peer_file_seed_count;
+        g_peerfile_state.dropped = 0;
+        g_peerfile_state.kept = 0;
+        g_peerfile_state.bad = n_peer_bad;
+        pthread_mutex_unlock(&g_lock);
     }
 
     g_start_ms = pulse_now_ms();
@@ -1925,6 +1980,7 @@ int main(int argc, char **argv) {
         g_hooks.metrics = metrics_hook;
         g_hooks.force_leave = force_leave_hook;
         g_hooks.reload_peer_file = reload_peer_file_hook;
+        g_hooks.peer_file_state = peer_file_state_hook;
         g_hooks.set_meta = set_meta_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
         g_hooks.peer_source = peer_source_hook;

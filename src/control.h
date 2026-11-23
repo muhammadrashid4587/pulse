@@ -67,6 +67,9 @@
  *           detect_latency_ms mean=X max=Y samples=N
  *           suspect_to_dead_ms mean=X max=Y samples=N
  *           slow_peers=N
+ *           peer_file=<path|'-'> last_reload=<unix|'-'>
+ *           last_mtime=<unix|'-'> pf_peers=<N|'-'> pf_added=<N|'-'>
+ *           pf_dropped=<N|'-'> pf_kept=<N|'-'> pf_bad=<N|'-'>
  *       detect_latency_ms is last-direct-contact -> SUSPECT for
  *       suspicions this node detected itself (mean/max in ms, "-" when
  *       there are no samples); suspect_to_dead_ms is SUSPECT -> DEAD.
@@ -78,6 +81,11 @@
  *       slow_peers is how many members currently count as slow: mean
  *       probe RTT above --slow-peer-rtt-ms (0 when the warning is
  *       disabled; see "Slow-peer warning").
+ *       The peer-file fields (0.28.0) are the --peer-file state: the
+ *       path, the wall-clock time of the last successful load or
+ *       reload, the file's mtime at that load, and the counts from
+ *       that load (the same numbers as the PEERFILE RELOAD log line).
+ *       All of them are "-" when the node runs without --peer-file.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -87,8 +95,15 @@
  *       "meta": its annotations as a JSON object ({} when it has
  *       none), "rtt_ms" / "rtt_mean_ms" (null until a probe has been
  *       answered), "slow" (true when the peer's mean probe RTT is
- *       above --slow-peer-rtt-ms, false otherwise), and the metrics
- *       object carries "slow_peers" (how many members are slow).
+ *       above --slow-peer-rtt-ms, false otherwise), "source" (where
+ *       the peer came from: "seed", "peer-file", "discovered" or
+ *       "self" — the same provenance PEERS reports, so a peer-file
+ *       peer is distinguishable from a discovered one), and the
+ *       metrics object carries "slow_peers" (how many members are
+ *       slow). A top-level "peer_file" object carries the --peer-file
+ *       state (path, last_reload / last_mtime as unix seconds, and
+ *       the counts from the last load), or null when the node runs
+ *       without --peer-file.
  *   anything else
  *       ERR unknown command
  *
@@ -118,6 +133,32 @@ typedef struct {
     char error[640];
 } pulse_reload_result_t;
 
+/* Peer-file state (0.28.0): what --peer-file the node is using and
+ * what the last successful load or reload of it did, for METRICS
+ * and JSON. have_file is 0 when the node was started without
+ * --peer-file; last_reload_unix is the wall-clock time (seconds
+ * since the epoch) of the last successful load or reload — the
+ * initial load at startup counts as the first one, with added =
+ * the peers the file contributed to the seed list — and
+ * last_mtime_unix is the file's mtime (seconds) at that load.
+ * peers / added / dropped / kept / bad are the counts from that
+ * load: the same numbers as the PEERFILE RELOAD log line (kept =
+ * peers still held in the kept list after the reload). A reload
+ * that cannot read the file leaves the state at the last successful
+ * load, so the numbers always describe a roster the node actually
+ * holds. */
+typedef struct {
+    int have_file;
+    char path[512];
+    int64_t last_reload_unix; /* 0 = never loaded */
+    int64_t last_mtime_unix;  /* 0 = unknown */
+    int peers;
+    int added;
+    int dropped;
+    int kept;
+    int bad;
+} pulse_peer_file_state_t;
+
 typedef struct {
     void *ctx;
     /* Copy the membership table into out (hook locks as needed). */
@@ -129,6 +170,11 @@ typedef struct {
      * reload SIGHUP triggers — filling out with the outcome. NULL
      * when the node does not support it: RELOAD then replies ERR. */
     void (*reload_peer_file)(void *ctx, pulse_reload_result_t *out);
+    /* Copy the --peer-file state (path, last reload time/mtime,
+     * counts from the last successful load) into out. NULL when the
+     * node does not track it: METRICS and JSON then report no peer
+     * file. */
+    void (*peer_file_state)(void *ctx, pulse_peer_file_state_t *out);
     /* Copy the failure-detector metrics into out (hook locks as needed). */
     void (*metrics)(void *ctx, pulse_metrics_t *out);
     /* Set one annotation on this node itself. Returns 0 on success,
