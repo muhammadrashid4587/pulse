@@ -9,11 +9,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "phi.h"
 
 #define CONTROL_MAX_LINE 1024
+
+/* WATCH heartbeat (0.32.0): ms a stream may go without sending a
+ * line before it sends a HEARTBEAT line of its own, so a client on
+ * a quiet cluster can tell "nothing happened" from "the connection
+ * died silently". Five seconds: long enough that a busy cluster
+ * never sees one (events reset the clock), short enough that a
+ * half-open connection is noticed quickly. */
+#define WATCH_HEARTBEAT_IDLE_MS 5000
 
 int control_listen(int port, int family) {
     int fd = socket(family, SOCK_STREAM, 0);
@@ -664,7 +673,19 @@ static int watch_filter_match_id(const watch_filter_t *f, const char *id) {
  * after a "GAP <requested> <oldest>" line that says how much was
  * lost; the stream stays open, unlike the mid-stream gap below.
  * FROM composes with the type/id filters, in any order, and the
- * filter applies to replayed events exactly as to live ones. */
+ * filter applies to replayed events exactly as to live ones.
+ *
+ * Heartbeat (0.32.0): a stream that has sent nothing for 5 s sends
+ * "HEARTBEAT <unix-seconds>", so a client on a quiet cluster can
+ * tell "nothing happened" from "the connection died silently" —
+ * a half-open TCP connection otherwise looks exactly like a quiet
+ * cluster. The heartbeat carries no sequence number (it is not an
+ * event) and is sent regardless of the filter: it is a property of
+ * the stream, not of the membership. Any line sent — EVENT, GAP,
+ * or HEARTBEAT — resets the 5 s clock, so a busy cluster never
+ * sees one. A client that only understands EVENT lines ignores
+ * anything else, so the heartbeat is safe to add to an existing
+ * watcher. */
 static void handle_watch(int fd, const control_hooks_t *hooks,
                          const char *arg) {
     watch_filter_t filter;
@@ -731,6 +752,10 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
         close(fd);
         return;
     }
+    /* last_sent_ms is the wall clock (ms) of the last line sent on
+     * this stream: the heartbeat (0.32.0) fires when it is 5 s old.
+     * Every send below — EVENT, GAP, HEARTBEAT — refreshes it. */
+    int64_t last_sent_ms = pulse_now_ms();
     if (gap) {
         snprintf(line, sizeof line, "GAP %llu %llu\n",
                  (unsigned long long)gap_from,
@@ -739,6 +764,7 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
             close(fd);
             return;
         }
+        last_sent_ms = pulse_now_ms();
     }
     /* first_wait is still set while no event has been consumed:
      * a gap on the very first wait means the replay point was
@@ -765,6 +791,7 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
                      pulse_event_type_name(ev.type), ev.id,
                      ev.incarnation, (long long)ev.unix_ts);
             if (send_all(fd, line) != 0) break;
+            last_sent_ms = pulse_now_ms();
         } else if (r == -1) {
             if (first_wait && filter.have_from) {
                 uint64_t new_oldest = watch_oldest_seq(hooks->ctx);
@@ -776,6 +803,7 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
                          (unsigned long long)start,
                          (unsigned long long)new_oldest);
                 if (send_all(fd, line) != 0) break;
+                last_sent_ms = pulse_now_ms();
                 seq = new_oldest - 1;
                 first_wait = 0;
                 continue;
@@ -795,6 +823,24 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
             if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
                 errno != EINTR)
                 break;
+            /* Heartbeat (0.32.0): nothing sent for 5 s means the
+             * stream looks dead to a client that cannot tell a
+             * quiet cluster from a half-open connection, so send
+             * a HEARTBEAT line with the current unix time. It
+             * carries no sequence number and ignores the filter:
+             * it is the stream saying it is alive, not an event.
+             * The wait above times out every second, so the
+             * heartbeat lands within a second of the 5 s mark. */
+            int64_t now_ms = pulse_now_ms();
+            if (now_ms - last_sent_ms >= WATCH_HEARTBEAT_IDLE_MS) {
+                /* Wall-clock unix seconds, like the EVENT
+                 * timestamps — not pulse_now_ms, which is
+                 * CLOCK_MONOTONIC and means nothing to a client. */
+                snprintf(line, sizeof line, "HEARTBEAT %lld\n",
+                         (long long)time(NULL));
+                if (send_all(fd, line) != 0) break;
+                last_sent_ms = now_ms;
+            }
         }
     }
     close(fd);

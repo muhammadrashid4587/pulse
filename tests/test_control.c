@@ -34,7 +34,12 @@
  * below the oldest buffered event replays from the oldest instead,
  * after a GAP line; FROM 0 replays from the oldest; a FROM past
  * the latest starts live; and a bad FROM is refused up front; the
- * replay end to end is covered by tests/test_watch_replay.sh. */
+ * replay end to end is covered by tests/test_watch_replay.sh. WATCH
+ * heartbeat (0.32.0) is covered here too: a live WATCH on a quiet
+ * stream sends a HEARTBEAT line with the current unix time once 5 s
+ * pass with nothing sent, and a second one about 5 s later, with no
+ * EVENT line in between; the heartbeat end to end is covered by
+ * tests/test_watch_heartbeat.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -250,6 +255,32 @@ static int watch_read_until(int fd, char *buf, size_t cap, size_t *len,
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     for (;;) {
         if (strstr(buf, needle) != NULL) return 1;
+        if (*len + 1 >= cap) return 0;
+        ssize_t r = recv(fd, buf + *len, cap - *len - 1, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return 0; /* timeout or error */
+        }
+        if (r == 0) return 0; /* server closed */
+        *len += (size_t)r;
+        buf[*len] = '\0';
+    }
+}
+
+/* Read until buf holds a complete line starting with prefix (or the
+ * timeout elapses). watch_read_until returns as soon as the prefix
+ * is present, which can be a partial line when the send arrived in
+ * pieces; this one waits for the newline that ends the line. */
+static int watch_read_line_with_prefix(int fd, char *buf, size_t cap,
+                                       size_t *len, const char *prefix,
+                                       int timeout_ms) {
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (long)(timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    for (;;) {
+        const char *p = strstr(buf, prefix);
+        if (p != NULL && strchr(p, '\n') != NULL) return 1;
         if (*len + 1 >= cap) return 0;
         ssize_t r = recv(fd, buf + *len, cap - *len - 1, 0);
         if (r < 0) {
@@ -735,6 +766,59 @@ int main(void) {
                                3000));
         CHECK(strstr(ubuf, "EVENT 13 ") == NULL);
         close(ufd);
+    }
+
+    /* WATCH heartbeat (0.32.0): a plain live WATCH on a quiet
+     * stream — the log holds seqs 1-141 and nothing is recorded
+     * after this one opens — sends a HEARTBEAT line with the
+     * current unix time once 5 s pass with nothing sent, and no
+     * EVENT line: the stream is alive, the cluster is just quiet.
+     * The heartbeat carries no sequence number, so it never shows
+     * up as an EVENT, and a second wait finds a second heartbeat
+     * about 5 s later, proving it repeats instead of firing once.
+     * (The 8 s read timeouts give the 5 s interval a wide margin
+     * for a slow scheduler; the heartbeat lands within a second
+     * of the mark because the wait times out every second.) */
+    int hfd = watch_connect(18991);
+    CHECK(hfd >= 0);
+    if (hfd >= 0) {
+        const char *hcmd = "WATCH\n";
+        CHECK(send(hfd, hcmd, strlen(hcmd), 0) == (ssize_t)strlen(hcmd));
+        char hbuf[4096];
+        size_t hlen = 0;
+        hbuf[0] = '\0';
+        CHECK(watch_read_until(hfd, hbuf, sizeof hbuf, &hlen, "END\n",
+                               3000));
+        CHECK(strncmp(hbuf, "OK watching\n", 12) == 0);
+        /* The read waits for the whole HEARTBEAT line, not just
+         * its prefix: a partial line would parse as a truncated
+         * timestamp. */
+        CHECK(watch_read_line_with_prefix(hfd, hbuf, sizeof hbuf, &hlen,
+                                          "HEARTBEAT ", 8000));
+        /* The heartbeat is the only line after END: no EVENT on a
+         * quiet stream, and its timestamp is a plausible unix
+         * time — all digits, after 2023, not in the future. */
+        CHECK(strstr(hbuf, "EVENT ") == NULL);
+        const char *hb = strstr(hbuf, "HEARTBEAT ");
+        CHECK(hb != NULL);
+        if (hb != NULL) {
+            long long ts = 0;
+            int n = 0;
+            CHECK(sscanf(hb, "HEARTBEAT %lld%n", &ts, &n) == 1);
+            CHECK(ts > 1700000000LL);
+            CHECK(ts <= (long long)time(NULL) + 60);
+            CHECK(hb[n] == '\n');
+        }
+        /* A second heartbeat follows about 5 s later: the buffer
+         * is reset first, so the read below can only be satisfied
+         * by a new HEARTBEAT line, not the one already counted. */
+        hlen = 0;
+        hbuf[0] = '\0';
+        CHECK(watch_read_line_with_prefix(hfd, hbuf, sizeof hbuf, &hlen,
+                                          "HEARTBEAT ", 8000));
+        CHECK(strstr(hbuf, "EVENT ") == NULL);
+        CHECK(strstr(hbuf, "HEARTBEAT ") != NULL);
+        close(hfd);
     }
 
     /* A bad filter is refused up front, and the connection closes. */

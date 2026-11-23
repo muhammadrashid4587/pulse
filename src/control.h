@@ -159,6 +159,13 @@
  *       lost. FROM composes with the type/id filters, in any
  *       order ("WATCH FROM 5 JOINED,DEAD"); a bad FROM is refused
  *       up front: ERR invalid watch filter <reason>.
+ *       Heartbeat (0.32.0): a stream that has sent nothing for 5 s
+ *       sends "HEARTBEAT <unix-seconds>", so a client on a quiet
+ *       cluster can tell "nothing happened" from "the connection
+ *       died silently". The heartbeat carries no sequence number
+ *       and is sent regardless of the filter; any line sent —
+ *       EVENT, GAP, or HEARTBEAT — resets the 5 s clock, so a
+ *       busy cluster never sees one.
  *   anything else
  *       ERR unknown command
  *
