@@ -2,12 +2,12 @@ CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g -Isrc
 LDFLAGS ?= -pthread -lm
 
-NODE_SRC = src/node.c src/member.c src/gossip.c src/phi.c src/secret.c src/control.c src/metrics.c src/persist.c
-HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h src/metrics.h src/persist.h
+NODE_SRC = src/node.c src/member.c src/gossip.c src/phi.c src/secret.c src/control.c src/metrics.c src/persist.c src/adaptive.c
+HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h src/metrics.h src/persist.h src/adaptive.h
 
 .PHONY: all test clean
 
-all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist
+all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive
 
 pulse-node: $(NODE_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $(NODE_SRC) $(LDFLAGS)
@@ -36,7 +36,10 @@ test_metrics: tests/test_metrics.c src/metrics.c src/metrics.h
 test_persist: tests/test_persist.c src/member.c src/phi.c src/persist.c src/member.h src/phi.h src/persist.h
 	$(CC) $(CFLAGS) -o $@ tests/test_persist.c src/member.c src/phi.c src/persist.c $(LDFLAGS)
 
-test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist
+test_adaptive: tests/test_adaptive.c src/adaptive.c src/adaptive.h
+	$(CC) $(CFLAGS) -o $@ tests/test_adaptive.c src/adaptive.c $(LDFLAGS)
+
+test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive
 	./test_member
 	./test_phi
 	./test_secret
@@ -44,6 +47,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	./test_gossip
 	./test_metrics
 	./test_persist
+	./test_adaptive
 	bash tests/test_cluster.sh
 	bash tests/test_gc.sh
 	bash tests/test_rejoin.sh
@@ -55,6 +59,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_sync.sh
 	bash tests/test_leave.sh
 	bash tests/test_join_sync.sh
+	bash tests/test_adaptive.sh
 
 clean:
-	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist
+	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive

@@ -38,6 +38,10 @@ void metrics_note_refute(pulse_metrics_t *m) { m->refutes++; }
 
 void metrics_note_join(pulse_metrics_t *m) { m->joins++; }
 
+void metrics_note_adaptive_fast(pulse_metrics_t *m) {
+    m->adaptive_fast_cycles++;
+}
+
 /* One latency group as "mean=X max=Y samples=N", with "-" for mean/max
  * when there are no samples yet. */
 static void format_group(char *buf, size_t len, int64_t samples,
@@ -68,8 +72,10 @@ void metrics_format(const pulse_metrics_t *m, char *buf, size_t len) {
     metrics_detect_hist_json(m, hist, sizeof hist);
     snprintf(buf, len,
              "METRICS suspected=%lld dead=%lld refutes=%lld joins=%lld "
+             "adaptive_fast_cycles=%lld "
              "detect_latency_ms %s hist=[%s] suspect_to_dead_ms %s",
              (long long)m->suspected, (long long)m->dead,
-             (long long)m->refutes, (long long)m->joins, detect, hist,
+             (long long)m->refutes, (long long)m->joins,
+             (long long)m->adaptive_fast_cycles, detect, hist,
              suspect_dead);
 }

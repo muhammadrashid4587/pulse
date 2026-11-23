@@ -42,6 +42,12 @@ typedef struct {
     int64_t suspect_dead_samples;
     int64_t suspect_dead_sum_ms;
     int64_t suspect_dead_max_ms;
+    /* Adaptive probe interval (0.18.0): probe cycles that ran at the
+     * fast interval because at least one peer was SUSPECT. Zero on a
+     * cluster that never had a suspect; it is the only trace that the
+     * prober ever sped up, since the current interval itself is not
+     * stored. */
+    int64_t adaptive_fast_cycles;
 } pulse_metrics_t;
 
 void metrics_init(pulse_metrics_t *m);
@@ -54,9 +60,12 @@ void metrics_note_suspect(pulse_metrics_t *m, int64_t latency_ms);
 void metrics_note_dead(pulse_metrics_t *m, int64_t duration_ms);
 void metrics_note_refute(pulse_metrics_t *m);
 void metrics_note_join(pulse_metrics_t *m);
+/* One probe cycle ran at the fast interval (a peer was SUSPECT). */
+void metrics_note_adaptive_fast(pulse_metrics_t *m);
 
 /* Format one METRICS line (no trailing newline) into buf:
  *   METRICS suspected=N dead=N refutes=N joins=N
+ *           adaptive_fast_cycles=N
  *           detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e]
  *           suspect_to_dead_ms mean=X max=Y samples=N
  * mean/max are "-" when there are no samples. The histogram is

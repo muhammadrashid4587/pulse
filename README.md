@@ -86,6 +86,15 @@ building block, not a production service mesh.
   anti-entropy `SYNC` heals that within one interval, and failure
   detection never depends on gossip (each node probes its peers
   directly). See "Gossip delta encoding" below.
+- Adaptive probe interval: while any peer is SUSPECT the cluster is
+  mid-incident, so the probe cycle shortens from the base interval to
+  a fast interval (default half the base, `--probe-interval-fast-ms`
+  to set it, never below 25 ms) — direct probes, indirect PING_REQ,
+  the suspect-to-dead sweep and gossip rounds all run faster until
+  the table is suspect-free again, then the interval returns to base.
+  The speedup is counted as `adaptive_fast_cycles` in `METRICS` and
+  `JSON`, and each switch is logged as an `ADAPTIVE` line. See
+  "Adaptive probe interval" below.
 
 ## What it is not
 
@@ -204,6 +213,7 @@ scripts/demo.sh
 | `--seed` | — (repeatable) | `host:port` of a known member to join through |
 | `--data-dir` | `.` | Directory holding the `incarnation` and `members` state files |
 | `--probe-interval-ms` | 100 | How often to probe a random peer |
+| `--probe-interval-fast-ms` | half of `--probe-interval-ms` | Probe interval while any peer is SUSPECT (adaptive probe interval; floored at 25 ms, never slower than the base) |
 | `--ack-timeout-ms` | 100 | How long to wait for an ACK before an indirect probe |
 | `--suspect-timeout-ms` | 300 | How long a SUSPECT lasts before becoming DEAD |
 | `--dead-retention` | 60 | Seconds a DEAD entry stays in the table before GC |
@@ -219,7 +229,9 @@ Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 `GC` (a DEAD entry removed after its retention expired), `ALIVE`,
 `REFUTE`, `LEAVE` (this node announced its clean shutdown to its
 peers), `SYNC <id>` (a periodic full-table exchange was sent to that
-peer), and a `STATUS alive=N suspect=N dead=N total=N` line
+peer), `ADAPTIVE fast probe=Nms suspects=N` when the probe interval
+shortens while a peer is SUSPECT and `ADAPTIVE probe=Nms stable`
+when it returns to base, and a `STATUS alive=N suspect=N dead=N total=N` line
 every second.
 
 Note on sending: `pulse-node` sends on a dedicated socket that is
@@ -543,6 +555,41 @@ one interval — and failure detection itself never depends on gossip,
 since each node probes its peers directly and suspects them on its
 own timeouts.
 
+## Adaptive probe interval
+
+A stable cluster has nothing to prove in a hurry: it probes at the
+configured `--probe-interval-ms` (default 100 ms) and keeps CPU and
+gossip traffic low. But while any peer is SUSPECT the cluster is
+mid-incident — a node may be dying, or may be about to refute — and
+every part of the probe cycle matters more: the direct probe, the
+indirect PING_REQ, the suspect-to-dead sweep, and the gossip round
+all run once per cycle. So while suspects exist the cycle shortens
+to the fast interval, and it goes back to base the moment the table
+is suspect-free again.
+
+The fast interval defaults to half the base (`--probe-interval-fast-ms`
+sets it explicitly) and is clamped to 25 ms at the low end — below
+that the loop would spin fast enough to matter on a ward device's
+CPU for no detection gain — and to the base interval at the high
+end, so a misconfigured fast value can never make detection slower
+than the base. A base already below 25 ms has nothing to speed up
+and stays at base. The switch is logged only when the interval
+changes (`ADAPTIVE fast probe=50ms suspects=1`, then `ADAPTIVE
+probe=100ms stable`), so a stable cluster does not spam the log, and
+the fast cycles are counted as `adaptive_fast_cycles` in the
+`METRICS` text line and in `JSON` — the only trace that the prober
+ever sped up, since the current interval itself is not stored.
+
+The cycle-based cadences inside the probe cycle — the ~5 s seed
+rejoin, the anti-entropy SYNC, the gossip round every other cycle —
+are counted in cycles, so they speed up in wall time along with the
+loop while the cluster is unstable. That is the point: a node that
+missed many digests heals faster, and a suspect is swept to DEAD
+sooner, exactly when the cluster needs it. The timeouts themselves
+do not change — `--ack-timeout-ms` and `--suspect-timeout-ms` are
+still wall-clock durations — so the fast interval only makes the
+checks that enforce them run more often, it never redefines them.
+
 ## Tests
 
 ```sh
@@ -575,6 +622,13 @@ make test
   ≥1000 ms, with boundary samples landing in the higher bucket),
   gossip-learned transitions bump the counts without adding a latency
   sample or a histogram count, and refutes/joins are plain counters.
+- `tests/test_adaptive.c`: unit tests for the adaptive probe interval
+  — the default fast interval is half the base floored at 25 ms, no
+  suspects means the base interval whatever the fast setting, suspects
+  mean the configured fast interval (or the default when it is 0),
+  the fast interval is clamped to the 25 ms floor and never slower
+  than base, a base below the floor has nothing to speed up, and a
+  nonsense base falls back to the floor instead of spinning.
 - `tests/test_control.sh`: integration test for the TCP control plane —
   `MEMBERS` lists the node itself, `STATUS` reports id and totals,
   `METRICS` reports zero counts and no samples on a fresh node and
@@ -663,6 +717,16 @@ make test
   and `--bind 127.0.0.1` nodes join normally, and mixed families do
   not merge (each side GCs the unanswering cross-family seed and
   neither side ever learns the other's id).
+- `tests/test_adaptive.sh`: integration test for the adaptive probe
+  interval — a 3-node cluster converges, a killed node is suspected
+  by both survivors, and while it is SUSPECT the survivors log an
+  `ADAPTIVE fast` line and run probe cycles at the fast interval (a
+  node started with `--probe-interval-fast-ms 40` logs probe=40ms, a
+  default node logs probe=50ms), `METRICS` and `JSON` report
+  `adaptive_fast_cycles` above zero, and once the dead peer is
+  declared DEAD the survivors log `ADAPTIVE probe=100ms stable` — the
+  speedup only lasts while the cluster is actually unstable. A stable
+  cluster logs no `ADAPTIVE` line at all.
 
 ## Roadmap
 
@@ -683,3 +747,4 @@ make test
 - ~~SYNC replies only on new information: a SYNC is answered with the receiver's full table only when the exchange taught it something new (new/revived sender, refutation, or a merged entry that added or changed a member); a SYNC that changes nothing gets no reply, fixing the 0.13.0 reply ping-pong in which a converged pair burned a CPU core exchanging identical tables forever.~~ Done in 0.15.0.
 - ~~Gossip delta encoding: instead of sending the full membership table in every gossip exchange, send only entries that changed since the peer's last known version (per-peer versions tracked from a table version bumped on every change, each entry stamped with the version it last changed at), falling back to a full SYNC when the peer has no recorded version or is more than a digest's worth of changes behind; a converged cluster sends no gossip bytes at all until something changes, and the periodic anti-entropy SYNC heals any delta lost to UDP.~~ Done in 0.16.0.
 - ~~Detection-latency histogram: the locally measured detection latencies are bucketed (<100, 100–249, 250–499, 500–999, ≥1000 ms) alongside the existing mean/max, and exposed as `hist` in the `METRICS` text line and as `detect_latency_ms.hist` in `JSON`, so the mean cannot hide a slow tail — a detection that usually lands in ~200 ms but sometimes takes over a second is exactly what the ward-device use case needs to see.~~ Done in 0.17.0.
+- ~~Adaptive probe interval: while any peer is SUSPECT the probe cycle shortens from the base interval to a fast interval (default half the base, `--probe-interval-fast-ms` to set it, floored at 25 ms, never slower than base), so direct probes, indirect PING_REQ, the suspect-to-dead sweep and gossip rounds all run faster exactly while the cluster is mid-incident, then return to base when the table is suspect-free; each switch is logged as an `ADAPTIVE` line and the fast cycles are counted as `adaptive_fast_cycles` in `METRICS` and `JSON`.~~ Done in 0.18.0.

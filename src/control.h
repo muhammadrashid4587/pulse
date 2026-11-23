@@ -29,11 +29,15 @@
  *   METRICS
  *       One line of failure-detector metrics, then END:
  *       METRICS suspected=N dead=N refutes=N joins=N
+ *           adaptive_fast_cycles=N
  *           detect_latency_ms mean=X max=Y samples=N
  *           suspect_to_dead_ms mean=X max=Y samples=N
  *       detect_latency_ms is last-direct-contact -> SUSPECT for
  *       suspicions this node detected itself (mean/max in ms, "-" when
  *       there are no samples); suspect_to_dead_ms is SUSPECT -> DEAD.
+ *       adaptive_fast_cycles counts probe cycles that ran at the fast
+ *       interval because a peer was SUSPECT (see "Adaptive probe
+ *       interval").
  *       Transitions learned from gossip bump the counts but add no
  *       latency sample, so samples can be smaller than the counts.
  *   JSON

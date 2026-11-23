@@ -182,11 +182,13 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
     metrics_detect_hist_json(&m, dhist, sizeof dhist);
     w = snprintf(buf + used, sizeof buf - used,
         "],\"metrics\":{\"suspected\":%lld,\"dead\":%lld,\"refutes\":%lld,"
-        "\"joins\":%lld,\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
+        "\"joins\":%lld,\"adaptive_fast_cycles\":%lld,"
+        "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
         "\"max\":%lld,\"samples\":%lld}}}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
-        (long long)m.joins, dmean, (long long)m.detect_max_ms,
+        (long long)m.joins, (long long)m.adaptive_fast_cycles,
+        dmean, (long long)m.detect_max_ms,
         (long long)m.detect_samples, dhist, smean,
         (long long)m.suspect_dead_max_ms,
         (long long)m.suspect_dead_samples);

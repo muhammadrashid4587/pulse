@@ -26,6 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "adaptive.h"
 #include "gossip.h"
 #include "member.h"
 #include "metrics.h"
@@ -50,6 +51,9 @@ typedef struct {
     char seeds[16][PULSE_ID_LEN];
     int seed_count;
     int probe_interval_ms;
+    int probe_interval_fast_ms; /* fast probe interval while any peer
+                                   is SUSPECT, 0 = half the base
+                                   interval (see adaptive.h) */
     int ack_timeout_ms;
     int suspect_timeout_ms;
     int64_t dead_retention_ms; /* how long a DEAD entry stays in the table */
@@ -915,10 +919,43 @@ static void *control_thread(void *arg) {
 static void *prober_thread(void *arg) {
     (void)arg;
     int cycle = 0;
+    /* The interval the loop is currently sleeping: log only when it
+     * changes, so a stable cluster does not spam the log every cycle.
+     * Each iteration re-counts suspects and re-derives the interval
+     * from the base and fast settings (see adaptive.h): while any peer
+     * is SUSPECT the cycle shortens so direct probes, indirect
+     * PING_REQ, the suspect-to-dead sweep and gossip rounds all run
+     * faster, and it goes back to base the moment the table is
+     * suspect-free. The cycle-based cadences inside probe_cycle (the
+     * ~5 s seed rejoin, the anti-entropy SYNC, the gossip round every
+     * other cycle) are counted in cycles, so they speed up in wall
+     * time along with the loop while the cluster is unstable — that
+     * is the point. */
+    int current_interval_ms = g_cfg.probe_interval_ms;
     while (!g_stop) {
+        int n_suspect;
+        pthread_mutex_lock(&g_lock);
+        n_suspect = member_count_state(&g_table, MEMBER_SUSPECT);
+        pthread_mutex_unlock(&g_lock);
+        int interval = pulse_adaptive_interval_ms(g_cfg.probe_interval_ms,
+                                                  g_cfg.probe_interval_fast_ms,
+                                                  n_suspect);
+        if (interval != current_interval_ms) {
+            if (interval < g_cfg.probe_interval_ms)
+                log_line("ADAPTIVE fast probe=%dms suspects=%d", interval,
+                         n_suspect);
+            else
+                log_line("ADAPTIVE probe=%dms stable", interval);
+            current_interval_ms = interval;
+        }
+        if (interval < g_cfg.probe_interval_ms) {
+            pthread_mutex_lock(&g_lock);
+            metrics_note_adaptive_fast(&g_metrics);
+            pthread_mutex_unlock(&g_lock);
+        }
         struct timespec ts;
-        ts.tv_sec = g_cfg.probe_interval_ms / 1000;
-        ts.tv_nsec = (long)(g_cfg.probe_interval_ms % 1000) * 1000000L;
+        ts.tv_sec = interval / 1000;
+        ts.tv_nsec = (long)(interval % 1000) * 1000000L;
         nanosleep(&ts, NULL);
         if (g_stop) break;
         probe_cycle(++cycle);
@@ -930,6 +967,7 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s --port PORT [--id ID] [--seed HOST:PORT]...\n"
             "       [--data-dir DIR] [--probe-interval-ms N]\n"
+            "       [--probe-interval-fast-ms N]\n"
             "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
             "       [--dead-retention SECONDS]\n"
             "       [--phi-accrual] [--phi-threshold N]\n"
@@ -945,6 +983,7 @@ int main(int argc, char **argv) {
     g_cfg.port = -1;
     snprintf(g_cfg.data_dir, sizeof g_cfg.data_dir, ".");
     g_cfg.probe_interval_ms = 100;
+    g_cfg.probe_interval_fast_ms = 0; /* default: half the base interval */
     g_cfg.ack_timeout_ms = 100;
     g_cfg.suspect_timeout_ms = 300;
     g_cfg.dead_retention_ms = 60000; /* 60 s */
@@ -970,6 +1009,9 @@ int main(int argc, char **argv) {
             snprintf(g_cfg.data_dir, sizeof g_cfg.data_dir, "%s", argv[++i]);
         } else if (strcmp(argv[i], "--probe-interval-ms") == 0 && i + 1 < argc) {
             g_cfg.probe_interval_ms = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--probe-interval-fast-ms") == 0 &&
+                   i + 1 < argc) {
+            g_cfg.probe_interval_fast_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ack-timeout-ms") == 0 && i + 1 < argc) {
             g_cfg.ack_timeout_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--suspect-timeout-ms") == 0 && i + 1 < argc) {
