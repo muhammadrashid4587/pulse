@@ -42,6 +42,19 @@ typedef struct {
     int64_t suspect_dead_samples;
     int64_t suspect_dead_sum_ms;
     int64_t suspect_dead_max_ms;
+    /* Suspicion-refutation window (0.19.0): SUSPECT -> ALIVE
+     * transitions, i.e. suspicions that turned out wrong — the peer
+     * was alive after all (a slow peer, a dropped probe, a transient
+     * partition). refute latency is how long the peer sat SUSPECT
+     * before coming back: the window a false suspicion stays visible
+     * to the cluster. A DEAD peer coming back is a restart, not a
+     * refutation, and is not counted here. Like the other latencies,
+     * only locally revived peers (direct contact) add a sample; a
+     * refutation learned from gossip bumps the count only. */
+    int64_t suspect_refuted;
+    int64_t refute_samples;
+    int64_t refute_sum_ms;
+    int64_t refute_max_ms;
     /* Adaptive probe interval (0.18.0): probe cycles that ran at the
      * fast interval because at least one peer was SUSPECT. Zero on a
      * cluster that never had a suspect; it is the only trace that the
@@ -60,14 +73,19 @@ void metrics_note_suspect(pulse_metrics_t *m, int64_t latency_ms);
 void metrics_note_dead(pulse_metrics_t *m, int64_t duration_ms);
 void metrics_note_refute(pulse_metrics_t *m);
 void metrics_note_join(pulse_metrics_t *m);
+/* A suspicion was refuted: a peer marked SUSPECT came back ALIVE.
+ * duration_ms is how long it sat SUSPECT, or -1 when it was learned
+ * from gossip and there is nothing local to measure. */
+void metrics_note_suspect_refuted(pulse_metrics_t *m, int64_t duration_ms);
 /* One probe cycle ran at the fast interval (a peer was SUSPECT). */
 void metrics_note_adaptive_fast(pulse_metrics_t *m);
 
 /* Format one METRICS line (no trailing newline) into buf:
  *   METRICS suspected=N dead=N refutes=N joins=N
- *           adaptive_fast_cycles=N
+ *           adaptive_fast_cycles=N suspect_refuted=N
  *           detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e]
  *           suspect_to_dead_ms mean=X max=Y samples=N
+ *           refute_latency_ms mean=X max=Y samples=N
  * mean/max are "-" when there are no samples. The histogram is
  * always present (all zeros before any sample). */
 void metrics_format(const pulse_metrics_t *m, char *buf, size_t len);

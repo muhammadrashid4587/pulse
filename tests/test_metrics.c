@@ -96,6 +96,27 @@ int main(void) {
     metrics_format(&m, buf, sizeof buf);
     CHECK(strstr(buf, "refutes=2 joins=1") != NULL);
 
+    /* A refuted suspicion: a peer that sat SUSPECT came back ALIVE.
+     * Locally revived peers record how long the suspicion lasted;
+     * a refutation learned from gossip counts but adds no sample. */
+    CHECK(m.suspect_refuted == 0);
+    CHECK(m.refute_samples == 0);
+    metrics_format(&m, buf, sizeof buf);
+    CHECK(strstr(buf, "suspect_refuted=0") != NULL);
+    CHECK(strstr(buf, "refute_latency_ms mean=- max=- samples=0") != NULL);
+    metrics_note_suspect_refuted(&m, 120);
+    metrics_note_suspect_refuted(&m, 300);
+    CHECK(m.suspect_refuted == 2);
+    CHECK(m.refute_samples == 2);
+    CHECK(m.refute_sum_ms == 420);
+    CHECK(m.refute_max_ms == 300);
+    metrics_note_suspect_refuted(&m, -1);
+    CHECK(m.suspect_refuted == 3);
+    CHECK(m.refute_samples == 2);
+    metrics_format(&m, buf, sizeof buf);
+    CHECK(strstr(buf, "suspect_refuted=3") != NULL);
+    CHECK(strstr(buf, "refute_latency_ms mean=210 max=300 samples=2") != NULL);
+
     printf("test_metrics: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -60,6 +60,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_leave.sh
 	bash tests/test_join_sync.sh
 	bash tests/test_adaptive.sh
+	bash tests/test_refute.sh
 
 clean:
 	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive

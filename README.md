@@ -95,6 +95,14 @@ building block, not a production service mesh.
   The speedup is counted as `adaptive_fast_cycles` in `METRICS` and
   `JSON`, and each switch is logged as an `ADAPTIVE` line. See
   "Adaptive probe interval" below.
+- Suspicion-refutation window: when a peer marked SUSPECT comes back
+  ALIVE — a slow peer, a dropped probe, a transient partition — the
+  suspicion is counted as refuted, and the time the peer sat SUSPECT
+  is recorded as a refute latency (mean/max/samples) in `METRICS`
+  and `JSON` as `suspect_refuted` / `refute_latency_ms`, so an
+  operator can see how long false suspicions stay visible to the
+  cluster. A DEAD peer coming back is a restart, not a refutation,
+  and is not counted. See "Suspicion-refutation window" below.
 
 ## What it is not
 
@@ -265,11 +273,11 @@ the port beyond localhost.
 # OK 127.0.0.1:17102
 
 ./pulse-ctl 127.0.0.1:18401 METRICS
-# METRICS suspected=1 dead=1 refutes=0 joins=2 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1
+# METRICS suspected=1 dead=1 refutes=0 joins=2 adaptive_fast_cycles=3 suspect_refuted=0 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1 refute_latency_ms mean=- max=- samples=0
 # END
 
 ./pulse-ctl 127.0.0.1:18401 JSON
-# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1}}}
+# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}}}
 # END
 ```
 
@@ -286,7 +294,7 @@ Commands:
 | `MEMBERS` | One `MEMBER <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <phi\|->` line per member, then `END`. Phi is the peer's current phi (two decimals) when phi-accrual is on and the peer has heartbeat history; `-` otherwise, including self. |
 | `STATUS` | One `STATUS id=<self> uptime=<seconds> alive=N suspect=N dead=N total=N` line, then `END`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
-| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. |
+| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. |
 | `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Built for tooling that polls cluster state without scraping the text protocol. |
 | anything else | `ERR unknown command` |
 
@@ -590,6 +598,36 @@ do not change — `--ack-timeout-ms` and `--suspect-timeout-ms` are
 still wall-clock durations — so the fast interval only makes the
 checks that enforce them run more often, it never redefines them.
 
+## Suspicion-refutation window
+
+Not every suspicion is a death. A peer can go quiet for a probe
+cycle or two — a scheduling stall, a burst of dropped packets, a
+ward device busy with a firmware write — and come straight back.
+The detector already handles that correctly (direct contact is
+proof of life), but until now it left no trace: `suspected` counted
+the scare and nothing counted the all-clear.
+
+So a SUSPECT that comes back ALIVE is now counted as a refuted
+suspicion (`suspect_refuted` in `METRICS` and `JSON`), and the time
+it spent SUSPECT is recorded as a refute latency — mean, max, and
+sample count — alongside the detection latency and the
+suspect-to-dead duration. The three latencies together describe the
+whole life of a suspicion: how fast it was raised, how long a false
+one stayed visible, and how long a true one took to confirm.
+
+The same local-vs-gossip split applies as for the other latencies:
+a peer revived by direct contact (it answered a probe, or sent a
+message) adds a measured sample, because the local table knows
+exactly when the suspicion started; a refutation learned from
+gossip — the peer refuted the verdict at a higher incarnation and
+another node spread the news — bumps the count without a sample.
+And a DEAD peer coming back is a restart, not a refutation: it was
+declared dead and rejoined, so it is not counted here. On a healthy
+cluster the refute latency stays short (a few hundred milliseconds
+at most); a refute latency that keeps approaching the suspect
+timeout means the cluster is flapping on the edge of declaring live
+peers dead, and the timeouts or the network deserve a look.
+
 ## Tests
 
 ```sh
@@ -728,6 +766,14 @@ make test
   speedup only lasts while the cluster is actually unstable. A stable
   cluster logs no `ADAPTIVE` line at all.
 
+- `tests/test_refute.sh`: integration test for the
+  suspicion-refutation window — a 2-node cluster converges, node 2
+  is frozen with SIGSTOP until node 1 suspects it, then resumed with
+  SIGCONT (with a stretched 2 s suspect timeout so the suspicion is
+  still open); node 1 logs ALIVE, never DEAD, and `METRICS` reports
+  `suspect_refuted=1` with one measured refute-latency sample, and
+  `JSON` carries the same count and latency group.
+
 ## Roadmap
 
 - ~~Garbage collection of old DEAD entries.~~ Done in 0.2.0.
@@ -748,3 +794,4 @@ make test
 - ~~Gossip delta encoding: instead of sending the full membership table in every gossip exchange, send only entries that changed since the peer's last known version (per-peer versions tracked from a table version bumped on every change, each entry stamped with the version it last changed at), falling back to a full SYNC when the peer has no recorded version or is more than a digest's worth of changes behind; a converged cluster sends no gossip bytes at all until something changes, and the periodic anti-entropy SYNC heals any delta lost to UDP.~~ Done in 0.16.0.
 - ~~Detection-latency histogram: the locally measured detection latencies are bucketed (<100, 100–249, 250–499, 500–999, ≥1000 ms) alongside the existing mean/max, and exposed as `hist` in the `METRICS` text line and as `detect_latency_ms.hist` in `JSON`, so the mean cannot hide a slow tail — a detection that usually lands in ~200 ms but sometimes takes over a second is exactly what the ward-device use case needs to see.~~ Done in 0.17.0.
 - ~~Adaptive probe interval: while any peer is SUSPECT the probe cycle shortens from the base interval to a fast interval (default half the base, `--probe-interval-fast-ms` to set it, floored at 25 ms, never slower than base), so direct probes, indirect PING_REQ, the suspect-to-dead sweep and gossip rounds all run faster exactly while the cluster is mid-incident, then return to base when the table is suspect-free; each switch is logged as an `ADAPTIVE` line and the fast cycles are counted as `adaptive_fast_cycles` in `METRICS` and `JSON`.~~ Done in 0.18.0.
+- ~~Suspicion-refutation window: a SUSPECT that comes back ALIVE is counted as a refuted suspicion (`suspect_refuted` in `METRICS` and `JSON`), with the time it sat SUSPECT recorded as a refute latency (mean/max/samples) — locally revived peers add a measured sample, gossip-learned refutations count only, and a DEAD peer coming back is a restart, not a refutation — so an operator can see how long false suspicions stay visible to the cluster.~~ Done in 0.19.0.

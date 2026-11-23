@@ -228,11 +228,20 @@ static void peer_set_known_version(const char *id, uint64_t version) {
 static void note_contact(const gmsg_t *msg,
                          const struct sockaddr_storage *addr) {
     int is_new, revived;
+    int64_t now = pulse_now_ms();
     pthread_mutex_lock(&g_lock);
-    is_new = member_find(&g_table, msg->from_id) == NULL;
+    member_t *before = member_find(&g_table, msg->from_id);
+    is_new = before == NULL;
+    /* A suspicion is refuted when a peer we marked SUSPECT answers us
+     * again: record how long it sat suspect. A DEAD peer coming back
+     * is a restart, not a refutation, so only SUSPECT counts. */
+    member_state_t prev = before ? before->state : MEMBER_ALIVE;
+    int64_t since = before ? before->state_since_ms : 0;
     revived = member_mark_alive(&g_table, msg->from_id, addr,
-                                msg->from_inc, pulse_now_ms());
+                                msg->from_inc, now);
     if (is_new) metrics_note_join(&g_metrics);
+    if (revived && prev == MEMBER_SUSPECT)
+        metrics_note_suspect_refuted(&g_metrics, now - since);
     pthread_mutex_unlock(&g_lock);
     if (is_new) {
         log_line("JOIN %s", msg->from_id);
@@ -275,10 +284,21 @@ static void handle_membership_msg(const gmsg_t *msg,
     member_state_t changed_states[8];
     int changed_count = 0;
     pthread_mutex_lock(&g_lock);
-    int is_new = member_find(&g_table, msg->from_id) == NULL;
+    member_t *sender_before = member_find(&g_table, msg->from_id);
+    int is_new = sender_before == NULL;
+    /* Same refutation window as direct contact: the sender is alive
+     * by direct contact too, so a SUSPECT sender coming back is a
+     * locally measured refutation. */
+    member_state_t sender_prev =
+        sender_before ? sender_before->state : MEMBER_ALIVE;
+    int64_t sender_since =
+        sender_before ? sender_before->state_since_ms : 0;
+    int64_t now = pulse_now_ms();
     int revived = member_mark_alive(&g_table, msg->from_id, from_addr,
-                                    msg->from_inc, pulse_now_ms());
+                                    msg->from_inc, now);
     if (is_new) metrics_note_join(&g_metrics);
+    if (revived && sender_prev == MEMBER_SUSPECT)
+        metrics_note_suspect_refuted(&g_metrics, now - sender_since);
     if (is_new || revived) learned = 1;
     for (int i = 0; i < msg->entry_count; i++) {
         const member_t *e = &msg->entries[i];
@@ -305,6 +325,14 @@ static void handle_membership_msg(const gmsg_t *msg,
                     metrics_note_suspect(&g_metrics, -1);
                 else if (after->state == MEMBER_DEAD)
                     metrics_note_dead(&g_metrics, -1);
+                else if (after->state == MEMBER_ALIVE &&
+                         prev == MEMBER_SUSPECT)
+                    /* A refutation learned from gossip: the peer
+                     * refuted the suspicion at a higher incarnation.
+                     * Count it, but there is no local window to
+                     * measure — the local entry may have been
+                     * suspected by gossip itself. */
+                    metrics_note_suspect_refuted(&g_metrics, -1);
             }
         }
         if ((r & MERGE_NEW) && new_count < 8) {

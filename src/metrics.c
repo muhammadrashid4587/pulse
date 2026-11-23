@@ -36,6 +36,15 @@ void metrics_note_dead(pulse_metrics_t *m, int64_t duration_ms) {
 
 void metrics_note_refute(pulse_metrics_t *m) { m->refutes++; }
 
+void metrics_note_suspect_refuted(pulse_metrics_t *m, int64_t duration_ms) {
+    m->suspect_refuted++;
+    if (duration_ms >= 0) {
+        m->refute_samples++;
+        m->refute_sum_ms += duration_ms;
+        if (duration_ms > m->refute_max_ms) m->refute_max_ms = duration_ms;
+    }
+}
+
 void metrics_note_join(pulse_metrics_t *m) { m->joins++; }
 
 void metrics_note_adaptive_fast(pulse_metrics_t *m) {
@@ -64,18 +73,22 @@ void metrics_detect_hist_json(const pulse_metrics_t *m, char *buf,
 }
 
 void metrics_format(const pulse_metrics_t *m, char *buf, size_t len) {
-    char detect[96], suspect_dead[96], hist[64];
+    char detect[96], suspect_dead[96], refute[96], hist[64];
     format_group(detect, sizeof detect, m->detect_samples, m->detect_sum_ms,
                  m->detect_max_ms);
     format_group(suspect_dead, sizeof suspect_dead, m->suspect_dead_samples,
                  m->suspect_dead_sum_ms, m->suspect_dead_max_ms);
+    format_group(refute, sizeof refute, m->refute_samples, m->refute_sum_ms,
+                 m->refute_max_ms);
     metrics_detect_hist_json(m, hist, sizeof hist);
     snprintf(buf, len,
              "METRICS suspected=%lld dead=%lld refutes=%lld joins=%lld "
-             "adaptive_fast_cycles=%lld "
-             "detect_latency_ms %s hist=[%s] suspect_to_dead_ms %s",
+             "adaptive_fast_cycles=%lld suspect_refuted=%lld "
+             "detect_latency_ms %s hist=[%s] suspect_to_dead_ms %s "
+             "refute_latency_ms %s",
              (long long)m->suspected, (long long)m->dead,
              (long long)m->refutes, (long long)m->joins,
-             (long long)m->adaptive_fast_cycles, detect, hist,
-             suspect_dead);
+             (long long)m->adaptive_fast_cycles,
+             (long long)m->suspect_refuted, detect, hist,
+             suspect_dead, refute);
 }
