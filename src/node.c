@@ -51,9 +51,23 @@ typedef struct {
     char data_dir[512];
     char seeds[16][PULSE_ID_LEN];
     int seed_count;
+    int seed_flag_count; /* seeds[0..seed_flag_count) came from --seed
+                            flags; the rest came from --peer-file, so a
+                            reload can rebuild the list as flags plus
+                            the file's current entries */
     char peer_file[512];   /* --peer-file path, "" = none: initial peers
                               read from a file instead of --seed flags
                               (see peerfile.h) */
+    char peer_file_seeds[16][PULSE_ID_LEN]; /* peers currently listed
+                            in --peer-file (excluding ones also named
+                            with --seed): the reload diffs against this */
+    int peer_file_seed_count;
+    char kept_peers[16][PULSE_ID_LEN]; /* peers removed from --peer-file
+                            but kept because they were ALIVE when the
+                            reload ran: a later reload drops them once
+                            they stop answering, instead of forgetting
+                            them the moment the file edit lands */
+    int kept_peer_count;
     int probe_interval_ms;
     int probe_interval_fast_ms; /* fast probe interval while any peer
                                    is SUSPECT, 0 = half the base
@@ -109,6 +123,11 @@ static control_hooks_t g_hooks;
 static pulse_metrics_t g_metrics;
 static int64_t g_start_ms = 0;
 static volatile sig_atomic_t g_stop = 0;
+/* Live peer-file reload (0.24.0): SIGHUP sets this flag and nothing
+ * else — the handler does no I/O — and the prober thread picks it up
+ * on its next cycle, where the reload runs under the normal lock
+ * discipline instead of inside a signal handler. */
+static volatile sig_atomic_t g_reload_peer_file = 0;
 static uint32_t g_seq = 1;
 static pending_probe_t g_pending[MAX_PENDING];
 static pending_indirect_t g_indirect[MAX_PENDING];
@@ -147,11 +166,33 @@ static void log_line(const char *fmt, ...) {
     pthread_mutex_unlock(&g_log_lock);
 }
 
+/* Copy an id between two PULSE_ID_LEN slots. Every id is
+ * NUL-terminated inside its slot by construction (all producers
+ * snprintf with PULSE_ID_LEN), so a whole-slot copy is exact.
+ * snprintf would work too, but gcc's fortify check cannot bound a
+ * variable-indexed array element and warns on it. */
+static void copy_id(char dst[PULSE_ID_LEN], const char *src) {
+    memcpy(dst, src, PULSE_ID_LEN);
+}
+
+/* Remove ids[idx] from a 16-slot id list by swapping in the last
+ * entry (order does not matter for seed lists). */
+static void list_swap_remove(char ids[][PULSE_ID_LEN], int *count,
+                             int idx) {
+    (*count)--;
+    if (idx != *count) copy_id(ids[idx], ids[*count]);
+}
+
 static void on_signal(int sig) {
     (void)sig;
     g_stop = 1;
     if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR);
     if (g_control_sock >= 0) shutdown(g_control_sock, SHUT_RDWR);
+}
+
+static void on_reload(int sig) {
+    (void)sig;
+    g_reload_peer_file = 1;
 }
 
 /* Incarnation survives restarts: the data dir holds a file with the next
@@ -587,11 +628,211 @@ static void *receiver_thread(void *arg) {
  * taken under the lock; the file write itself happens outside it. */
 #define PERSIST_EVERY_CYCLES 50
 
+/* Live peer-file reload (0.24.0): re-read --peer-file and merge the
+ * new list into the seed list.
+ *
+ * A peer newly listed in the file gets exactly the --seed treatment:
+ * it joins the seed list (so the ~5 s rejoin retry covers it), is
+ * added to the membership table, and gets a JOIN at once.
+ *
+ * A peer removed from the file is dropped from the seed list — but
+ * from the membership table only if it is currently unreachable. A
+ * peer that is still ALIVE stays a member: the file says who to seed
+ * from, the cluster says who is alive, and a file edit alone must
+ * never evict a live peer. It stays in the table until the normal
+ * failure path suspects, deads and GCs it, and it gets no more
+ * rejoin retries in the meantime — but it is remembered in a kept
+ * list, so a later reload drops it the moment it stops answering
+ * instead of forgetting it the moment the file edit lands. A peer
+ * that is SUSPECT, DEAD, or absent from the table is force-removed
+ * (with a tombstone, so gossip cannot resurrect it), and a peer that
+ * is also a --seed flag is never dropped at all — the flag outranks
+ * the file. Self is never dropped either.
+ *
+ * A reload that cannot read the file keeps the old list: a deleted
+ * or typo'd file must not drop the node to a solo start. Bad lines
+ * are logged and skipped, exactly as at startup. Runs on the prober
+ * thread: the file read and the JOIN sends happen outside g_lock,
+ * the seed-list and table updates under it (the rejoin block in
+ * probe_cycle reads the seed list under the same lock). */
+static void reload_peer_file(void) {
+    if (g_cfg.peer_file[0] == '\0') return; /* no file, nothing to do */
+    char peers[16][PULSE_ID_LEN];
+    int n_peers = 0, n_bad = 0;
+    if (pulse_peerfile_load(g_cfg.peer_file, peers, 16, &n_peers,
+                            &n_bad) != 0) {
+        log_line("PEERFILE reload %s: cannot read: %s", g_cfg.peer_file,
+                 strerror(errno));
+        return;
+    }
+    /* Peers already named with --seed flags stay seeds whatever the
+     * file says, so they take no part in the diff. */
+    char wanted[16][PULSE_ID_LEN];
+    int n_wanted = 0;
+    for (int i = 0; i < n_peers; i++) {
+        int is_flag = 0;
+        for (int j = 0; j < g_cfg.seed_flag_count; j++) {
+            if (strcmp(peers[i], g_cfg.seeds[j]) == 0) { is_flag = 1; break; }
+        }
+        if (!is_flag)
+            snprintf(wanted[n_wanted++], PULSE_ID_LEN, "%s", peers[i]);
+    }
+    char added[16][PULSE_ID_LEN], removed[16][PULSE_ID_LEN];
+    int n_added = 0, n_removed = 0;
+    pulse_peerfile_diff(g_cfg.peer_file_seeds, g_cfg.peer_file_seed_count,
+                        wanted, n_wanted, added, &n_added, removed,
+                        &n_removed);
+
+    typedef struct {
+        char id[PULSE_ID_LEN];
+        struct sockaddr_storage addr;
+    } join_action_t;
+    join_action_t joins[16];
+    int n_joins = 0;
+    char dropped[16][PULSE_ID_LEN];
+    int n_dropped = 0;
+    char kept[16][PULSE_ID_LEN];
+    int n_kept = 0;
+    int n_full = 0; /* added peers with no room left in the seed list */
+    int64_t now = pulse_now_ms();
+    pthread_mutex_lock(&g_lock);
+    /* Removals first: they free seed-list room for the additions. */
+    for (int i = 0; i < n_removed; i++) {
+        for (int j = 0; j < g_cfg.peer_file_seed_count; j++) {
+            if (strcmp(g_cfg.peer_file_seeds[j], removed[i]) == 0) {
+                memmove(&g_cfg.peer_file_seeds[j],
+                        &g_cfg.peer_file_seeds[j + 1],
+                        sizeof(g_cfg.peer_file_seeds[0]) *
+                            (g_cfg.peer_file_seed_count - j - 1));
+                g_cfg.peer_file_seed_count--;
+                break;
+            }
+        }
+        if (strcmp(removed[i], g_self_id) == 0) continue;
+        member_t *m = member_find(&g_table, removed[i]);
+        if (m && m->state == MEMBER_ALIVE) {
+            /* Remember it: a later reload drops it once it stops
+             * answering, instead of forgetting it the moment the
+             * file edit lands. */
+            if (g_cfg.kept_peer_count < 16) {
+                copy_id(g_cfg.kept_peers[g_cfg.kept_peer_count++],
+                        removed[i]);
+                copy_id(kept[n_kept++], removed[i]);
+            }
+        } else {
+            if (m) member_force_remove(&g_table, removed[i], now);
+            copy_id(dropped[n_dropped++], removed[i]);
+        }
+    }
+    for (int i = 0; i < n_added; i++) {
+        if (g_cfg.seed_flag_count + g_cfg.peer_file_seed_count >= 16) {
+            n_full++;
+            continue;
+        }
+        copy_id(g_cfg.peer_file_seeds[g_cfg.peer_file_seed_count++],
+                added[i]);
+        /* Back in the file after being kept: it is a seed again, so
+         * forget the kept record — the diff already put it in the
+         * added list, since it was never in peer_file_seeds. */
+        for (int j = 0; j < g_cfg.kept_peer_count; j++) {
+            if (strcmp(g_cfg.kept_peers[j], added[i]) == 0) {
+                list_swap_remove(g_cfg.kept_peers,
+                                 &g_cfg.kept_peer_count, j);
+                break;
+            }
+        }
+        struct sockaddr_storage addr;
+        if (member_parse_addr(added[i], &addr) != 0) continue;
+        if (!member_find(&g_table, added[i])) {
+            member_t *m = member_add(&g_table, added[i], &addr, 0);
+            if (m) m->state_since_ms = now;
+        }
+        if (addr.ss_family == g_family && n_joins < 16) {
+            copy_id(joins[n_joins].id, added[i]);
+            joins[n_joins].addr = addr;
+            n_joins++;
+        }
+    }
+    /* Re-examine the kept peers: a peer removed from the file while
+     * ALIVE stays a member, but only while it keeps answering. One
+     * that has since gone SUSPECT or DEAD is dropped now; one that
+     * already left the table (GC'd on its own) just leaves the kept
+     * list. A kept peer back in the file was re-added above, so it
+     * is gone from this list already and is not examined here. */
+    for (int i = 0; i < g_cfg.kept_peer_count;) {
+        int in_file = 0;
+        for (int j = 0; j < n_wanted; j++) {
+            if (strcmp(g_cfg.kept_peers[i], wanted[j]) == 0) {
+                in_file = 1;
+                break;
+            }
+        }
+        member_t *m = in_file
+                          ? NULL
+                          : member_find(&g_table, g_cfg.kept_peers[i]);
+        if (!in_file && m && m->state != MEMBER_ALIVE) {
+            member_force_remove(&g_table, g_cfg.kept_peers[i], now);
+            copy_id(dropped[n_dropped++], g_cfg.kept_peers[i]);
+            list_swap_remove(g_cfg.kept_peers,
+                             &g_cfg.kept_peer_count, i);
+        } else if (!in_file && !m) {
+            list_swap_remove(g_cfg.kept_peers,
+                             &g_cfg.kept_peer_count, i);
+        } else {
+            i++;
+        }
+    }
+    /* Rebuild the seed list as flags plus the file's current entries. */
+    g_cfg.seed_count = g_cfg.seed_flag_count;
+    for (int i = 0; i < g_cfg.peer_file_seed_count; i++) {
+        snprintf(g_cfg.seeds[g_cfg.seed_count++], PULSE_ID_LEN, "%s",
+                 g_cfg.peer_file_seeds[i]);
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    for (int i = 0; i < n_joins; i++)
+        gossip_send_join(g_send_sock, &joins[i].addr, g_self_id,
+                         g_incarnation);
+    for (int i = 0; i < n_added; i++) {
+        /* An added peer with no room never joined the seed list; the
+         * summary line counts it as skipped, not added. */
+        if (i < n_added - n_full)
+            log_line("PEERFILE ADD %s", added[i]);
+    }
+    for (int i = 0; i < n_dropped; i++)
+        log_line("PEERFILE DROP %s", dropped[i]);
+    for (int i = 0; i < n_kept; i++)
+        log_line("PEERFILE KEEP %s (still ALIVE)", kept[i]);
+    for (int i = 0; i < n_full; i++)
+        log_line("PEERFILE %s skipped: seed list full (16)",
+                 added[n_added - n_full + i]);
+    /* kept= is the peers still held in the kept list after this
+     * reload — removed from the file, still ALIVE, dropped by a
+     * later reload once they stop answering. */
+    if (n_bad > 0)
+        log_line("PEERFILE RELOAD %s peers=%d added=%d dropped=%d kept=%d (%d bad lines skipped)",
+                 g_cfg.peer_file, n_peers, n_added - n_full, n_dropped,
+                 g_cfg.kept_peer_count, n_bad);
+    else
+        log_line("PEERFILE RELOAD %s peers=%d added=%d dropped=%d kept=%d",
+                 g_cfg.peer_file, n_peers, n_added - n_full, n_dropped,
+                 g_cfg.kept_peer_count);
+}
+
 /* One probe cycle: ping a random peer, escalate timed-out probes to
  * indirect probes, suspect peers whose indirect probes also fail, sweep
  * stale suspects to dead, gossip a digest, and log a STATUS line. */
 static void probe_cycle(int cycle) {
     int64_t now = pulse_now_ms();
+
+    /* 0. Live peer-file reload (0.24.0): SIGHUP sets a flag (the
+     * handler itself does no I/O); the prober picks it up here, on
+     * its own thread, so the reload runs under the normal lock
+     * discipline instead of inside a signal handler. */
+    if (g_reload_peer_file) {
+        g_reload_peer_file = 0;
+        reload_peer_file();
+    }
 
     /* 1. Probe a random peer. In phi-accrual mode the PING still goes
      * out (it is the stimulus that produces heartbeats), but no pending
@@ -1232,6 +1473,7 @@ int main(int argc, char **argv) {
      * while they are not ALIVE. A missing or unreadable file is a
      * clean startup error, not an empty peer list: silently starting
      * alone would hide a typo'd path and leave the node isolated. */
+    g_cfg.seed_flag_count = g_cfg.seed_count;
     int n_peers = 0, n_peer_bad = 0, n_peer_dropped = 0;
     if (g_cfg.peer_file[0] != '\0') {
         char peers[16][PULSE_ID_LEN];
@@ -1242,9 +1484,23 @@ int main(int argc, char **argv) {
             return 2;
         }
         for (int i = 0; i < n_peers; i++) {
+            /* A peer already named with --seed stays a seed on the
+             * strength of the flag: the file must not duplicate it
+             * in the seed list, and a later reload must not drop it
+             * when the file stops listing it. Record the file's own
+             * seeds separately so the reload can diff against them. */
+            int is_flag = 0;
+            for (int j = 0; j < g_cfg.seed_flag_count; j++) {
+                if (strcmp(peers[i], g_cfg.seeds[j]) == 0) {
+                    is_flag = 1;
+                    break;
+                }
+            }
+            if (is_flag) continue;
             if (g_cfg.seed_count < 16) {
-                snprintf(g_cfg.seeds[g_cfg.seed_count++], PULSE_ID_LEN,
-                         "%s", peers[i]);
+                copy_id(g_cfg.peer_file_seeds[g_cfg.peer_file_seed_count++],
+                        peers[i]);
+                copy_id(g_cfg.seeds[g_cfg.seed_count++], peers[i]);
             } else {
                 n_peer_dropped++;
             }
@@ -1478,6 +1734,20 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    /* Live peer-file reload (0.24.0): SIGHUP must survive repeated
+     * delivery, so it needs sigaction, not signal. With this file's
+     * strict _POSIX_C_SOURCE, glibc's signal() has System V
+     * semantics: the handler resets to SIG_DFL after the first
+     * delivery, and the second SIGHUP would kill the node. (SIGINT /
+     * SIGTERM above are one-shot shutdowns, so the reset is harmless
+     * there.) No SA_RESTART: the receiver already retries on EINTR,
+     * and the prober's nanosleep returning early just runs a cycle. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_reload;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGHUP, &sa, NULL);
 
     pthread_t receiver, prober;
     if (pthread_create(&receiver, NULL, receiver_thread, NULL) != 0) {

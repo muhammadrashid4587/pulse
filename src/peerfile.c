@@ -67,3 +67,29 @@ int pulse_peerfile_load(const char *path, char ids[][PULSE_ID_LEN],
     *bad_out = bad;
     return 0;
 }
+
+static int id_in_list(char ids[][PULSE_ID_LEN], int n, const char *id) {
+    for (int i = 0; i < n; i++) {
+        if (strcmp(ids[i], id) == 0) return 1;
+    }
+    return 0;
+}
+
+void pulse_peerfile_diff(char old_ids[][PULSE_ID_LEN], int old_n,
+                         char new_ids[][PULSE_ID_LEN], int new_n,
+                         char added[][PULSE_ID_LEN], int *n_added_out,
+                         char removed[][PULSE_ID_LEN], int *n_removed_out) {
+    int n_added = 0, n_removed = 0;
+    for (int i = 0; i < new_n; i++) {
+        if (!id_in_list(old_ids, old_n, new_ids[i]) &&
+            !id_in_list(added, n_added, new_ids[i]))
+            snprintf(added[n_added++], PULSE_ID_LEN, "%s", new_ids[i]);
+    }
+    for (int i = 0; i < old_n; i++) {
+        if (!id_in_list(new_ids, new_n, old_ids[i]) &&
+            !id_in_list(removed, n_removed, old_ids[i]))
+            snprintf(removed[n_removed++], PULSE_ID_LEN, "%s", old_ids[i]);
+    }
+    *n_added_out = n_added;
+    *n_removed_out = n_removed;
+}

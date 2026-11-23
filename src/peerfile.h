@@ -32,4 +32,19 @@
 int pulse_peerfile_load(const char *path, char ids[][PULSE_ID_LEN],
                         int max_ids, int *count_out, int *bad_out);
 
+/* Live peer-file reload (0.24.0): set difference between the peer list
+ * a node already has (old_ids, old_n) and the list just read from the
+ * file (new_ids, new_n). added[] gets the ids in new but not old,
+ * removed[] the ids in old but not new; *n_added_out / *n_removed_out
+ * are their counts. Both output arrays must hold at least max(old_n,
+ * new_n) entries. Duplicates inside one list collapse to a single
+ * entry. Pure set arithmetic: it says nothing about whether a removed
+ * peer may actually be dropped — the caller decides that from the
+ * membership table (a peer that is still ALIVE is kept, never dropped
+ * on the strength of a file edit alone). */
+void pulse_peerfile_diff(char old_ids[][PULSE_ID_LEN], int old_n,
+                         char new_ids[][PULSE_ID_LEN], int new_n,
+                         char added[][PULSE_ID_LEN], int *n_added_out,
+                         char removed[][PULSE_ID_LEN], int *n_removed_out);
+
 #endif

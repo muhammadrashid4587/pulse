@@ -127,6 +127,11 @@ building block, not a production service mesh.
   ignored) and joins the cluster without a `--seed` flag — bad lines
   are logged and skipped, a missing file is a clean startup error.
   See "Seedless bootstrap" below.
+- Live peer-file reload: while a `--peer-file` is in use, SIGHUP
+  re-reads the file — newly listed peers join the cluster, peers
+  removed from the file are dropped once they stop answering, and a
+  peer that is still ALIVE is never dropped on the strength of a
+  file edit alone. See "Live peer-file reload" below.
 
 ## What it is not
 
@@ -264,7 +269,11 @@ Each node logs timestamped events to stdout: `JOIN`, `SUSPECT`, `DEAD`,
 `GC` (a DEAD entry removed after its retention expired), `ALIVE`,
 `REFUTE`, `LEAVE` (this node announced its clean shutdown to its
 peers), `PEERS <n> from <file>` (initial peers loaded from a peer
-list file — see "Seedless bootstrap"), `SLOW <id> mean=Nms threshold=Mms` (a peer's mean probe RTT
+list file — see "Seedless bootstrap"), `PEERFILE RELOAD <file>
+peers=<n> added=<a> dropped=<d> kept=<k>` (a SIGHUP re-read the peer
+file — see "Live peer-file reload"), `PEERFILE ADD <id>` /
+`PEERFILE DROP <id>` / `PEERFILE KEEP <id> (still ALIVE)` (one line per
+peer the reload added, dropped, or kept), `SLOW <id> mean=Nms threshold=Mms` (a peer's mean probe RTT
 rose above `--slow-peer-rtt-ms`, once per slow episode — see
 "Slow-peer warning"), `SYNC <id>` (a periodic full-table exchange was sent to that
 peer), `ADAPTIVE fast probe=Nms suspects=N` when the probe interval
@@ -477,6 +486,65 @@ starting — because silently starting alone would hide a typo'd
 path and leave the node isolated with no sign anything was wrong.
 An empty file is not an error: a node with an empty peer file
 starts alone, exactly like one with no seeds.
+
+## Live peer-file reload
+
+The peer file is the cluster's roster, and rosters change: a ward
+device is added, one is retired, one is renumbered. Restarting a
+node to pick up the new roster would drop it out of the cluster and
+force a rejoin, so while a `--peer-file` is in use the node re-reads
+the file on SIGHUP — `kill -HUP <pid>` — and merges the new list
+into its seed list without restarting:
+
+```sh
+# Terminal 1: 3-node cluster from one shared peer file
+./pulse-node --port 17101 --peer-file peers --data-dir /tmp/p1
+# Edit peers: remove 127.0.0.1:17103, add 127.0.0.1:17104
+kill -HUP $(pgrep -f 'pulse-node --port 17101')
+# Node 1 logs PEERFILE ADD 127.0.0.1:17104 once node 4 starts, and
+# PEERFILE KEEP 127.0.0.1:17103 (still ALIVE) for the removed peer.
+```
+
+A peer newly listed in the file gets exactly the `--seed` treatment:
+it joins the seed list (so the ~5 s rejoin retry covers it while it
+is down), is added to the membership table, and gets a `JOIN` at
+once, so it merges as soon as it starts answering.
+
+A peer removed from the file is dropped from the seed list — but
+from the membership table only if it is currently unreachable. A
+peer that is still ALIVE stays a member: the file says who to seed
+from, the cluster says who is alive, and a file edit alone must
+never evict a live peer. It stays in the table until the normal
+failure path suspects, deads and GCs it, and it gets no more rejoin
+retries in the meantime — but the node remembers it in a kept list,
+so a later SIGHUP drops it the moment it stops answering instead of
+forgetting it the moment the file edit lands. A peer that is SUSPECT,
+DEAD, or absent from the table is force-removed at once, with a
+tombstone so gossip cannot resurrect it, and the drop is logged as
+`PEERFILE DROP <id>`; a kept peer is logged as `PEERFILE KEEP <id>
+(still ALIVE)`. Every reload ends with a summary line,
+`PEERFILE RELOAD <file> peers=<n> added=<a> dropped=<d> kept=<k>`,
+where `kept` is how many removed-but-live peers are still held.
+
+Three deliberate strictnesses. A peer also named with a `--seed`
+flag is never added or dropped by a reload: the flag outranks the
+file, so a flag peer stays a seed whatever the file says. Self is
+never dropped: a node that removes its own line from the file stays
+a member of its own cluster. And a reload that cannot read the file
+— deleted, permissions, a typo'd edit — keeps the old list and logs
+`PEERFILE reload <file>: cannot read: <reason>`, instead of dropping
+the node to a solo start; bad lines are logged and skipped, exactly
+as at startup. SIGHUP on a node with no `--peer-file` is a no-op:
+the node keeps running, logs nothing, and never restarts — SIGHUP
+never restarts a node, with or without a peer file.
+
+The reload runs on the prober thread, on its next cycle (within one
+probe interval): the SIGHUP handler itself only sets a flag, so no
+file I/O happens inside a signal handler. The handler is installed
+with `sigaction`, not `signal`: with this program's strict POSIX
+feature macros, `signal` has System V semantics and the handler
+would reset to the default after the first delivery, so the second
+SIGHUP would kill the node.
 
 ## Membership persistence
 
@@ -1026,7 +1094,11 @@ make test
   missing port, unparseable host) are skipped and counted,
   duplicates are dropped silently, CRLF endings work, the cap
   counts overflow as bad, an empty file loads zero peers, and a
-  missing file is an error.
+  missing file is an error. Live reload diff (0.24.0): the set
+  difference between the old list and the new one — added is in new
+  but not old, removed is in old but not new, identical lists diff
+  to nothing, an empty side adds or removes everything, and
+  duplicates inside one list collapse to a single entry.
 - `tests/test_peerfile.sh`: integration test for seedless bootstrap
   — a missing peer file is a clean startup error (nonzero exit, no
   `START` line), three nodes started with `--peer-file` and no
@@ -1034,6 +1106,20 @@ make test
   a blank line, and a bad line that is logged and skipped), and a
   node whose file lists a peer that never answers still joins the
   live cluster and GCs the dead entry.
+- `tests/test_peerfile_reload.sh`: integration test for live
+  peer-file reload on SIGHUP (0.24.0) — three nodes converge from
+  one shared file; node 3 is removed from the file while ALIVE and
+  a SIGHUP on node 1 logs `PEERFILE KEEP` while node 3 stays ALIVE
+  in the membership; node 3 is then killed, and once node 1
+  suspects it a second SIGHUP drops it at once (`PEERFILE DROP`,
+  alive=2 within seconds instead of waiting out the 30 s dead
+  retention, and gone from `JSON`); node 4 is added to the file and
+  started, and a SIGHUP logs `PEERFILE ADD` with the cluster back
+  to alive=3; a SIGHUP with an unchanged file reloads cleanly
+  (added=0 dropped=0 kept=0), and a bad line added to the file is
+  logged and skipped without disturbing the cluster; a SIGHUP on a
+  node with no `--peer-file` is a no-op and the node keeps running;
+  and no node restarts on SIGHUP (exactly one `START` line each).
 
 ## Roadmap
 
@@ -1060,3 +1146,4 @@ make test
 - ~~Probe RTT per peer: each node measures the round-trip time of its direct probes (PING send to ACK receipt) per peer and reports the last RTT and the mean over all answered probes per member in `JSON` as `rtt_ms` / `rtt_mean_ms` (`null` until a probe has been answered, always `null` for self), so an operator can see which peers are slow before they are ever suspected.~~ Done in 0.21.0.
 - ~~Slow-peer warning: a peer whose mean probe RTT rises above a configurable threshold (`--slow-peer-rtt-ms`, 0 = disabled) is flagged `"slow":true` per member in `JSON` with a `slow_peers` count in `METRICS` and `JSON`, and the node logs a `SLOW` line once per slow episode (cleared on recovery, so a re-crossing warns again) — the mean, not the last RTT, so one slow probe is noise and only a consistently slow peer warns, while the peer is still ALIVE instead of only after it is suspected.~~ Done in 0.22.0.
 - ~~Seedless bootstrap via a peer list file: a node reads its initial peers from a file (`--peer-file`, one `host:port` per line, comments and blank lines ignored), probes them on startup and joins the cluster without a `--seed` flag — the entries get exactly the `--seed` treatment (JOIN at startup, probing, ~5 s rejoin retry), bad lines are logged and skipped, and a missing file is a clean startup error instead of a silent solo start.~~ Done in 0.23.0.
+- ~~Live peer-file reload on SIGHUP: while a `--peer-file` is in use, SIGHUP re-reads the file and merges it into the seed list without restarting — newly listed peers get the `--seed` treatment (seed list, table, JOIN at once), peers removed from the file are dropped from the table only once they stop answering (a still-ALIVE peer is kept and remembered, so a later reload drops it the moment it goes quiet), a peer named with `--seed` is never added or dropped by a reload, self is never dropped, and a reload that cannot read the file keeps the old list; every reload is logged (`PEERFILE RELOAD` summary plus `ADD`/`DROP`/`KEEP` lines), and SIGHUP on a node with no `--peer-file` is a no-op.~~ Done in 0.24.0.

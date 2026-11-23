@@ -76,6 +76,46 @@ int main(void) {
     CHECK(count == 2);
     CHECK(bad == 1);
 
+    /* Live reload diff (0.24.0): added is in new but not old,
+     * removed is in old but not new, unchanged peers are in
+     * neither. */
+    char old_ids[16][PULSE_ID_LEN], new_ids[16][PULSE_ID_LEN];
+    char added[16][PULSE_ID_LEN], removed[16][PULSE_ID_LEN];
+    int n_added = -1, n_removed = -1;
+    snprintf(old_ids[0], PULSE_ID_LEN, "127.0.0.1:17601");
+    snprintf(old_ids[1], PULSE_ID_LEN, "127.0.0.1:17602");
+    snprintf(old_ids[2], PULSE_ID_LEN, "127.0.0.1:17603");
+    snprintf(new_ids[0], PULSE_ID_LEN, "127.0.0.1:17602");
+    snprintf(new_ids[1], PULSE_ID_LEN, "127.0.0.1:17603");
+    snprintf(new_ids[2], PULSE_ID_LEN, "127.0.0.1:17604");
+    pulse_peerfile_diff(old_ids, 3, new_ids, 3, added, &n_added,
+                        removed, &n_removed);
+    CHECK(n_added == 1);
+    CHECK(n_removed == 1);
+    CHECK(strcmp(added[0], "127.0.0.1:17604") == 0);
+    CHECK(strcmp(removed[0], "127.0.0.1:17601") == 0);
+    /* Identical lists: nothing added, nothing removed. */
+    pulse_peerfile_diff(old_ids, 3, old_ids, 3, added, &n_added,
+                        removed, &n_removed);
+    CHECK(n_added == 0);
+    CHECK(n_removed == 0);
+    /* Empty old list: everything is added. Empty new list:
+     * everything is removed. */
+    pulse_peerfile_diff(old_ids, 0, new_ids, 3, added, &n_added,
+                        removed, &n_removed);
+    CHECK(n_added == 3);
+    CHECK(n_removed == 0);
+    pulse_peerfile_diff(old_ids, 3, new_ids, 0, added, &n_added,
+                        removed, &n_removed);
+    CHECK(n_added == 0);
+    CHECK(n_removed == 3);
+    /* Duplicates inside one list collapse to a single entry. */
+    snprintf(new_ids[3], PULSE_ID_LEN, "127.0.0.1:17604");
+    pulse_peerfile_diff(old_ids, 3, new_ids, 4, added, &n_added,
+                        removed, &n_removed);
+    CHECK(n_added == 1);
+    CHECK(strcmp(added[0], "127.0.0.1:17604") == 0);
+
     unlink(path);
     printf("test_peerfile: %d checks, %d failures\n", checks, failures);
     return failures != 0;

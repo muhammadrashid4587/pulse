@@ -71,6 +71,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_refute.sh
 	bash tests/test_meta.sh
 	bash tests/test_peerfile.sh
+	bash tests/test_peerfile_reload.sh
 
 clean:
 	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile
