@@ -43,7 +43,13 @@
  * covered here too: METRICS and JSON report the number of WATCH
  * streams connected right now and the sessions served since startup,
  * rising as watchers connect and falling as they go away; the count
- * end to end is covered by tests/test_watch_subscribers.sh. */
+ * end to end is covered by tests/test_watch_subscribers.sh. WATCH
+ * delivery / drop counts (0.34.0) are covered here too: each stream
+ * counts the EVENT lines it sent, the events its filter skipped,
+ * and the events it lost to a gap in the event ring, and METRICS
+ * and JSON report the totals plus a per-stream breakdown keyed by
+ * session number; the counts end to end are covered by
+ * tests/test_watch_delivery.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -317,6 +323,25 @@ static int metrics_wait_contains(int port, const char *needle,
     }
 }
 
+/* Poll JSON until its object contains needle (or the timeout
+ * elapses). A WATCH thread consumes events on its own schedule, so
+ * a per-stream count in JSON lags the record by up to a wait cycle
+ * — the poll waits for the stream to have consumed instead of
+ * racing a single read. Returns 1 when found. */
+static int json_wait_contains(int port, const char *needle,
+                              int timeout_ms) {
+    char reply[4096];
+    int64_t deadline = pulse_now_ms() + timeout_ms;
+    for (;;) {
+        if (send_cmd(port, "JSON\n", reply, sizeof reply) > 0 &&
+            strstr(reply, needle) != NULL)
+            return 1;
+        if (pulse_now_ms() >= deadline) return 0;
+        struct timespec ts = {0, 100 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+}
+
 /* Records one event into the log after a short sleep, so the
  * wakeup path of pulse_event_wait is exercised from another
  * thread instead of only the already-buffered path. */
@@ -523,7 +548,8 @@ int main(void) {
                  "slow_peers=0 peer_file=/tmp/peers "
                  "last_reload=1700000000 last_mtime=1699999000 "
                  "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
-                 "pf_bad=0 watch_subscribers=0 watch_sessions=0\nEND\n") == 0);
+                 "pf_bad=0 watch_subscribers=0 watch_sessions=0 "
+                 "watch_delivered=0 watch_filtered=0 watch_dropped=0\nEND\n") == 0);
 
     /* JSON (0.28.0): the same state as a "peer_file" object, and
      * each member carries its "source" — the peer-file peer is
@@ -636,7 +662,10 @@ int main(void) {
             18991, "watch_subscribers=1 watch_sessions=2", 5000));
         CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
         CHECK(strstr(reply,
-                     "\"watch\":{\"subscribers\":1,\"sessions\":2}") != NULL);
+                     "\"watch\":{\"subscribers\":1,\"sessions\":2,"
+                     "\"delivered\":2,\"filtered\":0,\"dropped\":0,"
+                     "\"streams\":[{\"session\":2,\"delivered\":0,"
+                     "\"filtered\":0,\"dropped\":0}]}") != NULL);
         int tfd = watch_connect(18991);
         CHECK(tfd >= 0);
         if (tfd >= 0) {
@@ -659,7 +688,9 @@ int main(void) {
             18991, "watch_subscribers=0 watch_sessions=3", 5000));
         CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
         CHECK(strstr(reply,
-                     "\"watch\":{\"subscribers\":0,\"sessions\":3}") != NULL);
+                     "\"watch\":{\"subscribers\":0,\"sessions\":3,"
+                     "\"delivered\":2,\"filtered\":0,\"dropped\":0,"
+                     "\"streams\":[]}") != NULL);
     }
 
     /* WATCH filter (0.30.0): a type list, an id list, or both narrows
@@ -896,6 +927,139 @@ int main(void) {
         CHECK(strstr(hbuf, "EVENT ") == NULL);
         CHECK(strstr(hbuf, "HEARTBEAT ") != NULL);
         close(hfd);
+    }
+
+    /* WATCH delivery / drop counts (0.34.0): each stream counts
+     * the EVENT lines it sent (delivered), the events it consumed
+     * but skipped because its type/id filter excluded them
+     * (filtered), and the events it lost because they had already
+     * scrolled out of the bounded event ring before the stream
+     * could consume them (dropped). METRICS reports the three as
+     * lifetime totals; JSON carries the same three totals in the
+     * "watch" object plus a "streams" array with the same three
+     * counts per currently-connected stream, keyed by its session
+     * number. The log holds seqs 1-141 here and sessions 1-10 are
+     * done, so the streams below are sessions 11-13. A plain
+     * WATCH that receives two live events reports delivered=2; a
+     * WATCH DEAD that sees two non-DEAD events reports filtered=2
+     * and delivered=0; and a WATCH FROM 2 against a ring whose
+     * oldest held seq is 18 reports dropped=16 and replays the
+     * 128 buffered events as delivered=128. The lifetime totals in
+     * METRICS are not asserted exactly: a just-closed stream's
+     * thread lingers up to a second before it notices the close,
+     * and if events are recorded in that window the lingering
+     * thread consumes them — delivering some to a dead socket,
+     * filtering some, or hitting a gap when the ring scrolls past
+     * it — so the totals depend on thread-exit timing. The
+     * per-stream counts are exact, and the totals path itself
+     * (all three zero before any WATCH connects) is covered by
+     * the exact METRICS line above. */
+    CHECK(metrics_wait_contains(
+        18991, "watch_subscribers=0 watch_sessions=10", 5000));
+    int cfd = watch_connect(18991);
+    CHECK(cfd >= 0);
+    if (cfd >= 0) {
+        const char *ccmd = "WATCH\n";
+        CHECK(send(cfd, ccmd, strlen(ccmd), 0) == (ssize_t)strlen(ccmd));
+        char cbuf[4096];
+        size_t clen = 0;
+        cbuf[0] = '\0';
+        CHECK(watch_read_until(cfd, cbuf, sizeof cbuf, &clen, "END\n",
+                               3000));
+        CHECK(strncmp(cbuf, "OK watching\n", 12) == 0);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=1 watch_sessions=11", 5000));
+        pulse_event_record(&g_watch_log, PULSE_EVENT_JOINED,
+                           "127.0.0.1:17901", 1, 1700000400);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_SUSPECTED,
+                           "127.0.0.1:17903", 2, 1700000401);
+        CHECK(watch_read_until(cfd, cbuf, sizeof cbuf, &clen,
+                               "EVENT 142 JOINED 127.0.0.1:17901 1 1700000400\n",
+                               3000));
+        CHECK(watch_read_until(cfd, cbuf, sizeof cbuf, &clen,
+                               "EVENT 143 SUSPECTED 127.0.0.1:17903 2 1700000401\n",
+                               3000));
+        /* The per-stream counts ride in JSON: session 11
+         * delivered both events, filtered and dropped nothing. */
+        CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+        CHECK(strstr(reply,
+                     "\"session\":11,\"delivered\":2,\"filtered\":0,"
+                     "\"dropped\":0") != NULL);
+        close(cfd);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=0 watch_sessions=11", 5000));
+    }
+    int dfd = watch_connect(18991);
+    CHECK(dfd >= 0);
+    if (dfd >= 0) {
+        const char *dcmd = "WATCH DEAD\n";
+        CHECK(send(dfd, dcmd, strlen(dcmd), 0) == (ssize_t)strlen(dcmd));
+        char dbuf[4096];
+        size_t dlen = 0;
+        dbuf[0] = '\0';
+        CHECK(watch_read_until(dfd, dbuf, sizeof dbuf, &dlen, "END\n",
+                               3000));
+        CHECK(strncmp(dbuf, "OK watching\n", 12) == 0);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=1 watch_sessions=12", 5000));
+        /* Two non-DEAD events: both are consumed and skipped by
+         * the filter, so filtered grows by two and delivered
+         * stays at zero. The poll waits for the stream thread to
+         * have consumed them — a single JSON read right after
+         * recording would race it. */
+        pulse_event_record(&g_watch_log, PULSE_EVENT_JOINED,
+                           "127.0.0.1:17901", 1, 1700000402);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_SUSPECTED,
+                           "127.0.0.1:17903", 2, 1700000403);
+        /* The poll waits for the stream thread to have consumed
+         * both events — a single JSON read right after recording
+         * would race it. */
+        CHECK(json_wait_contains(
+            18991,
+            "\"session\":12,\"delivered\":0,\"filtered\":2,\"dropped\":0",
+            5000));
+        CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+        CHECK(strstr(reply,
+                     "\"session\":12,\"delivered\":0,\"filtered\":2,"
+                     "\"dropped\":0") != NULL);
+        CHECK(strstr(dbuf, "EVENT 144 ") == NULL);
+        CHECK(strstr(dbuf, "EVENT 145 ") == NULL);
+        close(dfd);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=0 watch_sessions=12", 5000));
+    }
+    /* A WATCH FROM 2 against a ring whose oldest held seq is 18
+     * (seqs 1-145 recorded, the ring holds the last 128): the
+     * stream signals GAP 2 18, counts the 16 lost events as
+     * dropped, and replays the 128 buffered events as delivered.
+     * The buffer is 16 KB: 128 EVENT lines plus the snapshot run
+     * to about 7 KB. */
+    int qfd = watch_connect(18991);
+    CHECK(qfd >= 0);
+    if (qfd >= 0) {
+        const char *qcmd = "WATCH FROM 2\n";
+        CHECK(send(qfd, qcmd, strlen(qcmd), 0) == (ssize_t)strlen(qcmd));
+        char qbuf[16384];
+        size_t qlen = 0;
+        qbuf[0] = '\0';
+        CHECK(watch_read_until(qfd, qbuf, sizeof qbuf, &qlen, "END\n",
+                               3000));
+        CHECK(strncmp(qbuf, "OK watching\n", 12) == 0);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=1 watch_sessions=13", 5000));
+        CHECK(watch_read_until(qfd, qbuf, sizeof qbuf, &qlen,
+                               "GAP 2 18\n", 3000));
+        CHECK(watch_read_until(qfd, qbuf, sizeof qbuf, &qlen,
+                               "EVENT 145 SUSPECTED 127.0.0.1:17903 2 1700000403\n",
+                               3000));
+        CHECK(strstr(qbuf, "EVENT 17 ") == NULL);
+        CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+        CHECK(strstr(reply,
+                     "\"session\":13,\"delivered\":128,\"filtered\":0,"
+                     "\"dropped\":16") != NULL);
+        close(qfd);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=0 watch_sessions=13", 5000));
     }
 
     /* A bad filter is refused up front, and the connection closes. */

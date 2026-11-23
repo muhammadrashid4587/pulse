@@ -338,11 +338,11 @@ the port beyond localhost.
 # END
 
 ./pulse-ctl 127.0.0.1:18401 METRICS
-# METRICS suspected=1 dead=1 refutes=0 joins=2 adaptive_fast_cycles=3 suspect_refuted=0 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1 refute_latency_ms mean=- max=- samples=0 slow_peers=0 peer_file=peers last_reload=1795450000 last_mtime=1795449900 pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=0 pf_bad=0 watch_subscribers=0 watch_sessions=0
+# METRICS suspected=1 dead=1 refutes=0 joins=2 adaptive_fast_cycles=3 suspect_refuted=0 detect_latency_ms mean=203 max=203 samples=1 hist=[0,0,1,0,0] suspect_to_dead_ms mean=301 max=301 samples=1 refute_latency_ms mean=- max=- samples=0 slow_peers=0 peer_file=peers last_reload=1795450000 last_mtime=1795449900 pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=0 pf_bad=0 watch_subscribers=0 watch_sessions=0 watch_delivered=0 watch_filtered=0 watch_dropped=0
 # END
 
 ./pulse-ctl 127.0.0.1:18401 JSON
-# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null,"slow":false,"source":"self"},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42,"meta":{},"rtt_ms":1,"rtt_mean_ms":0,"slow":false,"source":"peer-file"}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"slow_peers":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}},"peer_file":{"path":"peers","last_reload":1795450000,"last_mtime":1795449900,"peers":3,"added":1,"dropped":0,"kept":0,"bad":0},"watch":{"subscribers":0,"sessions":0}}
+# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null,"slow":false,"source":"self"},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42,"meta":{},"rtt_ms":1,"rtt_mean_ms":0,"slow":false,"source":"peer-file"}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"slow_peers":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}},"peer_file":{"path":"peers","last_reload":1795450000,"last_mtime":1795449900,"peers":3,"added":1,"dropped":0,"kept":0,"bad":0},"watch":{"subscribers":0,"sessions":0,"delivered":0,"filtered":0,"dropped":0,"streams":[]}}
 # END
 ./pulse-ctl 127.0.0.1:18401 WATCH
 # OK watching
@@ -369,8 +369,8 @@ Commands:
 | `META <key=value>` | Set one annotation on this node itself: `OK <key=value>`. The change is gossiped with the next digest and persisted to the data dir, so it survives a restart. Bad syntax: `ERR invalid meta <arg>`; a ninth distinct key: `ERR meta full (max 8)`; missing argument: `ERR usage: META <key=value>`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
 | `RELOAD` | Re-read `--peer-file` and merge it into the seed list — the same reload SIGHUP triggers, for an operator who cannot send the node a signal: `OK peers=N added=A dropped=D kept=K bad=B`. `peers` is how many peers the file lists; `added`/`dropped`/`kept` are the merge outcome (a still-ALIVE peer removed from the file is kept, never dropped on a file edit alone); `bad` is how many lines were skipped as malformed. No `--peer-file`: `ERR no peer file`. Unreadable file: `ERR cannot read peer file <path>: <reason>`, and the old list is kept. |
-| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N slow_peers=N peer_file=<path\|-> last_reload=<unix\|-> last_mtime=<unix\|-> pf_peers=<N\|-> pf_added=<N\|-> pf_dropped=<N\|-> pf_kept=<N\|-> pf_bad=<N\|-> watch_subscribers=<N> watch_sessions=<N>` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. The peer-file fields (0.28.0) are the `--peer-file` state — the path, the wall-clock time of the last successful load or reload, the file's mtime at that load, and the counts from that load (the same numbers as the `PEERFILE RELOAD` log line) — and are all `-` when the node runs without `--peer-file`; see "Peer-file state in METRICS and JSON". `watch_subscribers` / `watch_sessions` (0.33.0) are how many `WATCH` streams are connected right now and how many sessions the node has served since startup; see "WATCH subscriber count in METRICS and JSON". |
-| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning") — and `source`, where the peer came from (`seed`, `peer-file`, `discovered`, or `self`, the same provenance `PEERS` reports). The metrics object also carries `slow_peers`, the count of currently slow members. A top-level `peer_file` object carries the `--peer-file` state (path, `last_reload` / `last_mtime` as unix seconds, and the counts from the last load), or `null` when the node runs without `--peer-file` (0.28.0). A top-level `watch` object carries `subscribers` (how many `WATCH` streams are connected right now) and `sessions` (how many `WATCH` sessions the node has served since startup) (0.33.0); see "WATCH subscriber count in METRICS and JSON". Built for tooling that polls cluster state without scraping the text protocol. |
+| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N slow_peers=N peer_file=<path\|-> last_reload=<unix\|-> last_mtime=<unix\|-> pf_peers=<N\|-> pf_added=<N\|-> pf_dropped=<N\|-> pf_kept=<N\|-> pf_bad=<N\|-> watch_subscribers=<N> watch_sessions=<N> watch_delivered=<N> watch_filtered=<N> watch_dropped=<N>` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. The peer-file fields (0.28.0) are the `--peer-file` state — the path, the wall-clock time of the last successful load or reload, the file's mtime at that load, and the counts from that load (the same numbers as the `PEERFILE RELOAD` log line) — and are all `-` when the node runs without `--peer-file`; see "Peer-file state in METRICS and JSON". `watch_subscribers` / `watch_sessions` (0.33.0) are how many `WATCH` streams are connected right now and how many sessions the node has served since startup; see "WATCH subscriber count in METRICS and JSON". `watch_delivered` / `watch_filtered` / `watch_dropped` (0.34.0) are the lifetime totals of EVENT lines streams sent, events streams consumed but skipped because their filter excluded them, and events streams lost to a gap in the bounded event ring; see "WATCH drop and delivery counts in METRICS and JSON". |
+| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning") — and `source`, where the peer came from (`seed`, `peer-file`, `discovered`, or `self`, the same provenance `PEERS` reports). The metrics object also carries `slow_peers`, the count of currently slow members. A top-level `peer_file` object carries the `--peer-file` state (path, `last_reload` / `last_mtime` as unix seconds, and the counts from the last load), or `null` when the node runs without `--peer-file` (0.28.0). A top-level `watch` object carries `subscribers` (how many `WATCH` streams are connected right now) and `sessions` (how many `WATCH` sessions the node has served since startup) (0.33.0), plus the delivery / drop counts (0.34.0): `delivered` (EVENT lines sent in total), `filtered` (events skipped by a stream's filter), `dropped` (events lost to a gap in the event ring), and a `streams` array with the same three counts per currently-connected stream, keyed by its `session` number; see "WATCH subscriber count in METRICS and JSON" and "WATCH drop and delivery counts in METRICS and JSON". Built for tooling that polls cluster state without scraping the text protocol. |
 | `WATCH [types] [ids] [FROM <seq>]` | A long-lived stream: `OK watching`, then one `SNAPSHOT <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <last-seen-ms\|-> <seed\|peer-file\|discovered\|self>` line per member (the `PEERS` shape), then `END`, then one `EVENT <seq> <JOINED\|SUSPECTED\|DEAD\|REVIVED\|DROPPED\|REFUTED> <id> <incarnation> <unix-seconds>` line per membership event as it happens, until the client closes the connection. Sequence numbers are 1-based and monotonic for the node's life; a slow consumer that falls more than the event log holds gets `ERR gap: events lost, reconnect` and must reconnect and re-read the snapshot. Runs on its own thread, so other commands keep answering while a client watches. An optional filter (0.30.0) narrows the stream server-side: a comma-separated type list (`WATCH JOINED,DEAD`), a comma-separated peer-id list (`WATCH 127.0.0.1:17102`), or both, in any order — the snapshot is narrowed by the id list too, a filtered-out event still consumes its sequence number so a filtered stream's numbers jump by design, and a bad filter is refused up front with `ERR invalid watch filter <reason>`. Replay / resume (0.31.0): `WATCH FROM <seq>` replays the buffered events from that seq, in order, after the snapshot and `END` and before live events, so a reconnecting client catches up instead of starting from now — `FROM 0` replays from the oldest buffered event, a `FROM` past the latest starts live, and a `FROM` below the oldest buffered event replays from the oldest instead, after a `GAP <requested> <oldest>` line; `FROM` composes with the type/id filters, in any order, and a bad `FROM` is refused up front. Heartbeat (0.32.0): a stream that has sent nothing for 5 s sends `HEARTBEAT <unix-seconds>`, so a client on a quiet cluster can tell "nothing happened" from "the connection died silently" — it carries no sequence number and is sent regardless of the filter, and any line sent resets the 5 s clock. See "Control-plane event stream (WATCH)" below. |
 | anything else | `ERR unknown command` |
 
@@ -927,6 +927,68 @@ on the others. And the count cannot tell a live watcher from a
 half-open one that has not been noticed yet — the `HEARTBEAT` is
 what proves a stream is alive, the count only proves it was
 counted.
+
+## WATCH drop and delivery counts in METRICS and JSON
+
+Counting subscribers says how many consumers are attached, but
+not whether they are keeping up: a watcher that falls behind the
+128-event ring is dropped with `ERR gap` and the events it missed
+are gone, and nothing in `METRICS` said so — the subscriber count
+just fell by one. Since 0.34.0 each stream counts what it does
+with every event it consumes, in both forms:
+
+```sh
+./pulse-ctl 127.0.0.1:18401 METRICS
+# METRICS ... watch_subscribers=2 watch_sessions=5 watch_delivered=41 watch_filtered=7 watch_dropped=3
+
+./pulse-ctl 127.0.0.1:18401 JSON
+# {...,"watch":{"subscribers":2,"sessions":5,"delivered":41,"filtered":7,"dropped":3,"streams":[{"session":4,"delivered":30,"filtered":0,"dropped":0},{"session":5,"delivered":11,"filtered":7,"dropped":3}]}}
+```
+
+Three counts per stream:
+
+- `delivered` is how many `EVENT` lines the stream actually sent
+  — live events and replayed ones alike. A send that fails ends
+  the stream and is counted neither way: the client is gone, so
+  there is no consumer left to report it to.
+- `filtered` is how many events the stream consumed but skipped
+  because its type/id filter excluded them. A stream that filters
+  heavily is not a stream in trouble: those events were excluded
+  on purpose, and they still consumed their sequence numbers by
+  design.
+- `dropped` is how many events the stream lost because they had
+  already scrolled out of the bounded event ring before the
+  stream could consume them: a replay `GAP` at stream start (the
+  events between the requested seq and the oldest buffered one),
+  a replay `GAP` on the first wait (a burst evicted the resume
+  point between the snapshot and the wait), or a mid-stream gap
+  (the events between the last consumed seq and the oldest
+  buffered one, which ends the stream with `ERR gap`). A growing
+  `dropped` count is the signal a consumer is not keeping up
+  with the cluster — a dashboard that reconnects and replays
+  from a stale seq every time, or a slow consumer on a busy
+  cluster.
+
+`METRICS` reports the three as lifetime totals — including what
+live streams have done so far, not only what finished streams
+did — so the totals only ever grow. `JSON` carries the same three
+totals in the `watch` object, plus a `streams` array with the
+same three counts per currently-connected stream, keyed by its
+`session` number (the session count the stream was assigned when
+it started), so an operator can tell which consumer is falling
+behind instead of only that some consumer is. A stream that goes
+away leaves the array; its counts stay in the totals.
+
+Two honest caveats. At most 64 concurrent streams are listed
+per-stream in `JSON`: a further stream still runs and still feeds
+the totals, it just has no slot to list until one frees up — 64
+is the same bound as the membership table, and a node with 64
+concurrent watchers has stranger problems than the listing. And
+the totals count what streams did, not what clients received: an
+`EVENT` line the node sent successfully but the client's network
+dropped afterwards still counts as delivered, because from the
+node's side the send completed — the counts measure the stream,
+not the wire.
 
 ## Membership persistence
 
@@ -1568,7 +1630,19 @@ make test
   while one stream is open after an earlier one closed, 2 / 3 with
   a second open, back to 1 / 3 when the second closes, and 0 / 3
   when the first closes too — and a `WATCH` refused up front never
-  becomes a session.
+  becomes a session. `WATCH` drop and delivery counts (0.34.0)
+  are covered the same way: a plain `WATCH` that receives two live
+  events reports delivered=2 on its per-stream entry in `JSON`, a
+  `WATCH DEAD` that sees two non-`DEAD` events reports filtered=2
+  and delivered=0, and a `WATCH FROM 2` against a ring whose
+  oldest held seq is 18 reports dropped=16 and replays the 128
+  buffered events as delivered=128 — and the exact `METRICS` line
+  carries `watch_delivered=0 watch_filtered=0 watch_dropped=0`
+  before any `WATCH` connects. The lifetime totals in `METRICS`
+  are not asserted exactly: a just-closed stream's thread lingers
+  up to a second before it notices the close, and events recorded
+  in that window are consumed by the lingering thread, so the
+  totals depend on thread-exit timing.
 - `tests/test_peerfile_metrics.sh`: integration test for
   METRICS/JSON exposure of peer-file state (0.28.0) — two nodes
   converge from one shared peer file (with a bad line) and `METRICS`
@@ -1675,6 +1749,24 @@ make test
   watcher going away drops subscribers back to 1 while sessions
   stays at 2, and the second going away leaves subscribers at 0
   with sessions still at 2 — the session count only ever grows.
+- `tests/test_watch_delivery.sh`: integration test for the `WATCH`
+  drop and delivery counts (0.34.0) — two nodes converge from one
+  shared peer file and with no watcher connected `METRICS` reports
+  `watch_delivered=0 watch_filtered=0 watch_dropped=0` and `JSON`
+  carries the same three zeros with an empty `streams` array; an
+  unfiltered `WATCH` on node 1 streams the `DEAD` event when node 2
+  is killed and `METRICS` reports at least 1 delivered while `JSON`
+  shows session 1 with at least 1 delivered; a second `WATCH`
+  filtered to `DEAD` only skips node 2's `REVIVED` on restart and
+  `METRICS` reports at least 1 filtered while `JSON` shows session
+  2 with 0 delivered and at least 1 filtered and no non-`DEAD`
+  event reaches it; both watchers going away leaves subscribers at
+  0 with sessions still at 2, the totals persisted, dropped still
+  0, and `JSON` listing no live streams. The drop count itself — a
+  gap in the event ring — is covered deterministically in the unit
+  test (`tests/test_control.c`): it needs 128 events to evict the
+  ring, so the integration test does not flood the cluster to
+  force one.
 
 ## Roadmap
 
@@ -1712,4 +1804,4 @@ make test
 - ~~WATCH replay / resume from a sequence number: a watcher can reconnect with `WATCH FROM <seq>` and the server replays the buffered events from that seq, in order, after the snapshot and `END` and before live events, so a client that dropped catches up instead of starting from now — `FROM 0` replays from the oldest buffered event, a `FROM` past the latest starts live, and a `FROM` below the oldest buffered event replays from the oldest instead, after a `GAP <requested> <oldest>` line that says how much was lost, with the stream staying open; `FROM` composes with the type/id filters in any order, and a bad `FROM` is refused up front with `ERR invalid watch filter <reason>`.~~ Done in 0.31.0.
 - ~~WATCH heartbeat on idle streams: a stream that has sent nothing for 5 s sends `HEARTBEAT <unix-seconds>`, so a client on a quiet cluster can tell "nothing happened" from "the connection died silently" — a half-open TCP connection otherwise looks exactly like a quiet cluster. The heartbeat carries no sequence number and is sent regardless of the type/id filter, and any line sent (EVENT, GAP, or HEARTBEAT) resets the 5 s clock, so a busy cluster never sees one.~~ Done in 0.32.0.
 - ~~WATCH subscriber count in METRICS and JSON: `METRICS` reports `watch_subscribers` (how many `WATCH` streams are connected right now) and `watch_sessions` (how many sessions the node has served since startup), and `JSON` carries the same counts as a top-level `watch` object, so an operator polling cluster state can see how many consumers are attached to the event stream — a client that went away drops out of the current count within about a second, while the session count only ever grows, so 0 subscribers with sessions above 0 means watchers that all went away and 0 / 0 means none ever connected.~~ Done in 0.33.0.
-- WATCH drop and delivery counts in METRICS: count the watchers dropped for falling behind the event ring (`ERR gap`) and the events delivered per stream, so an operator can see whether consumers are keeping up with the cluster instead of only how many are connected.
+- ~~WATCH drop and delivery counts in METRICS and JSON: each stream counts the `EVENT` lines it sent (`delivered`), the events it consumed but skipped because its type/id filter excluded them (`filtered`), and the events it lost to a gap in the bounded event ring (`dropped` — a replay `GAP`, or a mid-stream gap that ends the stream with `ERR gap`), and `METRICS` reports the three as lifetime totals while `JSON` carries the same three totals plus a `streams` array with the same three counts per currently-connected stream, keyed by its session number, so an operator can see whether consumers are keeping up with the cluster instead of only how many are connected.~~ Done in 0.34.0.

@@ -72,6 +72,7 @@
  *           last_mtime=<unix|'-'> pf_peers=<N|'-'> pf_added=<N|'-'>
  *           pf_dropped=<N|'-'> pf_kept=<N|'-'> pf_bad=<N|'-'>
  *           watch_subscribers=<N> watch_sessions=<N>
+ *           watch_delivered=<N> watch_filtered=<N> watch_dropped=<N>
  *       detect_latency_ms is last-direct-contact -> SUSPECT for
  *       suspicions this node detected itself (mean/max in ms, "-" when
  *       there are no samples); suspect_to_dead_ms is SUSPECT -> DEAD.
@@ -95,6 +96,22 @@
  *       stream, and whether any ever were. A client that went away
  *       drops out of the current count within about a second; the
  *       session count only ever grows.
+ *       Delivery / drop counts (0.34.0): watch_delivered is how
+ *       many EVENT lines WATCH streams have sent in total,
+ *       watch_filtered is how many events streams consumed but
+ *       skipped because their type/id filter excluded them, and
+ *       watch_dropped is how many events streams lost because
+ *       they had already scrolled out of the bounded event ring
+ *       before the stream could consume them — a replay GAP, or a
+ *       mid-stream gap that ends the stream with an ERR. All three
+ *       are lifetime totals, including what live streams have
+ *       done so far; JSON also carries the same three counts per
+ *       currently-connected stream, so an operator can tell which
+ *       consumer is falling behind instead of only that some
+ *       consumer is. A stream that filters heavily is not a
+ *       stream in trouble: filtered events were excluded on
+ *       purpose, while a growing dropped count means a consumer
+ *       is not keeping up with the cluster.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -115,7 +132,12 @@
  *       without --peer-file. A top-level "watch" object (0.33.0)
  *       carries "subscribers" (how many WATCH streams are connected
  *       right now) and "sessions" (how many WATCH sessions the node
- *       has served since startup).
+ *       has served since startup), plus the delivery / drop counts
+ *       (0.34.0): "delivered" (EVENT lines sent in total),
+ *       "filtered" (events skipped by a stream's filter) and
+ *       "dropped" (events lost to a gap in the event ring), and a
+ *       "streams" array with the same three counts per
+ *       currently-connected stream, keyed by its "session" number.
  *   WATCH [types] [ids] [FROM <seq>]
  *       A long-lived stream of membership events, for tooling that
  *       watches a cluster instead of polling MEMBERS or JSON once a
@@ -183,6 +205,24 @@
  *       served since startup ("watch_sessions" / "watch"."sessions"),
  *       so an operator can see how many consumers are attached to
  *       the event stream without counting connections by hand.
+ *       Delivery / drop counts (0.34.0): each stream counts the
+ *       EVENT lines it sent ("delivered"), the events it consumed
+ *       but skipped because its type/id filter excluded them
+ *       ("filtered"), and the events it lost because they had
+ *       already scrolled out of the bounded event ring before the
+ *       stream could consume them ("dropped" — a replay GAP at
+ *       stream start, a replay GAP on the first wait, or a
+ *       mid-stream gap that ends the stream with an ERR). METRICS
+ *       reports the three as lifetime totals
+ *       ("watch_delivered" / "watch_filtered" / "watch_dropped",
+ *       including what live streams have done so far); JSON
+ *       carries the same three totals in the "watch" object, plus
+ *       a "streams" array with the same three counts per
+ *       currently-connected stream, keyed by its "session"
+ *       number. A send that fails ends the stream and is counted
+ *       neither way. At most 64 concurrent streams are listed
+ *       per-stream in JSON; a further stream still runs and still
+ *       feeds the totals, it just has no slot to list.
  *   anything else
  *       ERR unknown command
  *

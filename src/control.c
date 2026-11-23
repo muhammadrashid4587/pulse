@@ -34,15 +34,106 @@
  * starts (a WATCH refused up front — bad filter, no watch hooks —
  * never becomes a session); the count drops when the thread ends,
  * so a client that went away is gone from the count within about a
- * second of the disconnect being noticed. */
+ * second of the disconnect being noticed.
+ *
+ * WATCH delivery / drop counts (0.34.0): per stream, how many
+ * EVENT lines were actually sent (delivered), how many events the
+ * stream consumed but skipped because its type/id filter excluded
+ * them (filtered), and how many events it lost because they had
+ * already scrolled out of the bounded event ring before the stream
+ * could consume them (dropped — a replay GAP, or a mid-stream gap
+ * that ends the stream). The per-stream counts live in a small
+ * fixed registry (one slot per stream, at most WATCH_MAX_STREAMS
+ * concurrent streams — a 65th stream still works and still feeds
+ * the totals, it just has no slot to list), and the lifetime
+ * totals accumulate every counted event, so METRICS and JSON
+ * report the totals including what live streams have done so far,
+ * not only what finished streams did. All of it is guarded by the
+ * one watch mutex: the counts are updated once per event, which
+ * is cheap next to the send itself. */
+#define WATCH_MAX_STREAMS 64
+
+typedef struct {
+    uint64_t session; /* session number assigned at stream start */
+    uint64_t delivered; /* EVENT lines sent on this stream */
+    uint64_t filtered; /* events consumed but skipped by the filter */
+    uint64_t dropped; /* events lost to a gap, never deliverable */
+    int active;
+} watch_stream_stat_t;
+
 static pthread_mutex_t g_watch_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_watch_current = 0;
 static uint64_t g_watch_total = 0;
+static uint64_t g_watch_delivered_total = 0;
+static uint64_t g_watch_filtered_total = 0;
+static uint64_t g_watch_dropped_total = 0;
+static watch_stream_stat_t g_watch_streams[WATCH_MAX_STREAMS];
 
-static void watch_subscriber_stats(int *current, uint64_t *total) {
+typedef struct {
+    int current;
+    uint64_t sessions;
+    uint64_t delivered;
+    uint64_t filtered;
+    uint64_t dropped;
+    watch_stream_stat_t streams[WATCH_MAX_STREAMS];
+    int n_streams;
+} watch_stats_t;
+
+static void watch_stats_snapshot(watch_stats_t *out) {
     pthread_mutex_lock(&g_watch_mu);
-    *current = g_watch_current;
-    *total = g_watch_total;
+    out->current = g_watch_current;
+    out->sessions = g_watch_total;
+    out->delivered = g_watch_delivered_total;
+    out->filtered = g_watch_filtered_total;
+    out->dropped = g_watch_dropped_total;
+    out->n_streams = 0;
+    for (int i = 0; i < WATCH_MAX_STREAMS; i++) {
+        if (g_watch_streams[i].active)
+            out->streams[out->n_streams++] = g_watch_streams[i];
+    }
+    pthread_mutex_unlock(&g_watch_mu);
+}
+
+/* Claim a registry slot for a new stream (its session number).
+ * Returns the slot, or -1 when every slot is taken: the stream
+ * still runs and still feeds the totals, it just is not listed
+ * per-stream in JSON until a slot frees up. */
+static int watch_stream_register(uint64_t session) {
+    pthread_mutex_lock(&g_watch_mu);
+    for (int i = 0; i < WATCH_MAX_STREAMS; i++) {
+        if (!g_watch_streams[i].active) {
+            memset(&g_watch_streams[i], 0, sizeof g_watch_streams[i]);
+            g_watch_streams[i].session = session;
+            g_watch_streams[i].active = 1;
+            pthread_mutex_unlock(&g_watch_mu);
+            return i;
+        }
+    }
+    pthread_mutex_unlock(&g_watch_mu);
+    return -1;
+}
+
+/* Add to one stream's counts and to the lifetime totals. A slot
+ * of -1 (registry full) still feeds the totals: the events
+ * happened, only the per-stream listing is missing. */
+static void watch_stream_add(int slot, uint64_t delivered,
+                             uint64_t filtered, uint64_t dropped) {
+    pthread_mutex_lock(&g_watch_mu);
+    if (slot >= 0 && g_watch_streams[slot].active) {
+        g_watch_streams[slot].delivered += delivered;
+        g_watch_streams[slot].filtered += filtered;
+        g_watch_streams[slot].dropped += dropped;
+    }
+    g_watch_delivered_total += delivered;
+    g_watch_filtered_total += filtered;
+    g_watch_dropped_total += dropped;
+    pthread_mutex_unlock(&g_watch_mu);
+}
+
+static void watch_stream_unregister(int slot) {
+    if (slot < 0) return;
+    pthread_mutex_lock(&g_watch_mu);
+    g_watch_streams[slot].active = 0;
     pthread_mutex_unlock(&g_watch_mu);
 }
 
@@ -290,14 +381,24 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
      * connected right now, and how many sessions the node has
      * served since startup. The current count is live state — a
      * client that went away drops out of it within about a second
-     * — while the session count only ever grows. */
-    int watch_current = 0;
-    uint64_t watch_total = 0;
-    watch_subscriber_stats(&watch_current, &watch_total);
+     * — while the session count only ever grows. Delivery / drop
+     * counts (0.34.0): how many EVENT lines WATCH streams have
+     * sent in total (delivered), how many events streams consumed
+     * but skipped because their filter excluded them (filtered),
+     * and how many events streams lost to a gap in the bounded
+     * event ring (dropped) — all lifetime totals, including what
+     * live streams have done so far. */
+    watch_stats_t ws;
+    watch_stats_snapshot(&ws);
     used = strlen(line);
     snprintf(line + used, sizeof line - used,
-             " watch_subscribers=%d watch_sessions=%llu", watch_current,
-             (unsigned long long)watch_total);
+             " watch_subscribers=%d watch_sessions=%llu "
+             "watch_delivered=%llu watch_filtered=%llu "
+             "watch_dropped=%llu",
+             ws.current, (unsigned long long)ws.sessions,
+             (unsigned long long)ws.delivered,
+             (unsigned long long)ws.filtered,
+             (unsigned long long)ws.dropped);
     if (send_all(fd, line) != 0) return;
     send_all(fd, "\nEND\n");
 }
@@ -422,10 +523,39 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
     metrics_detect_hist_json(&m, dhist, sizeof dhist);
     /* WATCH subscribers (0.33.0): the same counts METRICS reports,
      * as a top-level "watch" object — how many WATCH streams are
-     * connected right now, and how many sessions since startup. */
-    int watch_current = 0;
-    uint64_t watch_total = 0;
-    watch_subscriber_stats(&watch_current, &watch_total);
+     * connected right now, and how many sessions since startup —
+     * plus the delivery / drop counts (0.34.0): how many EVENT
+     * lines streams have sent in total, how many events were
+     * skipped by a stream's filter, and how many were lost to a
+     * gap, and a "streams" array with the same three counts per
+     * currently-connected stream, keyed by its session number, so
+     * an operator can tell which consumer is falling behind
+     * instead of only that some consumer is. The streams array is
+     * built into its own buffer first: 64 streams at ~110 bytes
+     * each fit in 8 KB with room to spare. */
+    watch_stats_t ws;
+    watch_stats_snapshot(&ws);
+    char streams_json[8192];
+    size_t s_used = 0;
+    int sw = snprintf(streams_json, sizeof streams_json, "[");
+    if (sw < 0) return;
+    s_used += (size_t)sw;
+    for (int i = 0; i < ws.n_streams; i++) {
+        sw = snprintf(streams_json + s_used,
+                      sizeof streams_json - s_used,
+                      "%s{\"session\":%llu,\"delivered\":%llu,"
+                      "\"filtered\":%llu,\"dropped\":%llu}",
+                      i == 0 ? "" : ",",
+                      (unsigned long long)ws.streams[i].session,
+                      (unsigned long long)ws.streams[i].delivered,
+                      (unsigned long long)ws.streams[i].filtered,
+                      (unsigned long long)ws.streams[i].dropped);
+        if (sw < 0 || (size_t)sw >= sizeof streams_json - s_used) return;
+        s_used += (size_t)sw;
+    }
+    sw = snprintf(streams_json + s_used, sizeof streams_json - s_used,
+                  "]");
+    if (sw < 0 || (size_t)sw >= sizeof streams_json - s_used) return;
     w = snprintf(buf + used, sizeof buf - used,
         "],\"metrics\":{\"suspected\":%lld,\"dead\":%lld,\"refutes\":%lld,"
         "\"joins\":%lld,\"adaptive_fast_cycles\":%lld,"
@@ -434,7 +564,9 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
         "\"max\":%lld,\"samples\":%lld},\"refute_latency_ms\":{\"mean\":%s,"
         "\"max\":%lld,\"samples\":%lld}},\"peer_file\":%s,"
-        "\"watch\":{\"subscribers\":%d,\"sessions\":%llu}}\nEND\n",
+        "\"watch\":{\"subscribers\":%d,\"sessions\":%llu,"
+        "\"delivered\":%llu,\"filtered\":%llu,\"dropped\":%llu,"
+        "\"streams\":%s}}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
         (long long)m.joins, (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
@@ -444,8 +576,11 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (long long)m.suspect_dead_max_ms,
         (long long)m.suspect_dead_samples,
         rmean, (long long)m.refute_max_ms,
-        (long long)m.refute_samples, pfjson, watch_current,
-        (unsigned long long)watch_total);
+        (long long)m.refute_samples, pfjson, ws.current,
+        (unsigned long long)ws.sessions,
+        (unsigned long long)ws.delivered,
+        (unsigned long long)ws.filtered,
+        (unsigned long long)ws.dropped, streams_json);
     if (w < 0 || (size_t)w >= sizeof buf - used) return;
     send_all(fd, buf);
 }
@@ -727,9 +862,23 @@ static int watch_filter_match_id(const watch_filter_t *f, const char *id) {
  * or HEARTBEAT — resets the 5 s clock, so a busy cluster never
  * sees one. A client that only understands EVENT lines ignores
  * anything else, so the heartbeat is safe to add to an existing
- * watcher. */
+ * watcher.
+ *
+ * Delivery / drop counts (0.34.0): the stream counts what it does
+ * with every event it consumes — delivered when an EVENT line is
+ * sent successfully (live and replayed alike), filtered when the
+ * type/id filter skips it, dropped when the event is gone before
+ * the stream can have it: a replay GAP at stream start (the
+ * events between the requested seq and the oldest buffered one),
+ * a replay GAP on the first wait (a burst evicted the resume
+ * point between the snapshot and the wait), or a mid-stream gap
+ * (the events between the last consumed seq and the oldest
+ * buffered one). A send that fails ends the stream and is counted
+ * neither way — the client is gone, so there is no consumer left
+ * to report it to. The counts are per stream and feed lifetime
+ * totals, exposed in METRICS and JSON. */
 static void handle_watch(int fd, const control_hooks_t *hooks,
-                         const char *arg) {
+                         const char *arg, int slot) {
     watch_filter_t filter;
     char ferr[128];
     if (parse_watch_filter(arg, &filter, ferr, sizeof ferr) != 0) {
@@ -806,6 +955,10 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
             close(fd);
             return;
         }
+        /* Delivery / drop counts (0.34.0): the events between the
+         * requested seq and the oldest buffered one are gone —
+         * this stream asked for them and will never see them. */
+        watch_stream_add(slot, 0, 0, oldest - gap_from);
         last_sent_ms = pulse_now_ms();
     }
     /* first_wait is still set while no event has been consumed:
@@ -827,12 +980,18 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
              * after this one, or the same event would be returned
              * again forever. Only a matching event is sent. */
             seq = ev.seq;
-            if (!watch_filter_match(&filter, &ev)) continue;
+            if (!watch_filter_match(&filter, &ev)) {
+                /* Delivery / drop counts (0.34.0): the event was
+                 * consumed but the filter kept it off the wire. */
+                watch_stream_add(slot, 0, 1, 0);
+                continue;
+            }
             snprintf(line, sizeof line, "EVENT %llu %s %s %u %lld\n",
                      (unsigned long long)ev.seq,
                      pulse_event_type_name(ev.type), ev.id,
                      ev.incarnation, (long long)ev.unix_ts);
             if (send_all(fd, line) != 0) break;
+            watch_stream_add(slot, 1, 0, 0);
             last_sent_ms = pulse_now_ms();
         } else if (r == -1) {
             if (first_wait && filter.have_from) {
@@ -845,10 +1004,25 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
                          (unsigned long long)start,
                          (unsigned long long)new_oldest);
                 if (send_all(fd, line) != 0) break;
+                /* Delivery / drop counts (0.34.0): the events
+                 * between the replay point and the new oldest
+                 * scrolled out while the stream was opening. */
+                watch_stream_add(slot, 0, 0, new_oldest - start);
                 last_sent_ms = pulse_now_ms();
                 seq = new_oldest - 1;
                 first_wait = 0;
                 continue;
+            }
+            /* Delivery / drop counts (0.34.0): the events between
+             * the last one this stream consumed and the oldest
+             * still buffered scrolled out while the consumer was
+             * behind — they are lost to this stream, which is
+             * why it is being dropped with an ERR. */
+            {
+                uint64_t oldest_now = watch_oldest_seq(hooks->ctx);
+                if (oldest_now > seq + 1)
+                    watch_stream_add(slot, 0, 0,
+                                     oldest_now - (seq + 1));
             }
             send_all(fd, "ERR gap: events lost, reconnect\n");
             break;
@@ -894,15 +1068,23 @@ typedef struct {
     /* The WATCH argument, copied: the thread outlives the
      * connection's line buffer, so it must own its copy. */
     char arg[CONTROL_MAX_LINE];
+    /* Delivery / drop counts (0.34.0): the registry slot this
+     * stream counts into (-1 when the registry was full), and
+     * the session number it was assigned at start. */
+    int slot;
+    uint64_t session;
 } watch_arg_t;
 
 static void *watch_thread(void *arg) {
     watch_arg_t *w = arg;
-    handle_watch(w->fd, w->hooks, w->arg);
+    int slot = w->slot;
+    handle_watch(w->fd, w->hooks, w->arg, slot);
     free(w);
-    /* The stream is over: this subscriber leaves the count. The
-     * increment happened in start_watch before the thread was
-     * created, so the count can never dip below zero here. */
+    /* The stream is over: this subscriber leaves the count and
+     * gives its registry slot back. The increment happened in
+     * start_watch before the thread was created, so the count can
+     * never dip below zero here. */
+    watch_stream_unregister(slot);
     pthread_mutex_lock(&g_watch_mu);
     g_watch_current--;
     pthread_mutex_unlock(&g_watch_mu);
@@ -930,13 +1112,17 @@ static int start_watch(int fd, const control_hooks_t *hooks,
     /* Count the session before the thread starts: a thread that
      * runs and exits fast must not decrement before this increment
      * lands. On a create failure the session never ran, so the
-     * count is given back. */
+     * count is given back. The session number doubles as the
+     * stream's key in the delivery / drop registry (0.34.0). */
     pthread_mutex_lock(&g_watch_mu);
     g_watch_current++;
     g_watch_total++;
+    w->session = g_watch_total;
     pthread_mutex_unlock(&g_watch_mu);
+    w->slot = watch_stream_register(w->session);
     pthread_t th;
     if (pthread_create(&th, NULL, watch_thread, w) != 0) {
+        watch_stream_unregister(w->slot);
         pthread_mutex_lock(&g_watch_mu);
         g_watch_current--;
         g_watch_total--;
