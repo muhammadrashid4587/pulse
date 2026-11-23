@@ -2,8 +2,8 @@ CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g -Isrc
 LDFLAGS ?= -pthread -lm
 
-NODE_SRC = src/node.c src/member.c src/gossip.c src/phi.c src/secret.c src/control.c src/metrics.c src/persist.c src/adaptive.c src/peerfile.c
-HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h src/metrics.h src/persist.h src/adaptive.h src/peerfile.h
+NODE_SRC = src/node.c src/member.c src/gossip.c src/phi.c src/secret.c src/control.c src/metrics.c src/persist.c src/adaptive.c src/peerfile.c src/events.c
+HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h src/metrics.h src/persist.h src/adaptive.h src/peerfile.h src/events.h
 
 .PHONY: all test clean
 
@@ -45,8 +45,8 @@ test_meta: tests/test_meta.c src/member.c src/phi.c src/gossip.c src/secret.c sr
 test_peerfile: tests/test_peerfile.c src/member.c src/phi.c src/peerfile.c src/member.h src/phi.h src/peerfile.h
 	$(CC) $(CFLAGS) -o $@ tests/test_peerfile.c src/member.c src/phi.c src/peerfile.c $(LDFLAGS)
 
-test_control: tests/test_control.c src/control.c src/member.c src/phi.c src/metrics.c src/control.h src/member.h src/phi.h src/metrics.h
-	$(CC) $(CFLAGS) -o $@ tests/test_control.c src/control.c src/member.c src/phi.c src/metrics.c $(LDFLAGS)
+test_control: tests/test_control.c src/control.c src/events.c src/member.c src/phi.c src/metrics.c src/control.h src/events.h src/member.h src/phi.h src/metrics.h
+	$(CC) $(CFLAGS) -o $@ tests/test_control.c src/control.c src/events.c src/member.c src/phi.c src/metrics.c $(LDFLAGS)
 
 test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile test_control
 	./test_member
@@ -80,6 +80,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_peerfile_metrics.sh
 	bash tests/test_reload.sh
 	bash tests/test_peers.sh
+	bash tests/test_watch.sh
 
 clean:
 	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile test_control

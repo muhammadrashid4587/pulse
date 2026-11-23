@@ -40,10 +40,10 @@ building block, not a production service mesh.
   picture as one machine-readable JSON object (`JSON`), each peer with
   its last-seen time and where it came from (`PEERS`), setting an
   annotation on the node (`META <key=value>`), triggering a live
-  peer-file reload (`RELOAD`), or
-  force-removing a member (`LEAVE <id>`). See
-  "Control plane" below. Query it with the bundled `pulse-ctl` client
-  or plain netcat.
+  peer-file reload (`RELOAD`), force-removing a member
+  (`LEAVE <id>`), or watching membership events as they happen
+  (`WATCH`). See "Control plane" below. Query it with the bundled
+  `pulse-ctl` client or plain netcat.
 - Optional shared secret (`--secret`): nodes started with the same
   secret only accept traffic from peers presenting it, so two clusters
   on the same network cannot accidentally merge. See "Shared secret"
@@ -270,7 +270,7 @@ scripts/demo.sh
 | `--phi-accrual` | off | Suspect on phi instead of the fixed ack timeout |
 | `--phi-threshold` | 8.0 | Phi value at which a peer is suspected (phi mode only) |
 | `--sync-interval-ms` | 10000 | How often to exchange full tables (anti-entropy SYNC) with a random peer |
-| `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `PEERS`, `LEAVE`, `RELOAD`) |
+| `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `PEERS`, `LEAVE`, `RELOAD`, `WATCH`) |
 | `--secret` / `--shared-secret` | — (none) | Shared secret for joins: only peers presenting the same secret are accepted |
 | `--meta KEY=VALUE` | — (none) | An annotation this node carries about itself (repeatable, at most 8): gossiped with its membership entry, shown in `MEMBERS`/`JSON`, persisted across restarts |
 | `--ipv6` | off | Run over IPv6: bind `::`, ids are `[::1]:port`, control plane on `::1` |
@@ -344,6 +344,13 @@ the port beyond localhost.
 ./pulse-ctl 127.0.0.1:18401 JSON
 # {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null,"slow":false,"source":"self"},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42,"meta":{},"rtt_ms":1,"rtt_mean_ms":0,"slow":false,"source":"peer-file"}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"slow_peers":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}},"peer_file":{"path":"peers","last_reload":1795450000,"last_mtime":1795449900,"peers":3,"added":1,"dropped":0,"kept":0,"bad":0}}
 # END
+./pulse-ctl 127.0.0.1:18401 WATCH
+# OK watching
+# SNAPSHOT 127.0.0.1:17101 1 ALIVE - self
+# SNAPSHOT 127.0.0.1:17102 1 ALIVE 12 peer-file
+# END
+# EVENT 1 JOINED 127.0.0.1:17102 1 1795450000
+# EVENT 2 SUSPECTED 127.0.0.1:17103 1 1795450001
 ```
 
 Or with netcat, if it is installed:
@@ -364,6 +371,7 @@ Commands:
 | `RELOAD` | Re-read `--peer-file` and merge it into the seed list — the same reload SIGHUP triggers, for an operator who cannot send the node a signal: `OK peers=N added=A dropped=D kept=K bad=B`. `peers` is how many peers the file lists; `added`/`dropped`/`kept` are the merge outcome (a still-ALIVE peer removed from the file is kept, never dropped on a file edit alone); `bad` is how many lines were skipped as malformed. No `--peer-file`: `ERR no peer file`. Unreadable file: `ERR cannot read peer file <path>: <reason>`, and the old list is kept. |
 | `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N slow_peers=N peer_file=<path\|-> last_reload=<unix\|-> last_mtime=<unix\|-> pf_peers=<N\|-> pf_added=<N\|-> pf_dropped=<N\|-> pf_kept=<N\|-> pf_bad=<N\|->` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. The peer-file fields (0.28.0) are the `--peer-file` state — the path, the wall-clock time of the last successful load or reload, the file's mtime at that load, and the counts from that load (the same numbers as the `PEERFILE RELOAD` log line) — and are all `-` when the node runs without `--peer-file`; see "Peer-file state in METRICS and JSON". |
 | `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning") — and `source`, where the peer came from (`seed`, `peer-file`, `discovered`, or `self`, the same provenance `PEERS` reports). The metrics object also carries `slow_peers`, the count of currently slow members. A top-level `peer_file` object carries the `--peer-file` state (path, `last_reload` / `last_mtime` as unix seconds, and the counts from the last load), or `null` when the node runs without `--peer-file` (0.28.0). Built for tooling that polls cluster state without scraping the text protocol. |
+| `WATCH` | A long-lived stream: `OK watching`, then one `SNAPSHOT <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <last-seen-ms\|-> <seed\|peer-file\|discovered\|self>` line per member (the `PEERS` shape), then `END`, then one `EVENT <seq> <JOINED\|SUSPECTED\|DEAD\|REVIVED\|DROPPED\|REFUTED> <id> <incarnation> <unix-seconds>` line per membership event as it happens, until the client closes the connection. Sequence numbers are 1-based and monotonic for the node's life; a slow consumer that falls more than the event log holds gets `ERR gap: events lost, reconnect` and must reconnect and re-read the snapshot. Runs on its own thread, so other commands keep answering while a client watches. See "Control-plane event stream (WATCH)" below. |
 | anything else | `ERR unknown command` |
 
 ## Shared secret
@@ -699,6 +707,75 @@ on a node that seeds from the roster. That is the point — `PEERS`
 shows why *this* node knows each member, so a roster typo, a stale
 seed flag, or a peer that only gossip ever mentioned can be told
 apart at a glance.
+
+## Control-plane event stream (`WATCH`)
+
+Polling `MEMBERS` or `JSON` once a second tells an operator what the
+cluster looks like, but not what just changed — and a failure that
+comes and goes between two polls is invisible entirely. Since 0.29.0
+the control plane streams membership events instead: one long-lived
+TCP connection that pushes an `EVENT` line for every transition as
+it happens, so a dashboard, an alerter, or a ward gateway can watch
+the cluster live instead of polling it.
+
+```sh
+./pulse-ctl 127.0.0.1:18401 WATCH
+# OK watching
+# SNAPSHOT 127.0.0.1:17101 1 ALIVE - self
+# SNAPSHOT 127.0.0.1:17102 1 ALIVE 12 peer-file
+# END
+# EVENT 1 JOINED 127.0.0.1:17102 1 1795450000
+# EVENT 2 SUSPECTED 127.0.0.1:17103 1 1795450001
+# EVENT 3 DEAD 127.0.0.1:17103 1 1795450002
+# ... the connection stays open until the client closes it
+```
+
+The stream starts with a snapshot, not with history: `OK watching`,
+then one `SNAPSHOT` line per member in the `PEERS` shape (id,
+incarnation, state, ms since last direct contact, source), then
+`END`. A late subscriber therefore sees the cluster as it is the
+moment it connects, without having to ask `MEMBERS` first — and
+without replaying everything that happened before it arrived. The
+events after the snapshot are the changes:
+
+| Event | Meaning |
+| ----- | ------- |
+| `JOINED` | A peer appeared in the table — first direct contact, a gossip entry about a peer never seen, or a peer added by a peer-file reload. |
+| `SUSPECTED` | A peer went ALIVE to SUSPECT — this node stopped hearing from it, or gossip said so. |
+| `DEAD` | A peer went SUSPECT to DEAD — its suspect window ran out, or gossip said so. |
+| `REVIVED` | A SUSPECT or DEAD peer came back ALIVE — it answered again. A DEAD peer coming back is a restart, not a refutation, but it is still a revival to a watcher. |
+| `DROPPED` | A peer left the table — garbage-collected after its retention expired, force-removed by `LEAVE`, or dropped by a peer-file reload. |
+| `REFUTED` | This node heard gossip calling itself SUSPECT or DEAD and bumped its incarnation to refute it. |
+
+Each `EVENT` line carries a sequence number (1-based, monotonic for
+the node's life), the member id, its incarnation at the event, and
+the wall-clock time in unix seconds. A client that sees a jump in
+the sequence numbers knows it missed events.
+
+Three honest caveats. The event log is a bounded ring (the last 128
+events): a consumer that falls more than a ring behind — a client
+that stops reading for a long time — gets `ERR gap: events lost,
+reconnect` and the connection closes, instead of the node buffering
+unboundedly for it; the client reconnects and re-reads the snapshot.
+The snapshot is taken just after the latest sequence number is read,
+so no event is ever lost between the two — but an event that lands
+in that tiny window may appear both in the snapshot and in the
+stream, and a client dedupes by sequence number. And the log starts
+empty at startup: members restored from `<data-dir>/members` are
+pre-existing state, not events, so a `WATCH` opened after a restart
+sees them in the snapshot and never as `JOINED` lines — same for
+seed and peer-file entries that were already in the table before
+the stream opened (a peer-file peer that was dead before it ever
+answered comes back as `REVIVED`, not `JOINED`).
+
+`WATCH` runs on its own thread, so the rest of the control plane
+keeps answering while a client watches — `MEMBERS`, `STATUS`,
+`LEAVE` and the rest are unaffected by an open stream. `pulse-ctl`
+already prints until the server closes the connection, so it streams
+a `WATCH` until interrupted (Ctrl-C); with its stdout to a file,
+run it under `stdbuf -o0` or the lines sit in the buffer. Like the
+rest of the control plane, `WATCH` has no authentication — it is a
+local debugging and operations interface, not a public API.
 
 ## Membership persistence
 
@@ -1309,6 +1386,15 @@ make test
   carries the same state as a top-level `peer_file` object and a
   `source` on every member, and a node with no peer file — or no
   peer-file hook at all — reports `-` / `null` instead of crashing.
+  `WATCH` (0.29.0) is covered two ways: the event log itself
+  (record / wait order, timeout, wakeup on record from another
+  thread, and the gap when the ring overflows past 128 events), and
+  the stream over the control plane — `OK watching`, a `SNAPSHOT`
+  of the canned table in the `PEERS` shape, then live `EVENT`
+  lines for events recorded after connecting, with one-shot
+  commands still answering while the stream is open, and a clean
+  `ERR watch not supported` with no watch hooks. The `WATCH`
+  events end to end are covered by `tests/test_watch.sh`.
 - `tests/test_peerfile_metrics.sh`: integration test for
   METRICS/JSON exposure of peer-file state (0.28.0) — two nodes
   converge from one shared peer file (with a bad line) and `METRICS`
@@ -1348,6 +1434,20 @@ make test
   SYNC as `discovered`; killing node 3 and waiting for node 1 to
   mark it `DEAD` still lists it as `DEAD` and `peer-file`; and the
   reply ends with `END`.
+- `tests/test_watch.sh`: integration test for the `WATCH`
+  control-plane command (0.29.0) — two nodes converge from one
+  shared peer file and a `WATCH` on node 1 opens with `OK watching`,
+  a `SNAPSHOT` line per member in the `PEERS` shape, and `END`, while
+  `MEMBERS` still answers on another connection; a third node
+  joining through `--seed` only streams `JOINED`, stopping it
+  (SIGSTOP) streams `SUSPECTED` and resuming it (SIGCONT) streams
+  `REVIVED`, killing it streams `DEAD`, and `LEAVE` over the
+  control plane streams `DROPPED`; the `EVENT` lines arrive in
+  lifecycle order with strictly increasing sequence numbers, and
+  the connection stays open for the whole test. A node joining
+  through `--seed` is used deliberately: a peer-file peer already
+  sits in the table before it ever answers, so it would come back
+  as `REVIVED`, not `JOINED`.
 
 ## Roadmap
 
@@ -1379,4 +1479,4 @@ make test
 - ~~Auto-reload on peer-file mtime change: while a `--peer-file` is in use, the node stats the file once a second and re-runs the same reload merge when its mtime moves — no SIGHUP, no control-plane call, no restart — with the reload logged (`PEERFILE <file> changed on disk, auto-reloading` plus the usual summary) and the watch baseline refreshed by every manual reload so it never re-runs right after one; an edit that preserves the mtime is invisible to the watch, a kept peer that dies after its edit is dropped at the next file change (or by normal GC), and a deleted file is skipped quietly until it reappears.~~ Done in 0.26.0.
 - ~~PEERS control-plane command over TCP: one `PEER <id> <incarnation> <state> <last-seen-ms|-> <seed\|peer-file\|discovered\|self>` line per member, then `END`, so an operator can see at a glance how long since each peer was last heard from directly and where the peer came from — a `--seed` flag, the `--peer-file` roster (or a peer removed from it but kept because it was still ALIVE), or gossip/a JOIN from a peer the node was never told about; the flag outranks the file, self reports as `self` with a `-` last-seen, and a peer never heard from reports `-` too.~~ Done in 0.27.0.
 - ~~METRICS/JSON exposure of peer-file state: `METRICS` reports the `--peer-file` path, the wall-clock time of the last successful load or reload, the file's mtime at that load, and the counts from that load (`pf_peers` / `pf_added` / `pf_dropped` / `pf_kept` / `pf_bad`), and `JSON` carries the same state as a top-level `peer_file` object (or `null` with no `--peer-file`) plus a `source` (`seed` / `peer-file` / `discovered` / `self`) on every member, so a peer-file peer is distinguishable from a discovered one in the machine-readable view too; the initial load at startup counts as the first reload, a failed reload leaves the last successful state untouched, and a node with no `--peer-file` reports `-` / `null`.~~ Done in 0.28.0.
-- Control-plane event stream (`WATCH`): a long-lived TCP connection that pushes membership events as they happen — `JOIN`, `SUSPECT`, `DEAD`, `ALIVE`, `REFUTE`, `LEAVE` — with the same id/incarnation/state shape as `PEERS`, so tooling can watch a cluster without polling `STATUS` / `MEMBERS` / `JSON` once a second; a slow consumer is dropped instead of buffering unboundedly, and the stream starts with a full snapshot so a late subscriber does not miss the current table.
+- ~~Control-plane event stream (`WATCH`): a long-lived TCP connection that pushes membership events as they happen — `JOINED`, `SUSPECTED`, `DEAD`, `REVIVED`, `DROPPED`, `REFUTED`, each with a sequence number, the member id, its incarnation and the unix time — with the same id/incarnation/state shape as `PEERS` for the opening snapshot, so tooling can watch a cluster without polling `STATUS` / `MEMBERS` / `JSON` once a second; a slow consumer is dropped instead of buffering unboundedly, and the stream starts with a full snapshot so a late subscriber does not miss the current table.~~ Done in 0.29.0.

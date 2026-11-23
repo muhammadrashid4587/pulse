@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+#include "events.h"
 #include "member.h"
 #include "metrics.h"
 
@@ -104,14 +105,43 @@
  *       state (path, last_reload / last_mtime as unix seconds, and
  *       the counts from the last load), or null when the node runs
  *       without --peer-file.
+ *   WATCH
+ *       A long-lived stream of membership events, for tooling that
+ *       watches a cluster instead of polling MEMBERS or JSON once a
+ *       second. The reply starts with "OK watching", then one
+ *       SNAPSHOT line per member — id, incarnation, state,
+ *       last-seen-ms (or '-') and source, the PEERS shape — then
+ *       END, then one EVENT line per membership event as it happens:
+ *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED>
+ *       <id> <incarnation> <unix-seconds>. JOINED is a peer
+ *       appearing in the table, SUSPECTED is ALIVE -> SUSPECT, DEAD
+ *       is SUSPECT -> DEAD, REVIVED is a SUSPECT/DEAD peer coming
+ *       back ALIVE, DROPPED is a peer leaving the table (GC after
+ *       its retention, a LEAVE, or a peer-file reload drop), and
+ *       REFUTED is this node hearing itself SUSPECT/DEAD and bumping
+ *       its incarnation. The connection stays open until the client
+ *       closes it (or falls too far behind: the event log is a
+ *       bounded ring, so a slow consumer gets "ERR gap: events lost,
+ *       reconnect" and must re-read the snapshot). Sequence numbers
+ *       are 1-based and monotonic for the node's life; a jump in
+ *       them means events were missed. The snapshot is taken after
+ *       the latest sequence is read, so no event is ever lost
+ *       between the two — an event in that window may appear both
+ *       in the snapshot and in the stream, and a client dedupes by
+ *       sequence number. WATCH runs on its own thread, so other
+ *       control-plane commands keep answering while a client
+ *       watches. No watch hooks: ERR watch not supported.
  *   anything else
  *       ERR unknown command
  *
  * The server is deliberately dumb: it knows nothing about the node's
  * threads or locks. All state access goes through the hooks, which the
  * node implements (snapshot copies the table under the node's lock;
- * force_leave removes under the lock). One connection is served at a
- * time; the server is a control interface, not a data path.
+ * force_leave removes under the lock). One-shot commands are served
+ * one connection at a time; the server is a control interface, not
+ * a data path. WATCH is the exception: it is a long-lived stream,
+ * so it runs on its own thread and the accept loop keeps serving
+ * other commands while a client watches.
  */
 
 /* RELOAD control-plane command (0.25.0): the outcome of re-reading
@@ -196,6 +226,20 @@ typedef struct {
      * reported as "slow" per member in JSON and as slow_peers in
      * METRICS and JSON. */
     int64_t slow_rtt_threshold_ms;
+    /* Membership events for the WATCH command (0.29.0): the next
+     * event after last_seq, or a wait for one. Returns 1 with *out
+     * filled, 0 when no new event arrived within timeout_ms, -1
+     * when the event after last_seq has already scrolled out of
+     * the node's bounded event log (the consumer fell too far
+     * behind and must reconnect and re-read the snapshot). NULL
+     * when the node does not support watching: WATCH then replies
+     * ERR watch not supported. */
+    int (*watch_next)(void *ctx, uint64_t last_seq, pulse_event_t *out,
+                      int timeout_ms);
+    /* The latest event sequence number (0 when no event has been
+     * recorded yet): a WATCH stream starts live from here, after
+     * its snapshot. NULL when the node does not support watching. */
+    uint64_t (*watch_latest_seq)(void *ctx);
     const char *self_id;
     int64_t start_ms; /* monotonic ms when the node started */
 } control_hooks_t;

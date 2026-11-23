@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -161,6 +162,28 @@ static void handle_members(int fd, const control_hooks_t *hooks) {
     send_all(fd, "END\n");
 }
 
+/* One member line in the PEERS shape — id, incarnation, state,
+ * last-seen-ms (or '-') and source — with the caller's prefix:
+ * "PEER" for PEERS, "SNAPSHOT" for the WATCH snapshot. Last-seen
+ * is ms since direct contact. Self never probes itself (its
+ * last_seen is just startup time), and a peer never heard from
+ * has last_seen_ms 0 — both report '-'. */
+static void format_peer_line(char *line, size_t cap, const char *prefix,
+                             const member_t *m,
+                             const control_hooks_t *hooks, int64_t now) {
+    char seenbuf[32];
+    if (strcmp(m->id, hooks->self_id) == 0 || m->last_seen_ms <= 0) {
+        snprintf(seenbuf, sizeof seenbuf, "-");
+    } else {
+        snprintf(seenbuf, sizeof seenbuf, "%lld",
+                 (long long)(now - m->last_seen_ms));
+    }
+    const char *source = peer_source_str(hooks, m->id);
+    snprintf(line, cap, "%s %s %u %s %s %s\n", prefix, m->id,
+             m->incarnation, member_state_name(m->state), seenbuf,
+             source);
+}
+
 static void handle_peers(int fd, const control_hooks_t *hooks) {
     member_table_t t;
     hooks->snapshot(hooks->ctx, &t);
@@ -168,21 +191,8 @@ static void handle_peers(int fd, const control_hooks_t *hooks) {
     /* A peer line is short: id, incarnation, state, last-seen, source. */
     char line[256];
     for (int i = 0; i < t.count; i++) {
-        const member_t *m = &t.members[i];
-        /* Last-seen is ms since direct contact. Self never probes
-         * itself (its last_seen is just startup time), and a peer
-         * never heard from has last_seen_ms 0 — both report '-'. */
-        char seenbuf[32];
-        if (strcmp(m->id, hooks->self_id) == 0 || m->last_seen_ms <= 0) {
-            snprintf(seenbuf, sizeof seenbuf, "-");
-        } else {
-            snprintf(seenbuf, sizeof seenbuf, "%lld",
-                     (long long)(now - m->last_seen_ms));
-        }
-        const char *source = peer_source_str(hooks, m->id);
-        snprintf(line, sizeof line, "PEER %s %u %s %s %s\n", m->id,
-                 m->incarnation, member_state_name(m->state), seenbuf,
-                 source);
+        format_peer_line(line, sizeof line, "PEER", &t.members[i],
+                         hooks, now);
         if (send_all(fd, line) != 0) return;
     }
     send_all(fd, "END\n");
@@ -458,13 +468,126 @@ static void handle_reload(int fd, const control_hooks_t *hooks) {
     }
 }
 
-static void handle_connection(int fd, const control_hooks_t *hooks) {
+/* WATCH (0.29.0): stream membership events on a long-lived
+ * connection. Runs on its own thread (see start_watch): the accept
+ * loop keeps serving one-shot commands while a client watches.
+ * The stream starts with the current table as SNAPSHOT lines (the
+ * PEERS shape) so a late subscriber sees the cluster as it is,
+ * then one EVENT line per membership event as it happens. The
+ * latest sequence is read BEFORE the snapshot, so no event is ever
+ * lost between the two: an event that lands in that window may
+ * appear both in the snapshot and in the stream, and the client
+ * dedupes by sequence number. The wait times out every second so
+ * a client that went away without closing is noticed promptly (a
+ * peek that returns 0 is a closed socket). A consumer that fell
+ * more than a ring behind gets an ERR line and the connection
+ * closes: it reconnects and re-reads the snapshot. */
+static void handle_watch(int fd, const control_hooks_t *hooks) {
+    /* Capture the hooks this thread needs up front: the thread is
+     * detached and outlives the connection setup, so it must not
+     * re-read the hooks struct on every loop iteration. */
+    int (*watch_next)(void *ctx, uint64_t last_seq, pulse_event_t *out,
+                      int timeout_ms) = hooks->watch_next;
+    uint64_t (*watch_latest_seq)(void *ctx) = hooks->watch_latest_seq;
+    void (*snapshot)(void *ctx, member_table_t *out) = hooks->snapshot;
+    uint64_t seq = watch_latest_seq(hooks->ctx);
+    member_table_t t;
+    snapshot(hooks->ctx, &t);
+    if (send_all(fd, "OK watching\n") != 0) {
+        close(fd);
+        return;
+    }
+    int64_t now = pulse_now_ms();
+    char line[256];
+    for (int i = 0; i < t.count; i++) {
+        format_peer_line(line, sizeof line, "SNAPSHOT", &t.members[i],
+                         hooks, now);
+        if (send_all(fd, line) != 0) {
+            close(fd);
+            return;
+        }
+    }
+    if (send_all(fd, "END\n") != 0) {
+        close(fd);
+        return;
+    }
+    for (;;) {
+        pulse_event_t ev;
+        int r = watch_next(hooks->ctx, seq, &ev, 1000);
+        if (r == 1) {
+            seq = ev.seq;
+            snprintf(line, sizeof line, "EVENT %llu %s %s %u %lld\n",
+                     (unsigned long long)ev.seq,
+                     pulse_event_type_name(ev.type), ev.id,
+                     ev.incarnation, (long long)ev.unix_ts);
+            if (send_all(fd, line) != 0) break;
+        } else if (r == -1) {
+            send_all(fd, "ERR gap: events lost, reconnect\n");
+            break;
+        } else {
+            /* Timed out with nothing new: check the client is
+             * still there. A peek that returns 0 is a closed
+             * socket; EAGAIN means nothing to read (and the
+             * client sent nothing, as expected); anything the
+             * client did send is ignored — WATCH takes no input
+             * after the command line. */
+            char c;
+            ssize_t n = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (n == 0) break;
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                errno != EINTR)
+                break;
+        }
+    }
+    close(fd);
+}
+
+typedef struct {
+    int fd;
+    const control_hooks_t *hooks;
+} watch_arg_t;
+
+static void *watch_thread(void *arg) {
+    watch_arg_t *w = arg;
+    handle_watch(w->fd, w->hooks);
+    free(w);
+    return NULL;
+}
+
+/* Start a WATCH stream on its own detached thread. Returns 1 when
+ * the thread owns the fd now (the caller must not close it), 0
+ * when the reply was already sent and the caller should close. */
+static int start_watch(int fd, const control_hooks_t *hooks) {
+    if (!hooks->watch_next || !hooks->watch_latest_seq) {
+        send_all(fd, "ERR watch not supported\n");
+        return 0;
+    }
+    watch_arg_t *w = malloc(sizeof *w);
+    if (!w) {
+        send_all(fd, "ERR watch not supported\n");
+        return 0;
+    }
+    w->fd = fd;
+    w->hooks = hooks;
+    pthread_t th;
+    if (pthread_create(&th, NULL, watch_thread, w) != 0) {
+        free(w);
+        send_all(fd, "ERR watch not supported\n");
+        return 0;
+    }
+    pthread_detach(th);
+    return 1;
+}
+
+/* Handle one connection. Returns 1 when the fd was handed to a
+ * WATCH thread (the caller must not close it), 0 otherwise. */
+static int handle_connection(int fd, const control_hooks_t *hooks) {
     char line[CONTROL_MAX_LINE];
     int n = read_line(fd, line, sizeof line);
-    if (n < 0) return;
+    if (n < 0) return 0;
     if (n == 0) {
         send_all(fd, "ERR empty command\n");
-        return;
+        return 0;
     }
     /* Split the command word from its argument. */
     char *sp = strchr(line, ' ');
@@ -490,9 +613,12 @@ static void handle_connection(int fd, const control_hooks_t *hooks) {
         handle_metrics(fd, hooks);
     } else if (strcmp(line, "JSON") == 0) {
         handle_json(fd, hooks);
+    } else if (strcmp(line, "WATCH") == 0) {
+        return start_watch(fd, hooks);
     } else {
         send_all(fd, "ERR unknown command\n");
     }
+    return 0;
 }
 
 void control_serve(int fd, const control_hooks_t *hooks) {
@@ -504,7 +630,8 @@ void control_serve(int fd, const control_hooks_t *hooks) {
             if (errno == EINTR) continue;
             return; /* listen socket shut down: stop serving */
         }
-        handle_connection(conn, hooks);
-        close(conn);
+        /* A WATCH hands its fd to its own thread; every other
+         * command is served here and the connection closes. */
+        if (!handle_connection(conn, hooks)) close(conn);
     }
 }

@@ -1,0 +1,104 @@
+#define _POSIX_C_SOURCE 200809L
+#include "events.h"
+
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+void pulse_event_log_init(pulse_event_log_t *log) {
+    memset(log, 0, sizeof *log);
+    pthread_mutex_init(&log->lock, NULL);
+    pthread_cond_init(&log->cond, NULL);
+    log->next_seq = 1;
+}
+
+const char *pulse_event_type_name(pulse_event_type_t type) {
+    switch (type) {
+        case PULSE_EVENT_JOINED:
+            return "JOINED";
+        case PULSE_EVENT_SUSPECTED:
+            return "SUSPECTED";
+        case PULSE_EVENT_DEAD:
+            return "DEAD";
+        case PULSE_EVENT_REVIVED:
+            return "REVIVED";
+        case PULSE_EVENT_DROPPED:
+            return "DROPPED";
+        case PULSE_EVENT_REFUTED:
+            return "REFUTED";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+void pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
+                        const char *id, uint32_t incarnation,
+                        int64_t unix_ts) {
+    pthread_mutex_lock(&log->lock);
+    pulse_event_t *slot = &log->events[log->head];
+    slot->seq = log->next_seq++;
+    slot->type = type;
+    snprintf(slot->id, sizeof slot->id, "%s", id);
+    slot->incarnation = incarnation;
+    slot->unix_ts = unix_ts;
+    log->head = (log->head + 1) % PULSE_EVENT_LOG_CAP;
+    if (log->count < PULSE_EVENT_LOG_CAP) log->count++;
+    /* A waiter may be waiting for exactly this event; a broadcast
+     * wakes it, and it re-checks under the lock. */
+    pthread_cond_broadcast(&log->cond);
+    pthread_mutex_unlock(&log->lock);
+}
+
+uint64_t pulse_event_latest_seq(pulse_event_log_t *log) {
+    pthread_mutex_lock(&log->lock);
+    uint64_t seq = log->next_seq - 1;
+    pthread_mutex_unlock(&log->lock);
+    return seq;
+}
+
+int pulse_event_wait(pulse_event_log_t *log, uint64_t after_seq,
+                     pulse_event_t *out, int timeout_ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&log->lock);
+    for (;;) {
+        uint64_t wanted = after_seq + 1;
+        uint64_t oldest = log->next_seq - (uint64_t)log->count;
+        if (log->count > 0 && wanted < oldest) {
+            /* The event the caller wants next has scrolled out of
+             * the ring: it fell too far behind to catch up from
+             * the buffer, so it must resync instead. */
+            pthread_mutex_unlock(&log->lock);
+            return -1;
+        }
+        if (wanted < log->next_seq) {
+            /* Buffered: the wanted event sits (wanted - oldest)
+             * slots past the oldest held event. The index math
+             * stays in range: head - count + offset is at worst
+             * -(CAP - 1), so one add of CAP fixes a negative. */
+            int idx = (log->head - log->count +
+                       (int)(wanted - oldest)) %
+                      PULSE_EVENT_LOG_CAP;
+            if (idx < 0) idx += PULSE_EVENT_LOG_CAP;
+            *out = log->events[idx];
+            pthread_mutex_unlock(&log->lock);
+            return 1;
+        }
+        /* Caught up: wait for the next record, or time out so the
+         * caller can check the client is still there. A spurious
+         * wakeup just re-checks the same conditions. */
+        int r = pthread_cond_timedwait(&log->cond, &log->lock,
+                                       &deadline);
+        if (r == ETIMEDOUT) {
+            pthread_mutex_unlock(&log->lock);
+            return 0;
+        }
+    }
+}

@@ -28,6 +28,8 @@
 #include <unistd.h>
 
 #include "adaptive.h"
+#include "control.h"
+#include "events.h"
 #include "gossip.h"
 #include "member.h"
 #include "metrics.h"
@@ -122,6 +124,11 @@ static int g_control_sock = -1; /* TCP control plane listen socket */
 static int g_family = AF_INET; /* address family of this node */
 static control_hooks_t g_hooks;
 static pulse_metrics_t g_metrics;
+static pulse_event_log_t g_event_log; /* membership events for WATCH
+    (0.29.0): every transition below records one here, next to the
+    log line for the same transition, so the log and the log file
+    agree. The log has its own lock; recording never takes g_lock,
+    so it is safe to call after the table lock is released. */
 static int64_t g_start_ms = 0;
 static volatile sig_atomic_t g_stop = 0;
 /* Live peer-file reload (0.24.0): SIGHUP sets this flag and nothing
@@ -315,6 +322,15 @@ static void peer_set_known_version(const char *id, uint64_t version) {
     pthread_mutex_unlock(&g_lock);
 }
 
+/* Membership events for WATCH (0.29.0): record one event in the
+ * node's event log. Call after the table lock is released, next to
+ * the log line for the same transition. */
+static void record_event(pulse_event_type_t type, const char *id,
+                         uint32_t incarnation) {
+    pulse_event_record(&g_event_log, type, id, incarnation,
+                       (int64_t)time(NULL));
+}
+
 /* Direct contact with a member: it is alive. Logs JOIN for a first sighting
  * and ALIVE when a suspected/dead member comes back. The address stored is
  * the one the member advertises in its id, never the datagram source. */
@@ -338,8 +354,12 @@ static void note_contact(const gmsg_t *msg,
     pthread_mutex_unlock(&g_lock);
     if (is_new) {
         log_line("JOIN %s", msg->from_id);
+        record_event(PULSE_EVENT_JOINED, msg->from_id, msg->from_inc);
     } else if (revived) {
         log_line("ALIVE %s", msg->from_id);
+        /* revived means the state changed to ALIVE, so the peer
+         * was SUSPECT or DEAD: a revival, not a routine heartbeat. */
+        record_event(PULSE_EVENT_REVIVED, msg->from_id, msg->from_inc);
     }
 }
 
@@ -369,12 +389,14 @@ static void handle_membership_msg(const gmsg_t *msg,
      * stops two converged nodes from answering each other forever. */
     int learned = 0;
     char new_ids[8][PULSE_ID_LEN];
+    uint32_t new_inc[8];
     int new_count = 0;
     /* State transitions learned from gossip (e.g. a peer's digest
      * says a member is DEAD, or a restarted member is ALIVE again
      * at a higher incarnation). Logged after unlock, like JOINs. */
     char changed_ids[8][PULSE_ID_LEN];
     member_state_t changed_states[8];
+    uint32_t changed_inc[8];
     int changed_count = 0;
     pthread_mutex_lock(&g_lock);
     member_t *sender_before = member_find(&g_table, msg->from_id);
@@ -438,6 +460,7 @@ static void handle_membership_msg(const gmsg_t *msg,
             learned = 1;
         if ((r & MERGE_NEW) && new_count < 8) {
             snprintf(new_ids[new_count], PULSE_ID_LEN, "%s", e->id);
+            new_inc[new_count] = e->incarnation;
             new_count++;
         }
         if ((r & MERGE_CHANGED) && changed_count < 8) {
@@ -446,6 +469,7 @@ static void handle_membership_msg(const gmsg_t *msg,
                 snprintf(changed_ids[changed_count], PULSE_ID_LEN,
                          "%s", e->id);
                 changed_states[changed_count] = after->state;
+                changed_inc[changed_count] = after->incarnation;
                 changed_count++;
             }
         }
@@ -464,21 +488,34 @@ static void handle_membership_msg(const gmsg_t *msg,
     pthread_mutex_unlock(&g_lock);
     if (is_new) {
         log_line("JOIN %s", msg->from_id);
+        record_event(PULSE_EVENT_JOINED, msg->from_id, msg->from_inc);
     } else if (revived) {
         log_line("ALIVE %s", msg->from_id);
+        record_event(PULSE_EVENT_REVIVED, msg->from_id, msg->from_inc);
     }
-    for (int i = 0; i < new_count; i++)
+    for (int i = 0; i < new_count; i++) {
         log_line("JOIN %s", new_ids[i]);
-    for (int i = 0; i < changed_count; i++) {
-        if (changed_states[i] == MEMBER_DEAD)
-            log_line("DEAD %s", changed_ids[i]);
-        else if (changed_states[i] == MEMBER_ALIVE)
-            log_line("ALIVE %s", changed_ids[i]);
-        else
-            log_line("SUSPECT %s", changed_ids[i]);
+        record_event(PULSE_EVENT_JOINED, new_ids[i], new_inc[i]);
     }
-    if (refute)
+    for (int i = 0; i < changed_count; i++) {
+        if (changed_states[i] == MEMBER_DEAD) {
+            log_line("DEAD %s", changed_ids[i]);
+            record_event(PULSE_EVENT_DEAD, changed_ids[i],
+                         changed_inc[i]);
+        } else if (changed_states[i] == MEMBER_ALIVE) {
+            log_line("ALIVE %s", changed_ids[i]);
+            record_event(PULSE_EVENT_REVIVED, changed_ids[i],
+                         changed_inc[i]);
+        } else {
+            log_line("SUSPECT %s", changed_ids[i]);
+            record_event(PULSE_EVENT_SUSPECTED, changed_ids[i],
+                         changed_inc[i]);
+        }
+    }
+    if (refute) {
         log_line("REFUTE %s inc=%u", g_self_id, g_incarnation);
+        record_event(PULSE_EVENT_REFUTED, g_self_id, g_incarnation);
+    }
     if (reply_sync && learned) {
         /* Answer a full table with our own, so the exchange converges
          * both sides in one round trip — but only when the exchange
@@ -752,6 +789,7 @@ static void reload_peer_file_locked(pulse_reload_result_t *r) {
     join_action_t joins[16];
     int n_joins = 0;
     char dropped[16][PULSE_ID_LEN];
+    uint32_t dropped_inc[16]; /* incarnation of each dropped peer */
     int n_dropped = 0;
     char kept[16][PULSE_ID_LEN];
     int n_kept = 0;
@@ -783,6 +821,7 @@ static void reload_peer_file_locked(pulse_reload_result_t *r) {
             }
         } else {
             if (m) member_force_remove(&g_table, removed[i], now);
+            dropped_inc[n_dropped] = m ? m->incarnation : 0;
             copy_id(dropped[n_dropped++], removed[i]);
         }
     }
@@ -834,6 +873,7 @@ static void reload_peer_file_locked(pulse_reload_result_t *r) {
                           : member_find(&g_table, g_cfg.kept_peers[i]);
         if (!in_file && m && m->state != MEMBER_ALIVE) {
             member_force_remove(&g_table, g_cfg.kept_peers[i], now);
+            dropped_inc[n_dropped] = m->incarnation;
             copy_id(dropped[n_dropped++], g_cfg.kept_peers[i]);
             list_swap_remove(g_cfg.kept_peers,
                              &g_cfg.kept_peer_count, i);
@@ -858,11 +898,17 @@ static void reload_peer_file_locked(pulse_reload_result_t *r) {
     for (int i = 0; i < n_added; i++) {
         /* An added peer with no room never joined the seed list; the
          * summary line counts it as skipped, not added. */
-        if (i < n_added - n_full)
+        if (i < n_added - n_full) {
             log_line("PEERFILE ADD %s", added[i]);
+            /* New in the table, incarnation unknown until it
+             * answers: 0 is honest, not a guess. */
+            record_event(PULSE_EVENT_JOINED, added[i], 0);
+        }
     }
-    for (int i = 0; i < n_dropped; i++)
+    for (int i = 0; i < n_dropped; i++) {
         log_line("PEERFILE DROP %s", dropped[i]);
+        record_event(PULSE_EVENT_DROPPED, dropped[i], dropped_inc[i]);
+    }
     for (int i = 0; i < n_kept; i++)
         log_line("PEERFILE KEEP %s (still ALIVE)", kept[i]);
     for (int i = 0; i < n_full; i++)
@@ -1137,17 +1183,21 @@ static void probe_cycle(int cycle) {
      * suspicion has no local heartbeat to measure against, so the
      * gossip path records -1 instead (see the GOSSIP handler). */
     int changed_idx[8];
+    uint32_t changed_inc[8]; /* incarnation of each newly suspected peer */
     int n_changed = 0;
     for (int i = 0; i < n_suspect; i++) {
         member_t *m = member_find(&g_table, suspect_ids[i]);
         int64_t latency = m ? now - m->last_seen_ms : -1;
         if (member_mark_suspect(&g_table, suspect_ids[i], now)) {
-            changed_idx[n_changed++] = i;
+            changed_idx[n_changed] = i;
+            changed_inc[n_changed] = m ? m->incarnation : 0;
+            n_changed++;
             metrics_note_suspect(&g_metrics, latency);
         }
     }
     /* 3. Sweep stale suspects to dead. */
     char newly_dead[8][PULSE_ID_LEN];
+    uint32_t newly_dead_inc[8];
     int n_dead = 0;
     for (int i = 0; i < g_table.count; i++) {
         member_t *m = &g_table.members[i];
@@ -1158,6 +1208,7 @@ static void probe_cycle(int cycle) {
                 metrics_note_dead(&g_metrics, duration);
                 if (n_dead < 8) {
                     snprintf(newly_dead[n_dead], PULSE_ID_LEN, "%s", m->id);
+                    newly_dead_inc[n_dead] = m->incarnation;
                     n_dead++;
                 }
             }
@@ -1167,10 +1218,38 @@ static void probe_cycle(int cycle) {
      * Tombstones live twice as long: a peer that learned the DEAD entry
      * later than we did still has up to one retention period to GC it
      * itself, and the tombstone stops its gossip from resurrecting the
-     * entry here in the meantime. */
+     * entry here in the meantime. member_gc returns only ids, so the
+     * incarnations for the DROPPED events are captured first: a DEAD
+     * entry past retention is exactly what GC removes. */
+    char gc_cand_ids[8][PULSE_ID_LEN];
+    uint32_t gc_cand_inc[8];
+    int n_gc_cand = 0;
+    for (int i = 0; i < g_table.count && n_gc_cand < 8; i++) {
+        member_t *m = &g_table.members[i];
+        if (m->state == MEMBER_DEAD &&
+            now - m->state_since_ms >= g_cfg.dead_retention_ms) {
+            snprintf(gc_cand_ids[n_gc_cand], PULSE_ID_LEN, "%s", m->id);
+            gc_cand_inc[n_gc_cand] = m->incarnation;
+            n_gc_cand++;
+        }
+    }
     char gc_ids[8][PULSE_ID_LEN];
     int n_gc = member_gc(&g_table, now, g_cfg.dead_retention_ms,
                          2 * g_cfg.dead_retention_ms, gc_ids, 8);
+    /* Match each removed id to its pre-GC incarnation (0 when the
+     * entry was somehow not among the candidates — it cannot
+     * happen, since GC removes exactly the entries past retention,
+     * but a 0 incarnation beats a wrong one). */
+    uint32_t gc_inc[8];
+    for (int i = 0; i < n_gc; i++) {
+        gc_inc[i] = 0;
+        for (int j = 0; j < n_gc_cand; j++) {
+            if (strcmp(gc_ids[i], gc_cand_ids[j]) == 0) {
+                gc_inc[i] = gc_cand_inc[j];
+                break;
+            }
+        }
+    }
     /* 4. Gossip a digest to a few random peers every other cycle. The
      * fanout grows with log2(cluster size) — 1 peer for a 2-node
      * cluster, up to 4 for 8+ peers — so news still spreads in
@@ -1268,11 +1347,21 @@ static void probe_cycle(int cycle) {
                      suspect_phi[idx]);
         else
             log_line("SUSPECT %s", suspect_ids[idx]);
+        record_event(PULSE_EVENT_SUSPECTED, suspect_ids[idx],
+                     changed_inc[i]);
     }
-    for (int i = 0; i < n_dead; i++)
+    for (int i = 0; i < n_dead; i++) {
         log_line("DEAD %s", newly_dead[i]);
-    for (int i = 0; i < n_gc; i++)
+        record_event(PULSE_EVENT_DEAD, newly_dead[i], newly_dead_inc[i]);
+    }
+    /* gc_ids holds at most 8 ids even when more entries were GC'd
+     * in one cycle (member_gc returns the total removed), so the
+     * loop is bounded at 8: reading past the array would log
+     * garbage. */
+    for (int i = 0; i < n_gc && i < 8; i++) {
         log_line("GC %s", gc_ids[i]);
+        record_event(PULSE_EVENT_DROPPED, gc_ids[i], gc_inc[i]);
+    }
     if (have_digest) {
         /* One digest per peer, each a delta against what that peer is
          * believed to already know. A peer with no record — never sent
@@ -1384,10 +1473,16 @@ static int force_leave_hook(void *ctx, const char *id) {
     (void)ctx;
     if (strcmp(id, g_self_id) == 0) return -1;
     int removed = 0;
+    uint32_t inc = 0;
     pthread_mutex_lock(&g_lock);
+    member_t *m = member_find(&g_table, id);
+    if (m) inc = m->incarnation;
     removed = member_force_remove(&g_table, id, pulse_now_ms());
     pthread_mutex_unlock(&g_lock);
-    if (removed) log_line("LEAVE %s", id);
+    if (removed) {
+        log_line("LEAVE %s", id);
+        record_event(PULSE_EVENT_DROPPED, id, inc);
+    }
     return removed;
 }
 
@@ -1406,6 +1501,19 @@ static void peer_file_state_hook(void *ctx, pulse_peer_file_state_t *out) {
     pthread_mutex_lock(&g_lock);
     *out = g_peerfile_state;
     pthread_mutex_unlock(&g_lock);
+}
+
+/* WATCH control-plane command (0.29.0): the next membership event
+ * after a sequence number, and the latest sequence number. */
+static int watch_next_hook(void *ctx, uint64_t last_seq,
+                           pulse_event_t *out, int timeout_ms) {
+    (void)ctx;
+    return pulse_event_wait(&g_event_log, last_seq, out, timeout_ms);
+}
+
+static uint64_t watch_latest_seq_hook(void *ctx) {
+    (void)ctx;
+    return pulse_event_latest_seq(&g_event_log);
 }
 
 /* Set one annotation on this node itself (control plane META): update
@@ -1841,6 +1949,7 @@ int main(int argc, char **argv) {
 
     member_table_init(&g_table);
     metrics_init(&g_metrics);
+    pulse_event_log_init(&g_event_log);
     /* The address stored for self is the one the id advertises: peers
      * already reply to the advertised id, so the table entry should
      * agree with it. (An unparseable --id falls back to loopback.) */
@@ -1981,6 +2090,8 @@ int main(int argc, char **argv) {
         g_hooks.force_leave = force_leave_hook;
         g_hooks.reload_peer_file = reload_peer_file_hook;
         g_hooks.peer_file_state = peer_file_state_hook;
+        g_hooks.watch_next = watch_next_hook;
+        g_hooks.watch_latest_seq = watch_latest_seq_hook;
         g_hooks.set_meta = set_meta_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
         g_hooks.peer_source = peer_source_hook;

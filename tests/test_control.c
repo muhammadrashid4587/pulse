@@ -1,5 +1,6 @@
 /* Unit tests for the TCP control plane dispatch (RELOAD, 0.25.0;
- * PEERS, 0.27.0; peer-file state in METRICS/JSON, 0.28.0):
+ * PEERS, 0.27.0; peer-file state in METRICS/JSON, 0.28.0; WATCH,
+ * 0.29.0):
  * fake hooks serve canned state, and the test drives the real
  * control_listen / control_serve over loopback, checking the exact
  * reply lines for RELOAD success, no peer file, an unreadable file,
@@ -15,7 +16,15 @@
  * integration test (tests/test_reload.sh) and the SIGHUP reload
  * tests; PEERS provenance end to end is covered by
  * tests/test_peers.sh, and the METRICS/JSON exposure end to end by
- * tests/test_peerfile_metrics.sh. */
+ * tests/test_peerfile_metrics.sh. WATCH (0.29.0) is covered two
+ * ways: the event log itself (record / wait order, timeout, wakeup
+ * on record, and the gap when the ring overflows), and the stream
+ * over the control plane (OK, a SNAPSHOT of the canned table, then
+ * live EVENT lines for events recorded after connecting, with
+ * one-shot commands still answering while the stream is open, and
+ * a clean ERR with no watch hooks). The WATCH events end to end —
+ * a join, a suspect and a revival, a death, a LEAVE drop — are
+ * covered by tests/test_watch.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -25,9 +34,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "control.h"
+#include "events.h"
 #include "member.h"
 #include "metrics.h"
 
@@ -139,6 +151,22 @@ static void reload_hook(void *ctx, pulse_reload_result_t *out) {
 
 static control_hooks_t g_hooks;
 
+/* WATCH (0.29.0): the fake watch hooks are backed by a real event
+ * log, so the stream test records events after connecting and
+ * reads them off the wire. */
+static pulse_event_log_t g_watch_log;
+
+static int watch_next_hook(void *ctx, uint64_t last_seq,
+                           pulse_event_t *out, int timeout_ms) {
+    (void)ctx;
+    return pulse_event_wait(&g_watch_log, last_seq, out, timeout_ms);
+}
+
+static uint64_t watch_latest_seq_hook(void *ctx) {
+    (void)ctx;
+    return pulse_event_latest_seq(&g_watch_log);
+}
+
 static void *serve_thread(void *arg) {
     int fd = *(int *)arg;
     control_serve(fd, &g_hooks);
@@ -179,7 +207,125 @@ static int send_cmd(int port, const char *cmd, char *out, size_t cap) {
     return (int)n;
 }
 
+/* Connect to the control port without sending anything: the
+ * caller drives the conversation (a WATCH stream stays open). */
+static int watch_connect(int port) {
+    char addrbuf[64];
+    snprintf(addrbuf, sizeof addrbuf, "127.0.0.1:%d", port);
+    struct sockaddr_storage dst;
+    if (member_parse_addr(addrbuf, &dst) != 0) return -1;
+    int fd = socket(dst.ss_family, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&dst, pulse_addr_len(&dst)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Read from a WATCH connection until buf holds needle (or the
+ * timeout elapses). Returns 1 when found. The socket has a
+ * receive timeout, so a stuck stream fails the test instead of
+ * hanging it. buf is NUL-terminated on entry and after each read. */
+static int watch_read_until(int fd, char *buf, size_t cap, size_t *len,
+                            const char *needle, int timeout_ms) {
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (long)(timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    for (;;) {
+        if (strstr(buf, needle) != NULL) return 1;
+        if (*len + 1 >= cap) return 0;
+        ssize_t r = recv(fd, buf + *len, cap - *len - 1, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return 0; /* timeout or error */
+        }
+        if (r == 0) return 0; /* server closed */
+        *len += (size_t)r;
+        buf[*len] = '\0';
+    }
+}
+
+/* Records one event into the log after a short sleep, so the
+ * wakeup path of pulse_event_wait is exercised from another
+ * thread instead of only the already-buffered path. */
+static void *record_later_thread(void *arg) {
+    pulse_event_log_t *log = arg;
+    struct timespec ts = {0, 50 * 1000000L};
+    nanosleep(&ts, NULL);
+    pulse_event_record(log, PULSE_EVENT_REVIVED, "127.0.0.1:17901", 2,
+                       1700000003);
+    return NULL;
+}
+
+/* The event log itself (0.29.0): record / wait order, timeout,
+ * cross-thread wakeup, and the gap when the ring overflows. */
+static void test_event_log(void) {
+    pulse_event_log_t log;
+    pulse_event_log_init(&log);
+
+    /* Type names are the words on the wire. */
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_JOINED), "JOINED") == 0);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_SUSPECTED), "SUSPECTED") == 0);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_DEAD), "DEAD") == 0);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_REVIVED), "REVIVED") == 0);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_DROPPED), "DROPPED") == 0);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_REFUTED), "REFUTED") == 0);
+
+    /* Empty log: no latest seq, and a short wait times out. */
+    pulse_event_t ev;
+    CHECK(pulse_event_latest_seq(&log) == 0);
+    CHECK(pulse_event_wait(&log, 0, &ev, 20) == 0);
+
+    /* Recorded events come back in order, with 1-based seqs. */
+    pulse_event_record(&log, PULSE_EVENT_JOINED, "127.0.0.1:17901", 1,
+                       1700000000);
+    pulse_event_record(&log, PULSE_EVENT_SUSPECTED, "127.0.0.1:17901", 1,
+                       1700000001);
+    pulse_event_record(&log, PULSE_EVENT_DEAD, "127.0.0.1:17901", 1,
+                       1700000002);
+    CHECK(pulse_event_latest_seq(&log) == 3);
+    CHECK(pulse_event_wait(&log, 0, &ev, 20) == 1);
+    CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
+          strcmp(ev.id, "127.0.0.1:17901") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000000);
+    CHECK(pulse_event_wait(&log, 1, &ev, 20) == 1);
+    CHECK(ev.seq == 2 && ev.type == PULSE_EVENT_SUSPECTED);
+    CHECK(pulse_event_wait(&log, 2, &ev, 20) == 1);
+    CHECK(ev.seq == 3 && ev.type == PULSE_EVENT_DEAD);
+    /* Caught up: a short wait times out instead of repeating. */
+    CHECK(pulse_event_wait(&log, 3, &ev, 20) == 0);
+
+    /* A wait for a future seq wakes when the event is recorded on
+     * another thread. */
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, record_later_thread, &log) == 0);
+    CHECK(pulse_event_wait(&log, 3, &ev, 2000) == 1);
+    CHECK(ev.seq == 4 && ev.type == PULSE_EVENT_REVIVED &&
+          ev.incarnation == 2 && ev.unix_ts == 1700000003);
+    pthread_join(th, NULL);
+
+    /* Overflow: past the ring capacity the oldest events scroll
+     * out, and a wait for one of them reports the gap instead of
+     * returning a stale event. Seqs 1-4 are already recorded, so
+     * after CAP+5 more the next seq is CAP+10 and the oldest held
+     * is 10: seqs below 10 are gone. */
+    for (int i = 0; i < PULSE_EVENT_LOG_CAP + 5; i++)
+        pulse_event_record(&log, PULSE_EVENT_JOINED, "127.0.0.1:17902",
+                           1, 1700000100 + i);
+    CHECK(pulse_event_latest_seq(&log) ==
+          (uint64_t)(PULSE_EVENT_LOG_CAP + 9));
+    CHECK(pulse_event_wait(&log, 8, &ev, 20) == -1);
+    /* The oldest surviving event is still readable. */
+    CHECK(pulse_event_wait(&log, 9, &ev, 20) == 1);
+    CHECK(ev.seq == 10 && ev.type == PULSE_EVENT_JOINED &&
+          strcmp(ev.id, "127.0.0.1:17902") == 0);
+}
+
 int main(void) {
+    test_event_log();
+
     g_hooks.ctx = NULL;
     g_hooks.snapshot = snapshot_hook;
     g_hooks.metrics = metrics_hook;
@@ -350,6 +496,48 @@ int main(void) {
     g_hooks.peer_file_state = peer_file_state_hook;
     g_peerfile_mode = 0;
 
+    /* WATCH (0.29.0): the stream starts with OK, a SNAPSHOT of the
+     * canned table in the PEERS shape, and END — then live events
+     * recorded after connecting arrive as EVENT lines, in order,
+     * with 1-based sequence numbers. While the WATCH is open, a
+     * one-shot command on another connection still answers: the
+     * stream does not starve the control plane. */
+    pulse_event_log_init(&g_watch_log);
+    g_hooks.watch_next = watch_next_hook;
+    g_hooks.watch_latest_seq = watch_latest_seq_hook;
+    int wfd = watch_connect(18991);
+    CHECK(wfd >= 0);
+    if (wfd >= 0) {
+        const char *wcmd = "WATCH\n";
+        CHECK(send(wfd, wcmd, strlen(wcmd), 0) == (ssize_t)strlen(wcmd));
+        char wbuf[4096];
+        size_t wlen = 0;
+        wbuf[0] = '\0';
+        CHECK(watch_read_until(wfd, wbuf, sizeof wbuf, &wlen, "END\n",
+                               3000));
+        CHECK(strncmp(wbuf, "OK watching\n", 12) == 0);
+        CHECK(strstr(wbuf, "SNAPSHOT 127.0.0.1:17999 1 ALIVE - self\n") != NULL);
+        CHECK(strstr(wbuf, "SNAPSHOT 127.0.0.1:17901 1 ALIVE ") != NULL);
+        CHECK(strstr(wbuf, " seed\n") != NULL);
+        CHECK(strstr(wbuf, "SNAPSHOT 127.0.0.1:17903 2 ALIVE ") != NULL);
+        CHECK(strstr(wbuf, " peer-file\n") != NULL);
+        /* MEMBERS still answers while the WATCH is open. */
+        CHECK(send_cmd(18991, "MEMBERS\n", reply, sizeof reply) > 0);
+        CHECK(strstr(reply, "MEMBER 127.0.0.1:17999 1 ALIVE") != NULL);
+        /* Events recorded after the snapshot stream live. */
+        pulse_event_record(&g_watch_log, PULSE_EVENT_JOINED,
+                           "127.0.0.1:17901", 1, 1700000000);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_SUSPECTED,
+                           "127.0.0.1:17903", 2, 1700000001);
+        CHECK(watch_read_until(wfd, wbuf, sizeof wbuf, &wlen,
+                               "EVENT 1 JOINED 127.0.0.1:17901 1 1700000000\n",
+                               3000));
+        CHECK(watch_read_until(wfd, wbuf, sizeof wbuf, &wlen,
+                               "EVENT 2 SUSPECTED 127.0.0.1:17903 2 1700000001\n",
+                               3000));
+        close(wfd);
+    }
+
     shutdown(fd, SHUT_RDWR);
     close(fd);
     pthread_join(server, NULL);
@@ -363,6 +551,12 @@ int main(void) {
         CHECK(pthread_create(&server, NULL, serve_thread, &fd) == 0);
         CHECK(send_cmd(18992, "RELOAD\n", reply, sizeof reply) > 0);
         CHECK(strcmp(reply, "ERR reload not supported\n") == 0);
+        /* A node with no watch hooks at all: WATCH is refused
+         * cleanly instead of crashing on a NULL hook. */
+        g_hooks.watch_next = NULL;
+        g_hooks.watch_latest_seq = NULL;
+        CHECK(send_cmd(18992, "WATCH\n", reply, sizeof reply) > 0);
+        CHECK(strcmp(reply, "ERR watch not supported\n") == 0);
         shutdown(fd, SHUT_RDWR);
         close(fd);
         pthread_join(server, NULL);
