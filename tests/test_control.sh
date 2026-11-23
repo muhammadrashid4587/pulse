@@ -102,7 +102,7 @@ json="$(ctl 18401 JSON)"
 if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
    && echo "$json" | grep -q '"id":"127.0.0.1:17401"' \
    && echo "$json" | grep -q '"total":1' \
-   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17401","incarnation":1,"state":"ALIVE","phi":null,"meta":{}}\]' \
+   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17401","incarnation":1,"state":"ALIVE","phi":null,"meta":{},"rtt_ms":null,"rtt_mean_ms":null}\]' \
    && echo "$json" | grep -q '"metrics":{"suspected":0,"dead":0,"refutes":0,"joins":0' \
    && echo "$json" | grep -q '"detect_latency_ms":{"mean":null,"max":0,"samples":0,"hist":\[0,0,0,0,0\]}' \
    && echo "$json" | grep -q "^END$"; then
@@ -140,6 +140,25 @@ if echo "$members" | grep -q "127.0.0.1:17401.*ALIVE" \
 else
     note fail "MEMBERS lists both nodes after join"
     echo "--- ctl output:"; echo "$members"
+fi
+
+# 2b. Probe RTT (0.21.0): once the nodes have probed each other, JSON
+# reports a numeric rtt_ms / rtt_mean_ms for the peer (self stays
+# null — a node never probes itself). Poll: the first probe round
+# takes a cycle or two.
+rtt_seen=0
+for i in $(seq 1 25); do
+    if ctl 18401 JSON | head -n 1 | grep -q '"id":"127.0.0.1:17402".*"rtt_ms":[0-9][0-9]*,"rtt_mean_ms":[0-9][0-9]*'; then
+        rtt_seen=1; break
+    fi
+    sleep 0.2
+done
+if [ "$rtt_seen" -eq 1 ] \
+   && ctl 18401 JSON | head -n 1 | grep -q '"id":"127.0.0.1:17401".*"rtt_ms":null,"rtt_mean_ms":null'; then
+    note ok "JSON reports a numeric probe RTT for the peer and null for self"
+else
+    note fail "JSON reports a numeric probe RTT for the peer and null for self"
+    echo "--- ctl output:"; ctl 18401 JSON
 fi
 
 # 3. LEAVE the second node on the first: OK, and it is gone from the
@@ -224,7 +243,7 @@ fi
 # (not null).
 json="$(ctl 18401 JSON)"
 if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
-   && echo "$json" | grep -q '"id":"127.0.0.1:17402","incarnation":1,"state":"DEAD","phi":null,"meta":{}}' \
+   && echo "$json" | grep -q '"id":"127.0.0.1:17402","incarnation":1,"state":"DEAD","phi":null,"meta":{},"rtt_ms":[0-9][0-9]*,"rtt_mean_ms":[0-9][0-9]*}' \
    && echo "$json" | grep -q '"dead":1' \
    && echo "$json" | grep -qE '"suspected":[1-9][0-9]*' \
    && echo "$json" | grep -qE '"detect_latency_ms":\{"mean":[0-9]+,"max":[0-9]+,"samples":[1-9][0-9]*,"hist":\[[0-9,]+\]\}' \

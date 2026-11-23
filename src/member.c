@@ -305,6 +305,9 @@ member_t *member_add(member_table_t *t, const char *id,
     m->state = MEMBER_ALIVE;
     m->last_seen_ms = 0;
     m->state_since_ms = 0;
+    m->rtt_ms = -1;
+    m->rtt_sum_ms = 0;
+    m->rtt_samples = 0;
     phi_init(&m->phi);
     note_change(t, m);
     return m;
@@ -478,6 +481,16 @@ int member_merge(member_table_t *t, const char *self_id, const char *id,
         return MERGE_CHANGED;
     }
     return MERGE_NONE;
+}
+
+int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms) {
+    if (rtt_ms < 0) return 0;
+    member_t *m = member_find(t, id);
+    if (!m) return 0;
+    m->rtt_ms = rtt_ms;
+    m->rtt_sum_ms += rtt_ms;
+    m->rtt_samples++;
+    return 1;
 }
 
 int member_mark_suspect(member_table_t *t, const char *id, int64_t now) {

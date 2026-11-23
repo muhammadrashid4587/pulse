@@ -175,6 +175,26 @@ int main(void) {
                      MEMBER_DEAD, now + 300000);
     CHECK(r & MERGE_NEW); /* tombstone expired, entry accepted again */
 
+    /* probe RTT (0.21.0): -1 until a probe is answered, then last and
+     * mean; unknown ids and negative samples are ignored, and
+     * recording an RTT is not a gossip-visible change */
+    member_t *m2 = member_find(&t, "127.0.0.1:17102");
+    CHECK(m2->rtt_ms == -1);
+    CHECK(m2->rtt_samples == 0);
+    uint64_t v_before = t.version;
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 3) == 1);
+    CHECK(m2->rtt_ms == 3);
+    CHECK(m2->rtt_samples == 1);
+    CHECK(m2->rtt_sum_ms == 3);
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 7) == 1);
+    CHECK(m2->rtt_ms == 7);
+    CHECK(m2->rtt_samples == 2);
+    CHECK(m2->rtt_sum_ms == 10);
+    CHECK(t.version == v_before); /* RTT is local, not gossip content */
+    CHECK(member_note_rtt(&t, "127.0.0.1:17999", 5) == 0);
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", -1) == 0);
+    CHECK(m2->rtt_ms == 7);
+
     /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
     CHECK(member_gossip_fanout(0) == 1);
     CHECK(member_gossip_fanout(1) == 1);

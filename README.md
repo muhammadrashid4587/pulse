@@ -110,6 +110,11 @@ building block, not a production service mesh.
   command, gossiped with its membership entry, visible in `MEMBERS`
   and `JSON`, and persisted across restarts. See "Member metadata"
   below.
+- Probe RTT: each node measures the round-trip time of its direct
+  probes (PING to ACK) per peer — the last RTT and the mean over all
+  answered probes — and reports them per member in `JSON` as
+  `rtt_ms` / `rtt_mean_ms`, so an operator can see which peers are
+  slow before they ever get suspected. See "Probe RTT" below.
 
 ## What it is not
 
@@ -288,7 +293,7 @@ the port beyond localhost.
 # END
 
 ./pulse-ctl 127.0.0.1:18401 JSON
-# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"}},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42,"meta":{}}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}}}
+# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42,"meta":{},"rtt_ms":1,"rtt_mean_ms":0}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}}}
 # END
 ```
 
@@ -307,7 +312,7 @@ Commands:
 | `META <key=value>` | Set one annotation on this node itself: `OK <key=value>`. The change is gossiped with the next digest and persisted to the data dir, so it survives a restart. Bad syntax: `ERR invalid meta <arg>`; a ninth distinct key: `ERR meta full (max 8)`; missing argument: `ERR usage: META <key=value>`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
 | `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. |
-| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none). Built for tooling that polls cluster state without scraping the text protocol. |
+| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self). Built for tooling that polls cluster state without scraping the text protocol. |
 | anything else | `ERR unknown command` |
 
 ## Shared secret
@@ -691,6 +696,38 @@ whoever claims them. With a shared secret only trusted peers can
 inject them; without one, any process on the network can already
 claim to be a member.
 
+## Probe RTT
+
+Every direct probe already times its own round trip: the prober
+records when a PING goes out and the ACK's arrival closes the loop.
+That measurement is now kept per peer — the last RTT in ms and the
+mean over every probe that peer has answered — and reported per
+member in `JSON` as `rtt_ms` / `rtt_mean_ms`:
+
+```sh
+./pulse-ctl 127.0.0.1:18401 JSON
+# {"id":"127.0.0.1:17101",...,"members":[{"id":"127.0.0.1:17101",...,"rtt_ms":null,"rtt_mean_ms":null},{"id":"127.0.0.1:17102",...,"rtt_ms":1,"rtt_mean_ms":0}],...}
+```
+
+The point is early warning, not precision. A peer whose RTT is
+climbing toward the ack timeout is a peer about to be suspected, and
+on a ward network that climb is the first sign of a congested link
+or a device struggling under load — visible here while the peer is
+still ALIVE, instead of only in the detection-latency histogram
+after it has already been suspected.
+
+Three honest caveats. The clock has millisecond resolution, so on
+loopback the RTT is usually 0 or 1 ms and the mean rounds down to 0;
+the numbers only become interesting on a real network, or with a
+slow peer. An ACK that arrives via an indirect probe still matches
+the pending direct probe, so its sample runs from the PING send to
+the forwarded ACK's arrival — an upper bound on the direct RTT,
+not a direct measurement. And the RTT is local measurement, not
+cluster state: it is never gossiped, never persisted, and does not
+bump the table version, so a restarted node starts at `null` again
+until its next probe is answered, and two nodes can legitimately
+disagree about a third peer's RTT.
+
 ## Tests
 
 ```sh
@@ -699,7 +736,9 @@ make test
 
 - `tests/test_member.c`: unit tests for the membership table — merge
   precedence, incarnation rules, refutation, state transitions, peer
-  selection.
+  selection, and probe RTT recording (last/mean, unknown ids and
+  negative samples ignored, recording an RTT is not a gossip-visible
+  change).
 - `tests/test_cluster.sh`: integration test with real processes — 3 nodes
   converge, a killed node is marked DEAD by both survivors, the survivors
   agree on membership, and a restarted node (same data dir) is cleared
@@ -743,6 +782,9 @@ make test
   second node appears in `MEMBERS` after joining, `LEAVE` removes it
   from the listing immediately, the live node comes back via direct
   contact, and `LEAVE` of a dead node removes it for good.
+  Probe RTT: after the join, `JSON` reports a numeric `rtt_ms` /
+  `rtt_mean_ms` for the peer and `null` for self, and after the kill
+  the dead member still carries its measured RTT.
 - `tests/test_secret.c`: unit tests for the join gate — SHA-256
   against FIPS 180-4 vectors (including one million 'a's), HMAC-SHA256
   against the RFC 4231 test case 2 vector, tag shape and
@@ -886,3 +928,4 @@ make test
 - ~~Adaptive probe interval: while any peer is SUSPECT the probe cycle shortens from the base interval to a fast interval (default half the base, `--probe-interval-fast-ms` to set it, floored at 25 ms, never slower than base), so direct probes, indirect PING_REQ, the suspect-to-dead sweep and gossip rounds all run faster exactly while the cluster is mid-incident, then return to base when the table is suspect-free; each switch is logged as an `ADAPTIVE` line and the fast cycles are counted as `adaptive_fast_cycles` in `METRICS` and `JSON`.~~ Done in 0.18.0.
 - ~~Suspicion-refutation window: a SUSPECT that comes back ALIVE is counted as a refuted suspicion (`suspect_refuted` in `METRICS` and `JSON`), with the time it sat SUSPECT recorded as a refute latency (mean/max/samples) — locally revived peers add a measured sample, gossip-learned refutations count only, and a DEAD peer coming back is a restart, not a refutation — so an operator can see how long false suspicions stay visible to the cluster.~~ Done in 0.19.0.
 - ~~Member metadata/annotations: each node carries up to 8 `key=value` annotations about itself (`role=worker`, `zone=us-east-1`, `version=1.2.3`), set with repeatable `--meta` flags or the control plane's `META` command, gossiped with its membership entry as an `;k=v,k=v` suffix (entries from older nodes parse unchanged), visible in `MEMBERS` and as a `meta` object per member in `JSON`, and persisted across restarts — the node's own set in `<data-dir>/meta` (flags win, otherwise the saved set is restored) and peers' sets as an optional fifth field in `<data-dir>/members`; an entry carrying no annotations never wipes stored ones.~~ Done in 0.20.0.
+- ~~Probe RTT per peer: each node measures the round-trip time of its direct probes (PING send to ACK receipt) per peer and reports the last RTT and the mean over all answered probes per member in `JSON` as `rtt_ms` / `rtt_mean_ms` (`null` until a probe has been answered, always `null` for self), so an operator can see which peers are slow before they are ever suspected.~~ Done in 0.21.0.

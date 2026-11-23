@@ -62,6 +62,19 @@ typedef struct {
      * (member_mark_alive). Gossip about a peer is not a heartbeat —
      * only a packet from the peer itself proves it is alive. */
     phi_accrual_t phi;
+    /* Probe round-trip time for this peer (0.21.0): the last measured
+     * direct-probe PING->ACK round trip in ms, and the running mean
+     * over all answered probes. Local measurement only — never
+     * gossiped, never persisted, and not a table-version change (like
+     * last_seen_ms, it is not gossip content). rtt_ms is -1 until a
+     * probe has been answered; self never probes itself, so self
+     * stays -1. A peer answered only via an indirect probe still gets
+     * a sample: the clock runs from our PING send to the ACK's
+     * arrival, including the indirect leg, so it is an upper bound
+     * on the direct RTT, not a direct measurement. */
+    int64_t rtt_ms;
+    int64_t rtt_sum_ms;
+    int64_t rtt_samples;
     /* Metadata the member carries about itself (role, zone, version,
      * ...): set at startup with --meta, changeable at runtime with
      * the control plane's META command, gossiped with the membership
@@ -190,6 +203,13 @@ int member_mark_dead(member_table_t *t, const char *id, int64_t now);
 int member_mark_alive(member_table_t *t, const char *id,
                       const struct sockaddr_storage *addr,
                       uint32_t incarnation, int64_t now);
+
+/* Record a probe round-trip time for a peer: the ms between sending a
+ * PING (direct, or via PING_REQ) and receiving its ACK. Updates the
+ * last RTT and the running mean. Returns 1 when the member exists, 0
+ * otherwise. Does not bump the table version: RTT is local
+ * measurement, not gossip content. A negative sample is ignored. */
+int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms);
 
 int member_count_state(const member_table_t *t, member_state_t state);
 /* Force-remove a member (operator action, e.g. the control plane's

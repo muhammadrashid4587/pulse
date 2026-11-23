@@ -425,10 +425,20 @@ static void handle_message(const gmsg_t *msg) {
         case GMSG_ACK: {
             struct sockaddr_storage requester;
             int has_requester = 0;
+            /* Direct-probe round trip (0.21.0): the pending probe
+             * records when its PING went out, so the ACK's arrival
+             * measures the probe latency for this peer. An ACK that
+             * arrived via an indirect probe still matches the
+             * pending entry, so its sample includes the indirect
+             * leg — an upper bound on the direct RTT, not a direct
+             * measurement. A stale or duplicate ACK matches no
+             * pending probe and adds no sample. */
+            int64_t rtt_ms = -1;
             pthread_mutex_lock(&g_lock);
             for (int i = 0; i < MAX_PENDING; i++) {
                 if (g_pending[i].active && g_pending[i].seq == msg->seq &&
                     strcmp(g_pending[i].target_id, msg->from_id) == 0) {
+                    rtt_ms = pulse_now_ms() - g_pending[i].sent_ms;
                     g_pending[i].active = 0;
                     break;
                 }
@@ -442,6 +452,8 @@ static void handle_message(const gmsg_t *msg) {
                     break;
                 }
             }
+            if (rtt_ms >= 0)
+                member_note_rtt(&g_table, msg->from_id, rtt_ms);
             pthread_mutex_unlock(&g_lock);
             note_contact(msg, &from_addr);
             if (has_requester) {

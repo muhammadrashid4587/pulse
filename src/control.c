@@ -172,11 +172,27 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
          * escaping is needed (see member_meta_json). */
         char metajson[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1) + 32];
         member_meta_json(mem, metajson, sizeof metajson);
+        /* Probe RTT (0.21.0): the last measured PING->ACK round trip
+         * in ms, and the mean over all answered probes. Both are
+         * null until a probe has been answered; self never probes
+         * itself, so self stays null. */
+        char rttbuf[32], rttmeanbuf[32];
+        if (mem->rtt_ms < 0 || mem->rtt_samples == 0) {
+            snprintf(rttbuf, sizeof rttbuf, "null");
+            snprintf(rttmeanbuf, sizeof rttmeanbuf, "null");
+        } else {
+            snprintf(rttbuf, sizeof rttbuf, "%lld",
+                     (long long)mem->rtt_ms);
+            snprintf(rttmeanbuf, sizeof rttmeanbuf, "%lld",
+                     (long long)(mem->rtt_sum_ms / mem->rtt_samples));
+        }
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
-                     "\"phi\":%s,\"meta\":%s}",
+                     "\"phi\":%s,\"meta\":%s,\"rtt_ms\":%s,"
+                     "\"rtt_mean_ms\":%s}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
-                     member_state_name(mem->state), phibuf, metajson);
+                     member_state_name(mem->state), phibuf, metajson,
+                     rttbuf, rttmeanbuf);
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }
