@@ -48,7 +48,12 @@ static int send_all(int fd, const char *s) {
     size_t len = strlen(s);
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = send(fd, s + sent, len - sent, 0);
+        /* MSG_NOSIGNAL: a client that went away mid-send must fail
+         * this send (and close the stream), not kill the node with
+         * SIGPIPE — a WATCH client disconnecting just as an EVENT
+         * is being written would otherwise take the whole process
+         * down with it. */
+        ssize_t n = send(fd, s + sent, len - sent, MSG_NOSIGNAL);
         if (n <= 0) return -1;
         sent += (size_t)n;
     }
@@ -468,6 +473,108 @@ static void handle_reload(int fd, const control_hooks_t *hooks) {
     }
 }
 
+/* WATCH filter (0.30.0): what a filtered WATCH subscribes to. A
+ * WATCH with no filter matches everything; a filter narrows it to
+ * certain event types, certain peer ids, or both. The type mask has
+ * one bit per pulse_event_type_t; the id list holds canonical
+ * "host:port" ids (parsed and re-formatted, so an equivalent
+ * spelling still matches). At most PULSE_MAX_MEMBERS ids: a filter
+ * naming more peers than the table can hold is nonsense. */
+typedef struct {
+    int have_types;
+    uint32_t type_mask;
+    int have_ids;
+    char ids[PULSE_MAX_MEMBERS][PULSE_ID_LEN];
+    int n_ids;
+} watch_filter_t;
+
+/* Parse one comma-separated filter token. A token containing ':' is
+ * a peer-id list: every part must parse as a host:port address
+ * (IPv6 bracketed), and is stored canonicalised. A token without
+ * ':' is an event-type list: every part must be one of the six
+ * EVENT words. Returns 0 on success, -1 with err filled on a bad
+ * token (unknown type, unparsable id, or too many ids). */
+static int parse_watch_filter_token(const char *token, watch_filter_t *f,
+                                    char *err, size_t errcap) {
+    char copy[CONTROL_MAX_LINE];
+    snprintf(copy, sizeof copy, "%s", token);
+    int is_ids = strchr(copy, ':') != NULL;
+    char *save = NULL;
+    for (char *part = strtok_r(copy, ",", &save); part;
+         part = strtok_r(NULL, ",", &save)) {
+        if (is_ids) {
+            struct sockaddr_storage addr;
+            if (member_parse_addr(part, &addr) != 0) {
+                snprintf(err, errcap, "invalid peer id %s", part);
+                return -1;
+            }
+            if (f->n_ids >= PULSE_MAX_MEMBERS) {
+                snprintf(err, errcap, "too many peer ids (max %d)",
+                         PULSE_MAX_MEMBERS);
+                return -1;
+            }
+            /* Canonicalise through parse + format, so an id typed
+             * in an equivalent spelling still matches the ids
+             * the events carry. */
+            member_format_id(&addr, f->ids[f->n_ids], PULSE_ID_LEN);
+            f->n_ids++;
+            f->have_ids = 1;
+        } else {
+            pulse_event_type_t type;
+            if (pulse_event_type_parse(part, &type) != 0) {
+                snprintf(err, errcap, "unknown event type %s", part);
+                return -1;
+            }
+            f->type_mask |= (uint32_t)(1u << type);
+            f->have_types = 1;
+        }
+    }
+    return 0;
+}
+
+/* Parse the argument of a WATCH command into a filter: a type list,
+ * an id list, or both, in any order, each list comma-separated and
+ * each token whitespace-separated. A NULL or empty argument is an
+ * unfiltered WATCH. Returns 0 on success, -1 with err filled. */
+static int parse_watch_filter(const char *arg, watch_filter_t *f,
+                              char *err, size_t errcap) {
+    memset(f, 0, sizeof *f);
+    if (!arg || arg[0] == '\0') return 0;
+    char copy[CONTROL_MAX_LINE];
+    snprintf(copy, sizeof copy, "%s", arg);
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, " \t", &save); tok;
+         tok = strtok_r(NULL, " \t", &save)) {
+        if (parse_watch_filter_token(tok, f, err, errcap) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* Does this event pass the filter? A filtered-out type or an id
+ * outside the list is dropped server-side, before sending. */
+static int watch_filter_match(const watch_filter_t *f,
+                              const pulse_event_t *ev) {
+    if (f->have_types && !(f->type_mask & (uint32_t)(1u << ev->type)))
+        return 0;
+    if (f->have_ids) {
+        for (int i = 0; i < f->n_ids; i++)
+            if (strcmp(f->ids[i], ev->id) == 0) return 1;
+        return 0;
+    }
+    return 1;
+}
+
+/* Does this peer id pass the filter's id list (the snapshot side:
+ * a type filter does not narrow the snapshot, which has no event
+ * type — only an id filter does)? */
+static int watch_filter_match_id(const watch_filter_t *f, const char *id) {
+    if (!f->have_ids) return 1;
+    for (int i = 0; i < f->n_ids; i++)
+        if (strcmp(f->ids[i], id) == 0) return 1;
+    return 0;
+}
+
 /* WATCH (0.29.0): stream membership events on a long-lived
  * connection. Runs on its own thread (see start_watch): the accept
  * loop keeps serving one-shot commands while a client watches.
@@ -481,8 +588,32 @@ static void handle_reload(int fd, const control_hooks_t *hooks) {
  * a client that went away without closing is noticed promptly (a
  * peek that returns 0 is a closed socket). A consumer that fell
  * more than a ring behind gets an ERR line and the connection
- * closes: it reconnects and re-reads the snapshot. */
-static void handle_watch(int fd, const control_hooks_t *hooks) {
+ * closes: it reconnects and re-reads the snapshot.
+ *
+ * A filter (0.30.0) narrows the stream: WATCH takes an optional
+ * type list, an id list, or both, e.g. "WATCH JOINED,DEAD" (only
+ * those event types), "WATCH 127.0.0.1:17102" (only that peer), or
+ * "WATCH JOINED,DEAD 127.0.0.1:17102" (both). The filter is
+ * applied server-side before sending, and the snapshot is narrowed
+ * by the id list too, so a watcher subscribed to one peer sees
+ * only that peer. An event that does not match is skipped but its
+ * sequence number is still consumed, so a filtered stream's numbers
+ * jump by design — a jump means filtered-out events, not lost ones,
+ * and only a gap ERR means the client fell behind. A bad filter is
+ * refused up front with "ERR invalid watch filter <reason>" and
+ * the connection closes. */
+static void handle_watch(int fd, const control_hooks_t *hooks,
+                         const char *arg) {
+    watch_filter_t filter;
+    char ferr[128];
+    if (parse_watch_filter(arg, &filter, ferr, sizeof ferr) != 0) {
+        char line[256];
+        snprintf(line, sizeof line, "ERR invalid watch filter %s\n",
+                 ferr);
+        send_all(fd, line);
+        close(fd);
+        return;
+    }
     /* Capture the hooks this thread needs up front: the thread is
      * detached and outlives the connection setup, so it must not
      * re-read the hooks struct on every loop iteration. */
@@ -500,6 +631,7 @@ static void handle_watch(int fd, const control_hooks_t *hooks) {
     int64_t now = pulse_now_ms();
     char line[256];
     for (int i = 0; i < t.count; i++) {
+        if (!watch_filter_match_id(&filter, t.members[i].id)) continue;
         format_peer_line(line, sizeof line, "SNAPSHOT", &t.members[i],
                          hooks, now);
         if (send_all(fd, line) != 0) {
@@ -515,7 +647,12 @@ static void handle_watch(int fd, const control_hooks_t *hooks) {
         pulse_event_t ev;
         int r = watch_next(hooks->ctx, seq, &ev, 1000);
         if (r == 1) {
+            /* Always consume the sequence number, even for a
+             * filtered-out event: the next wait is for the event
+             * after this one, or the same event would be returned
+             * again forever. Only a matching event is sent. */
             seq = ev.seq;
+            if (!watch_filter_match(&filter, &ev)) continue;
             snprintf(line, sizeof line, "EVENT %llu %s %s %u %lld\n",
                      (unsigned long long)ev.seq,
                      pulse_event_type_name(ev.type), ev.id,
@@ -545,11 +682,14 @@ static void handle_watch(int fd, const control_hooks_t *hooks) {
 typedef struct {
     int fd;
     const control_hooks_t *hooks;
+    /* The WATCH argument, copied: the thread outlives the
+     * connection's line buffer, so it must own its copy. */
+    char arg[CONTROL_MAX_LINE];
 } watch_arg_t;
 
 static void *watch_thread(void *arg) {
     watch_arg_t *w = arg;
-    handle_watch(w->fd, w->hooks);
+    handle_watch(w->fd, w->hooks, w->arg);
     free(w);
     return NULL;
 }
@@ -557,7 +697,8 @@ static void *watch_thread(void *arg) {
 /* Start a WATCH stream on its own detached thread. Returns 1 when
  * the thread owns the fd now (the caller must not close it), 0
  * when the reply was already sent and the caller should close. */
-static int start_watch(int fd, const control_hooks_t *hooks) {
+static int start_watch(int fd, const control_hooks_t *hooks,
+                       const char *arg) {
     if (!hooks->watch_next || !hooks->watch_latest_seq) {
         send_all(fd, "ERR watch not supported\n");
         return 0;
@@ -569,6 +710,7 @@ static int start_watch(int fd, const control_hooks_t *hooks) {
     }
     w->fd = fd;
     w->hooks = hooks;
+    snprintf(w->arg, sizeof w->arg, "%s", arg ? arg : "");
     pthread_t th;
     if (pthread_create(&th, NULL, watch_thread, w) != 0) {
         free(w);
@@ -614,7 +756,7 @@ static int handle_connection(int fd, const control_hooks_t *hooks) {
     } else if (strcmp(line, "JSON") == 0) {
         handle_json(fd, hooks);
     } else if (strcmp(line, "WATCH") == 0) {
-        return start_watch(fd, hooks);
+        return start_watch(fd, hooks, arg);
     } else {
         send_all(fd, "ERR unknown command\n");
     }

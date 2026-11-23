@@ -81,6 +81,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_reload.sh
 	bash tests/test_peers.sh
 	bash tests/test_watch.sh
+	bash tests/test_watch_filter.sh
 
 clean:
 	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile test_control

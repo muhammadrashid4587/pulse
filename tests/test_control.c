@@ -24,7 +24,11 @@
  * one-shot commands still answering while the stream is open, and
  * a clean ERR with no watch hooks). The WATCH events end to end —
  * a join, a suspect and a revival, a death, a LEAVE drop — are
- * covered by tests/test_watch.sh. */
+ * covered by tests/test_watch.sh. WATCH filtering (0.30.0) is
+ * covered here too: a filtered stream's snapshot holds only the
+ * filtered peer, only matching events arrive, and a bad filter is
+ * refused up front; the filter end to end is covered by
+ * tests/test_watch_filter.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -537,6 +541,61 @@ int main(void) {
                                3000));
         close(wfd);
     }
+
+    /* WATCH filter (0.30.0): a type list, an id list, or both narrows
+     * the stream server-side, and the snapshot is narrowed by the id
+     * list too. A filtered-out event still consumes its sequence
+     * number, so the numbers the client sees jump. The log already
+     * holds seqs 1-2, so the events below are 3-6. */
+    int ffd = watch_connect(18991);
+    CHECK(ffd >= 0);
+    if (ffd >= 0) {
+        const char *fcmd = "WATCH JOINED 127.0.0.1:17901\n";
+        CHECK(send(ffd, fcmd, strlen(fcmd), 0) == (ssize_t)strlen(fcmd));
+        char fbuf[4096];
+        size_t flen = 0;
+        fbuf[0] = '\0';
+        CHECK(watch_read_until(ffd, fbuf, sizeof fbuf, &flen, "END\n",
+                               3000));
+        CHECK(strncmp(fbuf, "OK watching\n", 12) == 0);
+        /* The snapshot holds only the filtered peer. */
+        CHECK(strstr(fbuf, "SNAPSHOT 127.0.0.1:17901 1 ALIVE ") != NULL);
+        CHECK(strstr(fbuf, "SNAPSHOT 127.0.0.1:17903") == NULL);
+        CHECK(strstr(fbuf, "SNAPSHOT 127.0.0.1:17999") == NULL);
+        /* Only JOINED for 17901 arrives: SUSPECTED for 17901 fails
+         * the type filter, JOINED for 17903 fails the id filter,
+         * and DEAD for 17901 fails the type filter. */
+        pulse_event_record(&g_watch_log, PULSE_EVENT_JOINED,
+                           "127.0.0.1:17901", 1, 1700000010);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_SUSPECTED,
+                           "127.0.0.1:17901", 1, 1700000011);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_JOINED,
+                           "127.0.0.1:17903", 2, 1700000012);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_DEAD,
+                           "127.0.0.1:17901", 1, 1700000013);
+        CHECK(watch_read_until(ffd, fbuf, sizeof fbuf, &flen,
+                               "EVENT 3 JOINED 127.0.0.1:17901 1 1700000010\n",
+                               3000));
+        /* Drain anything else the stream would send: the buffered
+         * events are processed at once, so a 1.5 s read for a line
+         * that never arrives leaves the buffer settled. */
+        CHECK(watch_read_until(ffd, fbuf, sizeof fbuf, &flen,
+                               "EVENT 999", 1500) == 0);
+        CHECK(strstr(fbuf, "EVENT 4 SUSPECTED") == NULL);
+        CHECK(strstr(fbuf, "EVENT 5 JOINED 127.0.0.1:17903") == NULL);
+        CHECK(strstr(fbuf, "EVENT 6 DEAD") == NULL);
+        close(ffd);
+    }
+
+    /* A bad filter is refused up front, and the connection closes. */
+    CHECK(send_cmd(18991, "WATCH BOGUS\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply,
+                 "ERR invalid watch filter unknown event type BOGUS\n") == 0);
+    CHECK(send_cmd(18991, "WATCH 127.0.0.1:notaport\n", reply,
+                   sizeof reply) > 0);
+    CHECK(strcmp(reply,
+                 "ERR invalid watch filter invalid peer id "
+                 "127.0.0.1:notaport\n") == 0);
 
     shutdown(fd, SHUT_RDWR);
     close(fd);

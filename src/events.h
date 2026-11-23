@@ -62,6 +62,11 @@ void pulse_event_log_init(pulse_event_log_t *log);
  * the word that rides in the EVENT line for a type. */
 const char *pulse_event_type_name(pulse_event_type_t type);
 
+/* The reverse: the type for a wire word ("JOINED" -> JOINED), or -1
+ * when the word names no event type. Used by the WATCH filter
+ * (0.30.0), which takes the same words on the command line. */
+int pulse_event_type_parse(const char *name, pulse_event_type_t *out);
+
 /* Append one event (assigning it the next sequence number) and wake
  * any waiter. Thread-safe; never blocks. */
 void pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,

@@ -32,6 +32,18 @@ const char *pulse_event_type_name(pulse_event_type_t type) {
     }
 }
 
+int pulse_event_type_parse(const char *name, pulse_event_type_t *out) {
+    static const char *names[] = {"JOINED",   "SUSPECTED", "DEAD",
+                                  "REVIVED",  "DROPPED",   "REFUTED"};
+    for (int i = 0; i < 6; i++) {
+        if (strcmp(name, names[i]) == 0) {
+            *out = (pulse_event_type_t)i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 void pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
                         const char *id, uint32_t incarnation,
                         int64_t unix_ts) {

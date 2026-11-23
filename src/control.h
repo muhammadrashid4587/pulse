@@ -105,7 +105,7 @@
  *       state (path, last_reload / last_mtime as unix seconds, and
  *       the counts from the last load), or null when the node runs
  *       without --peer-file.
- *   WATCH
+ *   WATCH [types] [ids]
  *       A long-lived stream of membership events, for tooling that
  *       watches a cluster instead of polling MEMBERS or JSON once a
  *       second. The reply starts with "OK watching", then one
@@ -131,6 +131,21 @@
  *       sequence number. WATCH runs on its own thread, so other
  *       control-plane commands keep answering while a client
  *       watches. No watch hooks: ERR watch not supported.
+ *       A filter (0.30.0) narrows the stream server-side: an
+ *       optional type list, an id list, or both, in any order —
+ *       "WATCH JOINED,DEAD" (only those event types),
+ *       "WATCH 127.0.0.1:17102" (only that peer), or
+ *       "WATCH JOINED,DEAD 127.0.0.1:17102" (both). A token with a
+ *       ':' is an id list (comma-separated host:port, IPv6
+ *       bracketed); a token without one is a type list
+ *       (comma-separated EVENT words). The snapshot is narrowed by
+ *       the id list too, so a watcher subscribed to one peer sees
+ *       only that peer; a type filter does not narrow the snapshot,
+ *       which has no event type. A filtered-out event still
+ *       consumes its sequence number, so a filtered stream's
+ *       numbers jump by design — a jump means filtered-out events,
+ *       not lost ones. A bad filter is refused up front:
+ *       ERR invalid watch filter <reason>.
  *   anything else
  *       ERR unknown command
  *
