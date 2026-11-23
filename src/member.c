@@ -16,6 +16,41 @@ int64_t pulse_now_ms(void) {
 void member_table_init(member_table_t *t) {
     t->count = 0;
     t->tombstone_count = 0;
+    t->version = 0;
+}
+
+/* Record a change to one entry: bump the table version and stamp the
+ * entry with it, so a later digest can tell whether this peer already
+ * knows about the change. Every function below that changes what
+ * gossip would send goes through here (directly or via
+ * note_tombstone_change). A pure heartbeat — last_seen_ms moving —
+ * is not a change: the entry's gossip content is identical. */
+static void note_change(member_table_t *t, member_t *m) {
+    t->version++;
+    m->changed_version = t->version;
+}
+
+void member_note_changed(member_table_t *t, member_t *m) {
+    note_change(t, m);
+}
+
+/* Same, for a tombstone: bumping the version also covers the table
+ * entry that was removed to make room for it (one observable change:
+ * the member is gone and the tombstone says DEAD at its incarnation). */
+static void note_tombstone_change(member_table_t *t, tombstone_t *ts) {
+    t->version++;
+    ts->changed_version = t->version;
+}
+
+int member_changed_count(const member_table_t *t, uint64_t since_version) {
+    int n = 0;
+    for (int i = 0; i < t->count; i++) {
+        if (t->members[i].changed_version > since_version) n++;
+    }
+    for (int i = 0; i < t->tombstone_count; i++) {
+        if (t->tombstones[i].changed_version > since_version) n++;
+    }
+    return n;
 }
 
 /* Tombstones: a GC'd member leaves a record so gossip cannot bring it
@@ -60,6 +95,7 @@ static void tombstone_add(member_table_t *t, const char *id,
     snprintf(ts->id, sizeof(ts->id), "%s", idbuf);
     ts->incarnation = incarnation;
     ts->removed_ms = now;
+    note_tombstone_change(t, ts);
 }
 
 int member_gc(member_table_t *t, int64_t now, int64_t dead_retention_ms,
@@ -118,6 +154,7 @@ member_t *member_add(member_table_t *t, const char *id,
     m->last_seen_ms = 0;
     m->state_since_ms = 0;
     phi_init(&m->phi);
+    note_change(t, m);
     return m;
 }
 
@@ -279,11 +316,13 @@ int member_merge(member_table_t *t, const char *self_id, const char *id,
         m->state = state;
         m->state_since_ms = now;
         if (addr) m->addr = *addr;
+        note_change(t, m);
         return MERGE_CHANGED;
     }
     if (incarnation == m->incarnation && state_rank(state) > state_rank(m->state)) {
         m->state = state;
         m->state_since_ms = now;
+        note_change(t, m);
         return MERGE_CHANGED;
     }
     return MERGE_NONE;
@@ -294,6 +333,7 @@ int member_mark_suspect(member_table_t *t, const char *id, int64_t now) {
     if (!m || m->state != MEMBER_ALIVE) return 0;
     m->state = MEMBER_SUSPECT;
     m->state_since_ms = now;
+    note_change(t, m);
     return 1;
 }
 
@@ -302,6 +342,7 @@ int member_mark_dead(member_table_t *t, const char *id, int64_t now) {
     if (!m || m->state == MEMBER_DEAD) return 0;
     m->state = MEMBER_DEAD;
     m->state_since_ms = now;
+    note_change(t, m);
     return 1;
 }
 
@@ -325,11 +366,16 @@ int member_mark_alive(member_table_t *t, const char *id,
         return 1;
     }
     int changed = (m->state != MEMBER_ALIVE);
+    int inc_raised = (incarnation > m->incarnation);
     m->state = MEMBER_ALIVE;
-    if (incarnation > m->incarnation) m->incarnation = incarnation;
+    if (inc_raised) m->incarnation = incarnation;
     if (addr) m->addr = *addr;
     m->last_seen_ms = now;
     if (changed) m->state_since_ms = now;
+    /* A state change or a higher incarnation is gossip-visible, so it
+     * bumps the table version; a routine heartbeat that only moves
+     * last_seen_ms is not, and leaves the version alone. */
+    if (changed || inc_raised) note_change(t, m);
     phi_heartbeat(&m->phi, now);
     return changed;
 }

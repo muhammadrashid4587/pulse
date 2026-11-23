@@ -96,15 +96,107 @@ static int urgent_before(const member_t *a, const member_t *b) {
 
 int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                        const char *from_id, uint32_t inc,
-                       const member_table_t *t) {
+                       const member_table_t *t,
+                       uint64_t since_version,
+                       uint64_t *sent_through_version) {
     /* Entry text is built first so the header count can cover both the
      * member window and the tombstones appended after it. */
     char entries[1280];
     int off = 0;
     int n = t->count;
-    if (n == 0) return 0;
+    if (n == 0) {
+        if (sent_through_version) *sent_through_version = t->version;
+        return 0;
+    }
     int total = 0;
+    /* The highest changed_version actually sent: the peer can be
+     * recorded as knowing the table up to here. It only advances as
+     * far as the entries that fit in the digest. */
+    uint64_t through = since_version;
 
+    if (since_version > 0) {
+        /* Delta: only entries that changed after the peer's version,
+         * oldest change first, so the reported through-version is an
+         * exact prefix bound: the digest sends a prefix of version
+         * order, so every entry at or below the reported version went
+         * out and the newest changes simply wait for the next digest.
+         * (Sending newest-first instead would over-claim: a truncated
+         * digest would record the peer as knowing the newest change
+         * while older unsent changes below that version never went out
+         * again.) Members and tombstones share one version-ordered
+         * list: a tombstone appended after the members could otherwise
+         * be squeezed out by a full digest while its version sat below
+         * the reported bound, and the peer would never be sent it
+         * again. Nothing changed means nothing to say: send no
+         * datagram at all, and report the peer as current — a
+         * converged cluster stays quiet until something actually
+         * happens. */
+        typedef struct {
+            int is_tombstone;
+            int idx;
+            uint64_t ver;
+        } delta_item_t;
+        delta_item_t items[PULSE_MAX_MEMBERS + PULSE_MAX_TOMBSTONES];
+        int n_items = 0;
+        for (int i = 0; i < n; i++) {
+            if (t->members[i].changed_version > since_version) {
+                items[n_items].is_tombstone = 0;
+                items[n_items].idx = i;
+                items[n_items].ver = t->members[i].changed_version;
+                n_items++;
+            }
+        }
+        for (int i = 0; i < t->tombstone_count; i++) {
+            if (t->tombstones[i].changed_version > since_version) {
+                items[n_items].is_tombstone = 1;
+                items[n_items].idx = i;
+                items[n_items].ver = t->tombstones[i].changed_version;
+                n_items++;
+            }
+        }
+        /* Insertion sort by version ascending — the delta is at most
+         * 16 + 16 items and usually tiny. */
+        for (int i = 1; i < n_items; i++) {
+            delta_item_t key = items[i];
+            int j = i - 1;
+            while (j >= 0 && items[j].ver > key.ver) {
+                items[j + 1] = items[j];
+                j--;
+            }
+            items[j + 1] = key;
+        }
+        for (int k = 0; k < n_items && total < PULSE_GOSSIP_ENTRIES; k++) {
+            if (items[k].is_tombstone) {
+                const tombstone_t *ts = &t->tombstones[items[k].idx];
+                if (append_entry(entries, sizeof entries, &off, ts->id,
+                                 ts->incarnation, MEMBER_DEAD) != 0)
+                    break;
+            } else {
+                const member_t *m = &t->members[items[k].idx];
+                if (append_entry(entries, sizeof entries, &off, m->id,
+                                 m->incarnation, m->state) != 0)
+                    break;
+            }
+            total++;
+            if (items[k].ver > through)
+                through = items[k].ver;
+        }
+        if (total == 0) {
+            if (sent_through_version) *sent_through_version = t->version;
+            return 0;
+        }
+        char buf[PULSE_MAX_MSG];
+        int hoff = snprintf(buf, sizeof buf, "GOSSIP %s %u %d%s", from_id,
+                            inc, total, entries);
+        if (hoff < 0 || (size_t)hoff >= sizeof buf) return -1;
+        if (sent_through_version) *sent_through_version = through;
+        return send_str(sock, to, buf);
+    }
+
+    /* since_version 0: the peer's version is unknown, so the old
+     * digest goes out — urgent entries first, then the random window.
+     * A peer we know nothing about gets the full picture, not a delta
+     * against a version it may never have had. */
     /* Urgent entries first: SUSPECT/DEAD members, most recently changed
      * first, capped at PULSE_GOSSIP_URGENT. Insertion sort — the table
      * holds at most 64 members and the urgent set is usually tiny. */
@@ -133,6 +225,8 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                          m->incarnation, m->state) != 0)
             break;
         total++;
+        if (m->changed_version > through)
+            through = m->changed_version;
     }
 
     /* The rest of the digest is the usual random contiguous window,
@@ -154,6 +248,8 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                          m->incarnation, m->state) != 0)
             break;
         total++;
+        if (m->changed_version > through)
+            through = m->changed_version;
     }
     /* Tombstones ride along as DEAD entries when there is room: a
      * force-leave (or a GC removal) then spreads to peers, which mark
@@ -166,11 +262,14 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                          ts->incarnation, MEMBER_DEAD) != 0)
             break;
         total++;
+        if (ts->changed_version > through)
+            through = ts->changed_version;
     }
     char buf[PULSE_MAX_MSG];
     int hoff = snprintf(buf, sizeof buf, "GOSSIP %s %u %d%s", from_id, inc,
                         total, entries);
     if (hoff < 0 || (size_t)hoff >= sizeof buf) return -1;
+    if (sent_through_version) *sent_through_version = through;
     return send_str(sock, to, buf);
 }
 

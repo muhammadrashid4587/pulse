@@ -98,6 +98,27 @@ static uint32_t g_seq = 1;
 static pending_probe_t g_pending[MAX_PENDING];
 static pending_indirect_t g_indirect[MAX_PENDING];
 
+/* Per-peer gossip versions: the highest membership-table version we
+ * believe each peer has already received from us (see
+ * member_table_t.version). A digest to a peer carries only the entries
+ * that changed after that version (delta encoding, 0.16.0); a peer
+ * with no record, or one more than a digest's worth of changes behind,
+ * gets a full SYNC instead. Records are best-effort — UDP delivery is
+ * not guaranteed, so a lost delta can leave a peer behind the version
+ * recorded for it — but the periodic anti-entropy SYNC (full table,
+ * every ~10 s) heals that within one interval, and failure detection
+ * itself never depends on gossip: each node probes its peers directly.
+ * Only the prober thread and the receiver thread's reply paths touch
+ * this table, always through the helpers below, which take g_lock
+ * themselves; no caller may hold g_lock across them. */
+#define MAX_PEER_VERSIONS PULSE_MAX_MEMBERS
+typedef struct {
+    char id[PULSE_ID_LEN];
+    uint64_t known_version;
+} peer_version_t;
+static peer_version_t g_peer_versions[MAX_PEER_VERSIONS];
+static int g_n_peer_versions;
+
 static void log_line(const char *fmt, ...) {
     pthread_mutex_lock(&g_log_lock);
     double t = (pulse_now_ms() - g_start_ms) / 1000.0;
@@ -146,6 +167,55 @@ static void save_incarnation(const char *data_dir, uint32_t next) {
         fprintf(f, "%u\n", next);
         fclose(f);
     }
+}
+
+/* The table version a peer is believed to already know. *found is 0
+ * when we have never sent this peer anything (a new peer, or a peer
+ * whose record was evicted): the caller treats that as infinitely
+ * behind and answers with a full SYNC. */
+static uint64_t peer_known_version(const char *id, int *found) {
+    uint64_t v = 0;
+    *found = 0;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_n_peer_versions; i++) {
+        if (strcmp(g_peer_versions[i].id, id) == 0) {
+            v = g_peer_versions[i].known_version;
+            *found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return v;
+}
+
+/* Record that a peer now knows the table up to version: call after a
+ * digest (with the through-version the send reported) or after a full
+ * table went out (with the snapshot's version — a SYNC carries the
+ * whole table, so the peer is current as of it; the periodic SYNC
+ * heals the entries a single oversized SYNC could not fit). A version
+ * is never moved backwards: a stale snapshot's version is ignored. */
+static void peer_set_known_version(const char *id, uint64_t version) {
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_n_peer_versions; i++) {
+        if (strcmp(g_peer_versions[i].id, id) == 0) {
+            if (version > g_peer_versions[i].known_version)
+                g_peer_versions[i].known_version = version;
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+    }
+    if (g_n_peer_versions >= MAX_PEER_VERSIONS) {
+        /* Full: evict the oldest record to make room. The evicted
+         * peer simply gets a full SYNC on its next digest round. */
+        memmove(&g_peer_versions[0], &g_peer_versions[1],
+                sizeof(peer_version_t) * (MAX_PEER_VERSIONS - 1));
+        g_n_peer_versions--;
+    }
+    snprintf(g_peer_versions[g_n_peer_versions].id, PULSE_ID_LEN, "%s",
+             id);
+    g_peer_versions[g_n_peer_versions].known_version = version;
+    g_n_peer_versions++;
+    pthread_mutex_unlock(&g_lock);
 }
 
 /* Direct contact with a member: it is alive. Logs JOIN for a first sighting
@@ -251,7 +321,12 @@ static void handle_membership_msg(const gmsg_t *msg,
         g_incarnation++;
         save_incarnation(g_cfg.data_dir, g_incarnation + 1);
         member_t *self = member_find(&g_table, g_self_id);
-        if (self) self->incarnation = g_incarnation;
+        if (self) {
+            self->incarnation = g_incarnation;
+            /* Our own incarnation is gossip-visible: stamp the change
+             * so the next digest carries it as a delta entry. */
+            member_note_changed(&g_table, self);
+        }
     }
     pthread_mutex_unlock(&g_lock);
     if (is_new) {
@@ -275,13 +350,16 @@ static void handle_membership_msg(const gmsg_t *msg,
         /* Answer a full table with our own, so the exchange converges
          * both sides in one round trip — but only when the exchange
          * taught us something new (see above). Sent from a snapshot
-         * taken under the lock, like the JOIN reply. */
+         * taken under the lock, like the JOIN reply. The peer now
+         * holds our whole table as of the snapshot, so record it as
+         * current: its next digest can be a delta. */
         member_table_t copy;
         pthread_mutex_lock(&g_lock);
         copy = g_table;
         pthread_mutex_unlock(&g_lock);
-        gossip_send_full_table(g_send_sock, from_addr, g_self_id,
-                               g_incarnation, &copy);
+        if (gossip_send_full_table(g_send_sock, from_addr, g_self_id,
+                                   g_incarnation, &copy) == 0)
+            peer_set_known_version(msg->from_id, copy.version);
     }
 }
 
@@ -370,8 +448,12 @@ static void handle_message(const gmsg_t *msg) {
              * rotate the missing members through, while the seed
              * already holds the full picture. The joiner merges the
              * SYNC and answers with its own full table, so one
-             * exchange converges both sides. */
-            gossip_send_full_table(g_send_sock, &from_addr, g_self_id, g_incarnation, &copy);
+             * exchange converges both sides. The joiner now holds our
+             * whole table as of the snapshot, so record it as current:
+             * its next digest can be a delta. */
+            if (gossip_send_full_table(g_send_sock, &from_addr, g_self_id,
+                                       g_incarnation, &copy) == 0)
+                peer_set_known_version(msg->from_id, copy.version);
             break;
         }
 
@@ -647,11 +729,14 @@ static void probe_cycle(int cycle) {
      * fanout grows with log2(cluster size) — 1 peer for a 2-node
      * cluster, up to 4 for 8+ peers — so news still spreads in
      * O(log n) rounds as the cluster grows, without flooding a large
-     * cluster. Only ALIVE/SUSPECT peers are gossip targets; the same
-     * digest copy goes to each of them. */
+     * cluster. Only ALIVE/SUSPECT peers are gossip targets; each
+     * peer's digest is built from the same snapshot copy, but the
+     * digest itself is per-peer (a delta against what that peer is
+     * believed to already know — see the send loop below). */
     member_table_t digest_copy;
     int have_digest = 0;
     struct sockaddr_storage digest_to[4];
+    char digest_ids[4][PULSE_ID_LEN];
     int n_digest = 0;
     if (cycle % 2 == 0) {
         int n_peers = 0;
@@ -672,7 +757,9 @@ static void probe_cycle(int cycle) {
                 }
             }
             if (dup) continue;
-            digest_to[n_digest++] = d->addr;
+            digest_to[n_digest] = d->addr;
+            snprintf(digest_ids[n_digest], PULSE_ID_LEN, "%s", d->id);
+            n_digest++;
         }
         if (n_digest > 0) {
             digest_copy = g_table;
@@ -741,13 +828,40 @@ static void probe_cycle(int cycle) {
     for (int i = 0; i < n_gc; i++)
         log_line("GC %s", gc_ids[i]);
     if (have_digest) {
-        for (int i = 0; i < n_digest; i++)
-            gossip_send_digest(g_send_sock, &digest_to[i], g_self_id,
-                               g_incarnation, &digest_copy);
+        /* One digest per peer, each a delta against what that peer is
+         * believed to already know. A peer with no record — never sent
+         * to, or evicted — or one more than a digest's worth of changes
+         * behind gets a full SYNC instead: a delta cannot carry that
+         * much, and the SYNC converges it in one exchange. A peer that
+         * is current gets no datagram at all until something changes.
+         * The record advances only to what actually went out (the
+         * digest reports the highest changed version it carried), so
+         * a digest that could not fit every change leaves the rest
+         * for the next round instead of pretending the peer knows it. */
+        for (int i = 0; i < n_digest; i++) {
+            int found = 0;
+            uint64_t known = peer_known_version(digest_ids[i], &found);
+            int changed = member_changed_count(&digest_copy, known);
+            if (!found || changed > PULSE_GOSSIP_ENTRIES) {
+                if (gossip_send_full_table(g_send_sock, &digest_to[i],
+                                           g_self_id, g_incarnation,
+                                           &digest_copy) == 0)
+                    peer_set_known_version(digest_ids[i],
+                                           digest_copy.version);
+            } else {
+                uint64_t through = known;
+                if (gossip_send_digest(g_send_sock, &digest_to[i],
+                                       g_self_id, g_incarnation,
+                                       &digest_copy, known,
+                                       &through) == 0)
+                    peer_set_known_version(digest_ids[i], through);
+            }
+        }
     }
     if (have_sync) {
-        gossip_send_full_table(g_send_sock, &sync_to, g_self_id,
-                               g_incarnation, &sync_copy);
+        if (gossip_send_full_table(g_send_sock, &sync_to, g_self_id,
+                                   g_incarnation, &sync_copy) == 0)
+            peer_set_known_version(sync_id, sync_copy.version);
         log_line("SYNC %s", sync_id);
     }
     if (cycle % 10 == 0) {
@@ -1166,7 +1280,8 @@ int main(int argc, char **argv) {
             if (strcmp(m->id, g_self_id) == 0) continue;
             if (m->state == MEMBER_DEAD) continue;
             if (gossip_send_digest(g_send_sock, &m->addr, g_self_id,
-                                   g_incarnation, &leave_copy) == 0)
+                                   g_incarnation, &leave_copy,
+                                   0, NULL) == 0)
                 n_notified++;
         }
     }

@@ -74,6 +74,18 @@ building block, not a production service mesh.
   for the same reason: a joiner gets the seed's whole table at once
   instead of waiting for gossip rounds to rotate the missing members
   through.
+- Gossip delta encoding: every membership-table change bumps a table
+  version, and each entry records the version at which it last changed,
+  so a digest to a peer carries only the entries that changed since the
+  version that peer last saw — oldest change first — instead of the
+  whole 16-entry window every round. A converged cluster sends no
+  gossip bytes at all until something actually changes. A peer with no
+  recorded version, or one more than a digest's worth of changes
+  behind, gets a full `SYNC` instead of a delta. Delivery is UDP, so a
+  lost delta can leave a peer behind its recorded version; the periodic
+  anti-entropy `SYNC` heals that within one interval, and failure
+  detection never depends on gossip (each node probes its peers
+  directly). See "Gossip delta encoding" below.
 
 ## What it is not
 
@@ -475,8 +487,11 @@ beyond that. One peer per round is enough while the cluster is tiny,
 but gossip only keeps its O(log n) spread as the cluster grows if
 each round reaches O(log n) peers; the cap bounds the extra traffic
 on a large cluster. Only ALIVE and SUSPECT peers are gossip targets,
-and the same digest copy goes to each of them, so the change costs
-no extra table snapshots.
+and each peer's digest is built from the same table snapshot, so the
+change costs no extra snapshots — but the digest itself is per-peer,
+a delta against what that peer is believed to already know (see
+"Gossip delta encoding" below), so two targets in the same round can
+receive different digests.
 
 ## Digest prioritization
 
@@ -489,6 +504,44 @@ changed first, DEAD before SUSPECT on a tie — and the remaining
 slots are the usual random window, skipping entries already sent as
 urgent, so the rest of the table still rotates through instead of
 starving. Tombstones still ride along after the table entries.
+
+## Gossip delta encoding
+
+Before this, every gossip round sent the same 16-entry digest to each
+target peer whether anything had changed or not — a converged cluster
+burned a digest per peer every 200 ms just to say nothing new. Every
+membership-table change now bumps a table version, and each entry
+records the version at which it last changed (added, or a new
+incarnation or state; a routine heartbeat that only moves
+`last_seen_ms` is not a change). Each node remembers, per peer, the
+highest version it believes that peer has already received, and a
+digest to that peer carries only the entries that changed after that
+version — oldest change first — and nothing at all when nothing
+changed. A converged cluster is therefore quiet on the gossip channel
+until something actually happens.
+
+Two details keep the bookkeeping honest. First, the digest reports
+the highest changed version it actually carried, and the peer's
+recorded version advances only that far: when more entries changed
+than the digest holds, the rest go out on the next digest instead of
+being recorded as known. Members and tombstones share one
+version-ordered list, so a tombstone can never be squeezed out below
+the reported version. Second, a peer with no recorded version — never
+sent to, or evicted from the per-peer table — or one more than a
+digest's worth of changes behind gets a full `SYNC` instead of a
+delta: a delta cannot carry that much, and the `SYNC` converges it in
+one exchange.
+
+Delta encoding changes nothing on the wire: a `GOSSIP` datagram has
+the same verb and the same `id:inc:state` entries, only fewer of them,
+so a node running an older version merges a delta exactly as it
+merged a full digest. The one thing it does not guarantee is delivery:
+UDP can drop a delta, leaving a peer behind the version recorded for
+it. That is bounded by the periodic anti-entropy `SYNC`, which still
+exchanges full tables every ~10 s and heals any missed change within
+one interval — and failure detection itself never depends on gossip,
+since each node probes its peers directly and suspects them on its
+own timeouts.
 
 ## Tests
 
@@ -624,3 +677,4 @@ make test
 - ~~Graceful leave: a node that stops cleanly announces its departure to its peers (a GOSSIP digest with its own entry DEAD), so they mark it DEAD at once instead of waiting for the probe timeout; a crash sends nothing, so the probe path still covers unclean deaths, and a restart at a higher incarnation refutes the DEAD entry.~~ Done in 0.14.0.
 - ~~JOIN answered with a full-table SYNC: a joiner gets the seed's whole membership table at once instead of the capped 16-entry digest, so it converges immediately instead of waiting for gossip rounds to rotate the missing members through; the joiner answers with its own full table, so one exchange converges both sides.~~ Done in 0.15.0.
 - ~~SYNC replies only on new information: a SYNC is answered with the receiver's full table only when the exchange taught it something new (new/revived sender, refutation, or a merged entry that added or changed a member); a SYNC that changes nothing gets no reply, fixing the 0.13.0 reply ping-pong in which a converged pair burned a CPU core exchanging identical tables forever.~~ Done in 0.15.0.
+- ~~Gossip delta encoding: instead of sending the full membership table in every gossip exchange, send only entries that changed since the peer's last known version (per-peer versions tracked from a table version bumped on every change, each entry stamped with the version it last changed at), falling back to a full SYNC when the peer has no recorded version or is more than a digest's worth of changes behind; a converged cluster sends no gossip bytes at all until something changes, and the periodic anti-entropy SYNC heals any delta lost to UDP.~~ Done in 0.16.0.

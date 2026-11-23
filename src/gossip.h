@@ -48,6 +48,24 @@
  * drop datagrams whose tag is missing or wrong; receivers without one
  * ignore the trailing token. See secret.h for what the gate is and is
  * not.
+ *
+ * Delta encoding (0.16.0): every membership-table change bumps a
+ * table version, and each entry records the version at which it last
+ * changed (see member.h). A digest to a peer that already knows the
+ * table up to version V carries only entries changed after V — the
+ * delta — oldest change first, so a converged cluster sends
+ * no gossip bytes at all until something actually changes. A peer
+ * with no recorded version (since_version 0) gets the old digest
+ * instead: urgent entries first, then the random window. Delta
+ * encoding changes nothing on the wire: a GOSSIP datagram has the
+ * same verb and the same "id:inc:state" entries, only fewer of them,
+ * so an older node merges a delta exactly as it merged a full digest.
+ * Delivery is UDP, so a lost delta can leave a peer behind the
+ * version recorded for it; that is bounded by the periodic
+ * anti-entropy SYNC, which still exchanges full tables every ~10 s
+ * and heals any missed change within one interval. A peer more than
+ * one digest's worth of changes behind gets a full SYNC instead of
+ * a delta — the caller decides that with member_changed_count.
  */
 
 typedef enum {
@@ -91,16 +109,30 @@ int gossip_send_ping_req(int sock, const struct sockaddr_storage *to, uint32_t s
 int gossip_send_join(int sock, const struct sockaddr_storage *to,
                      const char *from_id, uint32_t inc);
 /* Send a digest of up to PULSE_GOSSIP_ENTRIES table entries to a peer.
- * Recently-changed SUSPECT/DEAD entries go first (up to
+ * Delta encoding: when since_version > 0, only entries (members and
+ * tombstones) that changed after that version are sent, oldest change
+ * first, and nothing is sent at all when nothing changed — so
+ * a converged cluster is quiet until something actually happens. When
+ * since_version is 0 (the peer's version is unknown), the old digest
+ * goes out: recently-changed SUSPECT/DEAD entries first (up to
  * PULSE_GOSSIP_URGENT of them, most recently changed first): a digest
  * is only 16 entries and the table holds up to 64 members, so a purely
  * random window can miss a fresh SUSPECT for several rounds and delay
  * the news that matters most. The remaining slots are the usual random
  * contiguous window, skipping entries already sent as urgent, so the
- * rest of the table still rotates through. */
+ * rest of the table still rotates through.
+ * sent_through_version, when non-NULL, is set to the highest
+ * changed_version among the entries actually sent — the version the
+ * peer can now be recorded as knowing — or to t->version when
+ * nothing was sent because nothing changed. It is only advanced as
+ * far as the entries that fit: when more entries changed than the
+ * digest holds, the rest go out on the next digest, and the peer's
+ * recorded version advances only to what it actually received. */
 int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                        const char *from_id, uint32_t inc,
-                       const member_table_t *t);
+                       const member_table_t *t,
+                       uint64_t since_version,
+                       uint64_t *sent_through_version);
 /* Send the sender's whole membership table (anti-entropy SYNC): every
  * table entry, then tombstones as DEAD while there is room, in table
  * order — no 16-entry cap, no prioritization, no random window. One

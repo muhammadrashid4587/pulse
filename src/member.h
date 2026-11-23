@@ -20,6 +20,10 @@ typedef struct {
     char id[PULSE_ID_LEN]; /* "host:port" */
     uint32_t incarnation;  /* incarnation the member had when removed */
     int64_t removed_ms;    /* monotonic ms when the tombstone was recorded */
+    /* Table version at which this tombstone was recorded: a digest to a
+     * peer that already knows everything up to version V only carries
+     * tombstones with changed_version > V. See member_table_t.version. */
+    uint64_t changed_version;
 } tombstone_t;
 
 typedef struct {
@@ -29,6 +33,11 @@ typedef struct {
     member_state_t state;
     int64_t last_seen_ms;   /* monotonic ms of last direct contact */
     int64_t state_since_ms; /* when the current state started */
+    /* Table version at which this entry last changed (added, or a new
+     * incarnation or state): a digest to a peer that already knows
+     * everything up to version V only carries entries with
+     * changed_version > V. See member_table_t.version. */
+    uint64_t changed_version;
     /* Phi-accrual history for this peer: fed by every direct contact
      * (member_mark_alive). Gossip about a peer is not a heartbeat —
      * only a packet from the peer itself proves it is alive. */
@@ -38,6 +47,16 @@ typedef struct {
 typedef struct {
     member_t members[PULSE_MAX_MEMBERS];
     int count;
+    /* Membership-table version: bumped on every change to what gossip
+     * would send (a member added, removed, or changing incarnation or
+     * state; a tombstone recorded). Each entry records the version at
+     * which it last changed, so a digest to a peer can carry only the
+     * entries that changed since the version that peer last saw
+     * (delta encoding, 0.16.0) instead of the whole table every round.
+     * The version is local and monotonic; it is never sent on the wire
+     * and never persists — a restarted node starts at 0 and its peers
+     * fall back to a full SYNC, exactly as for a peer never seen. */
+    uint64_t version;
     /* Tombstones: members garbage-collected while DEAD. Gossip about a
      * tombstoned id at an incarnation <= the recorded one is ignored, so
      * a peer that still holds the DEAD entry cannot resurrect it here.
@@ -50,6 +69,17 @@ typedef struct {
 
 int64_t pulse_now_ms(void);
 void member_table_init(member_table_t *t);
+/* Mark one entry as changed at the current table version: the entry's
+ * gossip content changed outside the member_* mutation functions (the
+ * refutation path in node.c bumps our own incarnation directly, and
+ * the graceful-leave announcement marks our own entry DEAD on a
+ * throwaway copy). Bumps the table version and stamps the entry. */
+void member_note_changed(member_table_t *t, member_t *m);
+/* How many entries (members plus tombstones) changed after
+ * since_version: the size of the delta a digest to a peer at that
+ * version would carry. The caller uses it to decide between a delta
+ * digest and a full SYNC. */
+int member_changed_count(const member_table_t *t, uint64_t since_version);
 member_t *member_find(member_table_t *t, const char *id);
 member_t *member_add(member_table_t *t, const char *id,
                      const struct sockaddr_storage *addr,
