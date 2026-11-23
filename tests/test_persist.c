@@ -142,7 +142,76 @@ int main(void) {
     CHECK(member_find(&t7, "127.0.0.1:17102")->last_seen_ms ==
           now - 86400 * 1000);
 
+    /* Annotations ride along in the members file as a fifth field and
+     * survive the round trip; a member with none saves "-". */
+    member_table_t t8;
+    member_table_init(&t8);
+    add_member(&t8, "127.0.0.1:17102", 1, MEMBER_ALIVE, now - 3000, now);
+    member_t *m8 = member_find(&t8, "127.0.0.1:17102");
+    CHECK(member_meta_set(m8, "role", "worker") == 0);
+    CHECK(member_meta_set(m8, "zone", "us-east-1") == 0);
+    add_member(&t8, "127.0.0.1:17103", 1, MEMBER_ALIVE, now - 1000, now);
+    CHECK(pulse_members_save(dir, &t8, "127.0.0.1:17101", now) == 2);
+    f = fopen("/tmp/pulse-persist-test/members", "r");
+    CHECK(f != NULL);
+    nread = fread(contents, 1, sizeof contents - 1, f);
+    contents[nread] = '\0';
+    fclose(f);
+    CHECK(strstr(contents,
+                 "127.0.0.1:17102 1 A 3 role=worker,zone=us-east-1") != NULL);
+    CHECK(strstr(contents, "127.0.0.1:17103 1 A 1 -") != NULL);
+    member_table_t t9;
+    member_table_init(&t9);
+    CHECK(pulse_members_load(dir, &t9, "127.0.0.1:17101", now) == 2);
+    m = member_find(&t9, "127.0.0.1:17102");
+    CHECK(m != NULL);
+    CHECK(m->meta_count == 2);
+    CHECK(strcmp(m->meta[0].key, "role") == 0);
+    CHECK(strcmp(m->meta[1].value, "us-east-1") == 0);
+    m = member_find(&t9, "127.0.0.1:17103");
+    CHECK(m != NULL);
+    CHECK(m->meta_count == 0);
+    /* A malformed annotations field is dropped; the entry still loads. */
+    f = fopen("/tmp/pulse-persist-test/members", "w");
+    fprintf(f, "127.0.0.1:17102 1 A 3 role=worker,bad\n");
+    fclose(f);
+    member_table_t t10;
+    member_table_init(&t10);
+    CHECK(pulse_members_load(dir, &t10, "127.0.0.1:17101", now) == 1);
+    m = member_find(&t10, "127.0.0.1:17102");
+    CHECK(m != NULL);
+    CHECK(m->meta_count == 0);
+
+    /* The node's own annotations: the meta file round-trips, a
+     * missing file loads zero, and malformed lines are skipped. */
+    meta_kv_t saved_meta[PULSE_MAX_META];
+    int n_saved = 0;
+    CHECK(pulse_meta_load("/tmp/pulse-persist-test-nonexistent",
+                          saved_meta, PULSE_MAX_META, &n_saved) == 0);
+    CHECK(n_saved == 0);
+    meta_kv_t mine[2];
+    snprintf(mine[0].key, sizeof mine[0].key, "role");
+    snprintf(mine[0].value, sizeof mine[0].value, "worker");
+    snprintf(mine[1].key, sizeof mine[1].key, "version");
+    snprintf(mine[1].value, sizeof mine[1].value, "1.2.3");
+    CHECK(pulse_meta_save(dir, mine, 2) == 2);
+    CHECK(pulse_meta_load(dir, saved_meta, PULSE_MAX_META, &n_saved) == 2);
+    CHECK(n_saved == 2);
+    CHECK(strcmp(saved_meta[0].key, "role") == 0);
+    CHECK(strcmp(saved_meta[1].value, "1.2.3") == 0);
+    f = fopen("/tmp/pulse-persist-test/meta", "w");
+    fprintf(f, "role=worker\n");
+    fprintf(f, "not a pair\n");
+    fprintf(f, "zone=us-east-1\n");
+    fprintf(f, "role=gateway\n"); /* duplicate key: first value wins */
+    fclose(f);
+    CHECK(pulse_meta_load(dir, saved_meta, PULSE_MAX_META, &n_saved) == 2);
+    CHECK(n_saved == 2);
+    CHECK(strcmp(saved_meta[0].value, "worker") == 0);
+    CHECK(strcmp(saved_meta[1].key, "zone") == 0);
+
     unlink("/tmp/pulse-persist-test/members");
+    unlink("/tmp/pulse-persist-test/meta");
     rmdir(dir);
 
     printf("test_persist: %d checks, %d failures\n", checks, failures);

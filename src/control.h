@@ -13,9 +13,19 @@
  *   MEMBERS
  *       One line per member, then END:
  *       MEMBER <id> <incarnation> <ALIVE|SUSPECT|DEAD> <phi|'-'>
+ *           <annotations|'-'>
  *       phi is the peer's current phi value (two decimals) when
  *       phi-accrual is on and the peer has heartbeat history, '-'
  *       otherwise (including self, which has no phi history).
+ *       Annotations are the member's comma-separated "k=v,k=v" list,
+ *       '-' when it carries none.
+ *   META <key=value>
+ *       Set one annotation on this node itself (at most 8): OK
+ *       <key=value>. The change is gossiped to the cluster with the
+ *       next digest and persisted to the data dir, so it survives a
+ *       restart. Bad syntax: ERR invalid meta <arg>; a ninth distinct
+ *       key: ERR meta full (max 8); missing argument:
+ *       ERR usage: META <key=value>.
  *   STATUS
  *       STATUS id=<self-id> uptime=<seconds> alive=N suspect=N dead=N
  *       total=N, then END.
@@ -45,7 +55,9 @@
  *       JSON object on a single line, then END. Member phi is a number
  *       when phi-accrual is on and the peer has heartbeat history,
  *       null otherwise (including self). Latency means are null when
- *       there are no samples; max is 0 then.
+ *       there are no samples; max is 0 then. Each member also carries
+ *       "meta": its annotations as a JSON object ({} when it has
+ *       none).
  *   anything else
  *       ERR unknown command
  *
@@ -65,6 +77,11 @@ typedef struct {
     int (*force_leave)(void *ctx, const char *id);
     /* Copy the failure-detector metrics into out (hook locks as needed). */
     void (*metrics)(void *ctx, pulse_metrics_t *out);
+    /* Set one annotation on this node itself. Returns 0 on success,
+     * -1 on invalid key/value, -2 when the node already carries the
+     * maximum number of annotations. NULL when the node does not
+     * support it: META then replies ERR. */
+    int (*set_meta)(void *ctx, const char *key, const char *value);
     /* 1 when phi-accrual suspicion is on (phi values are meaningful). */
     int (*phi_enabled)(void *ctx);
     const char *self_id;

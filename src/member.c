@@ -53,6 +53,158 @@ int member_changed_count(const member_table_t *t, uint64_t since_version) {
     return n;
 }
 
+/* Metadata: a key or value is 1..32 chars of [A-Za-z0-9._-]. The
+ * charset keeps annotations safe in the wire format (no spaces,
+ * commas, semicolons, colons or '=' inside a key or value) and in
+ * JSON (no quotes or backslashes to escape). */
+static int meta_token_ok(const char *s, size_t max_len) {
+    size_t n = strlen(s);
+    if (n == 0 || n > max_len) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+int member_meta_parse(const char *s, char *key, size_t klen, char *value,
+                      size_t vlen) {
+    if (!s || strlen(s) > PULSE_META_MAX_LEN) return -1;
+    const char *eq = strchr(s, '=');
+    if (!eq || eq == s || eq[1] == '\0') return -1;
+    /* Exactly one '=': a second one would be inside the value. */
+    if (strchr(eq + 1, '=') != NULL) return -1;
+    size_t k = (size_t)(eq - s);
+    size_t v = strlen(eq + 1);
+    if (k >= klen || v >= vlen) return -1;
+    memcpy(key, s, k);
+    key[k] = '\0';
+    memcpy(value, eq + 1, v);
+    value[v] = '\0';
+    if (!meta_token_ok(key, PULSE_META_KEY_LEN)) return -1;
+    if (!meta_token_ok(value, PULSE_META_VAL_LEN)) return -1;
+    return 0;
+}
+
+int member_meta_set(member_t *m, const char *key, const char *value) {
+    if (!meta_token_ok(key, PULSE_META_KEY_LEN)) return -1;
+    if (!meta_token_ok(value, PULSE_META_VAL_LEN)) return -1;
+    if (strlen(key) + 1 + strlen(value) > PULSE_META_MAX_LEN) return -1;
+    /* Validated above: key and value fit their buffers, so memcpy is
+     * exact — snprintf would warn about truncation it cannot see. */
+    size_t klen = strlen(key);
+    size_t vlen = strlen(value);
+    for (int i = 0; i < m->meta_count; i++) {
+        if (strcmp(m->meta[i].key, key) == 0) {
+            memcpy(m->meta[i].value, value, vlen + 1);
+            return 0;
+        }
+    }
+    if (m->meta_count >= PULSE_MAX_META) return -2;
+    memcpy(m->meta[m->meta_count].key, key, klen + 1);
+    memcpy(m->meta[m->meta_count].value, value, vlen + 1);
+    m->meta_count++;
+    return 0;
+}
+
+int member_meta_format(const member_t *m, char *buf, size_t len) {
+    size_t off = 0;
+    for (int i = 0; i < m->meta_count; i++) {
+        int w = snprintf(buf + off, len - off, "%s%s=%s",
+                         i == 0 ? "" : ",", m->meta[i].key,
+                         m->meta[i].value);
+        if (w < 0 || (size_t)w >= len - off) return -1;
+        off += (size_t)w;
+    }
+    if (len > 0) buf[off] = '\0';
+    return (int)off;
+}
+
+int member_meta_parse_list(const char *s, meta_kv_t *out, int max,
+                           int *out_count) {
+    *out_count = 0;
+    if (!s || s[0] == '\0') return 0;
+    char tmp[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
+    if (strlen(s) >= sizeof tmp) return -1;
+    snprintf(tmp, sizeof tmp, "%s", s);
+    char *save = NULL;
+    char *tok = strtok_r(tmp, ",", &save);
+    while (tok) {
+        if (*out_count >= max) return -1;
+        char key[PULSE_META_KEY_LEN + 1];
+        char value[PULSE_META_VAL_LEN + 1];
+        if (member_meta_parse(tok, key, sizeof key, value, sizeof value) != 0)
+            return -1;
+        /* A list with the same key twice is ambiguous: reject it. */
+        for (int i = 0; i < *out_count; i++) {
+            if (strcmp(out[i].key, key) == 0) return -1;
+        }
+        snprintf(out[*out_count].key, sizeof out[*out_count].key, "%s",
+                 key);
+        snprintf(out[*out_count].value, sizeof out[*out_count].value,
+                 "%s", value);
+        (*out_count)++;
+        tok = strtok_r(NULL, ",", &save);
+    }
+    return 0;
+}
+
+int member_meta_equal(const member_t *a, const member_t *b) {
+    if (a->meta_count != b->meta_count) return 0;
+    for (int i = 0; i < a->meta_count; i++) {
+        int found = 0;
+        for (int j = 0; j < b->meta_count; j++) {
+            if (strcmp(a->meta[i].key, b->meta[j].key) == 0 &&
+                strcmp(a->meta[i].value, b->meta[j].value) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) return 0;
+    }
+    return 1;
+}
+
+void member_meta_json(const member_t *m, char *buf, size_t len) {
+    size_t off = 0;
+    int w = snprintf(buf + off, len - off, "{");
+    if (w < 0 || (size_t)w >= len - off) goto done;
+    off += (size_t)w;
+    for (int i = 0; i < m->meta_count; i++) {
+        w = snprintf(buf + off, len - off, "%s\"%s\":\"%s\"",
+                     i == 0 ? "" : ",", m->meta[i].key, m->meta[i].value);
+        if (w < 0 || (size_t)w >= len - off) goto done;
+        off += (size_t)w;
+    }
+    w = snprintf(buf + off, len - off, "}");
+    if (w < 0 || (size_t)w >= len - off) goto done;
+    off += (size_t)w;
+done:
+    if (len > 0) buf[off < len ? off : len - 1] = '\0';
+}
+
+int member_merge_meta(member_table_t *t, const char *self_id, const char *id,
+                      const meta_kv_t *meta, int meta_count) {
+    if (meta_count <= 0) return 0; /* nothing carried: keep what we have */
+    if (strcmp(id, self_id) == 0) return 0; /* our own meta is ours */
+    member_t *m = member_find(t, id);
+    if (!m) return 0;
+    if (meta_count > PULSE_MAX_META) return 0;
+    member_t tmp;
+    memset(&tmp, 0, sizeof tmp);
+    tmp.meta_count = meta_count;
+    for (int i = 0; i < meta_count; i++) tmp.meta[i] = meta[i];
+    if (member_meta_equal(m, &tmp)) return 0;
+    m->meta_count = meta_count;
+    for (int i = 0; i < meta_count; i++) m->meta[i] = meta[i];
+    /* Annotations are gossip-visible: stamp the change so the next
+     * digest carries the entry as a delta. */
+    note_change(t, m);
+    return 1;
+}
+
 /* Tombstones: a GC'd member leaves a record so gossip cannot bring it
  * back. A tombstone is keyed by id; a rejoin at a higher incarnation
  * clears it, and direct contact clears it too (a packet from the member

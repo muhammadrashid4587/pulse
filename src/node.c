@@ -65,6 +65,10 @@ typedef struct {
     char secret[PULSE_SECRET_MAX]; /* shared secret for joins, "" = none */
     int ipv6;                  /* use IPv6 (bind ::, ids are "[::1]:port") */
     char bind_host[128];       /* bind address override, "" = wildcard */
+    /* This node's own annotations (see member.h): --meta flags, or the
+     * ones saved from the last run when no flags are given. */
+    meta_kv_t meta[PULSE_MAX_META];
+    int meta_count;
 } config_t;
 
 typedef struct {
@@ -335,6 +339,14 @@ static void handle_membership_msg(const gmsg_t *msg,
                     metrics_note_suspect_refuted(&g_metrics, -1);
             }
         }
+        /* Annotations ride along with the entry: when the sender
+         * carries some we did not have (or different ones), take
+         * them — that is new information, so a SYNC answer is due.
+         * An entry with no annotations says nothing about them. */
+        if (e->meta_count > 0 &&
+            member_merge_meta(&g_table, g_self_id, e->id, e->meta,
+                              e->meta_count))
+            learned = 1;
         if ((r & MERGE_NEW) && new_count < 8) {
             snprintf(new_ids[new_count], PULSE_ID_LEN, "%s", e->id);
             new_count++;
@@ -938,6 +950,36 @@ static int force_leave_hook(void *ctx, const char *id) {
     return removed;
 }
 
+/* Set one annotation on this node itself (control plane META): update
+ * the self entry, stamp it changed so the next digest gossips it, and
+ * persist the set to the data dir so it survives a restart. Returns
+ * 0 on success, -1 on an invalid key/value, -2 when the node already
+ * carries the maximum number of annotations. */
+static int set_meta_hook(void *ctx, const char *key, const char *value) {
+    (void)ctx;
+    int r;
+    meta_kv_t saved[PULSE_MAX_META];
+    int n_saved = 0;
+    pthread_mutex_lock(&g_lock);
+    member_t *self = member_find(&g_table, g_self_id);
+    if (!self) {
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    r = member_meta_set(self, key, value);
+    if (r == 0) {
+        member_note_changed(&g_table, self);
+        n_saved = self->meta_count;
+        for (int i = 0; i < n_saved; i++) saved[i] = self->meta[i];
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (r == 0) {
+        pulse_meta_save(g_cfg.data_dir, saved, n_saved);
+        log_line("META %s=%s", key, value);
+    }
+    return r;
+}
+
 static void *control_thread(void *arg) {
     (void)arg;
     control_serve(g_control_sock, &g_hooks);
@@ -1002,6 +1044,7 @@ static void usage(const char *prog) {
             "       [--sync-interval-ms N]\n"
             "       [--control-port PORT]\n"
             "       [--secret SECRET | --shared-secret SECRET]\n"
+            "       [--meta KEY=VALUE]... (repeatable, at most 8)\n"
             "       [--ipv6] [--bind HOST]\n",
             prog);
 }
@@ -1079,6 +1122,38 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--secret must not be empty\n");
                 return 2;
             }
+        } else if (strcmp(argv[i], "--meta") == 0 && i + 1 < argc) {
+            char key[PULSE_META_KEY_LEN + 1];
+            char value[PULSE_META_VAL_LEN + 1];
+            if (member_meta_parse(argv[++i], key, sizeof key, value,
+                                  sizeof value) != 0) {
+                fprintf(stderr,
+                        "--meta must be key=value (keys/values "
+                        "[A-Za-z0-9._-], \"key=value\" at most %d chars)\n",
+                        PULSE_META_MAX_LEN);
+                return 2;
+            }
+            /* A repeated key updates the value instead of adding a
+             * second pair. */
+            int slot = -1;
+            for (int j = 0; j < g_cfg.meta_count; j++) {
+                if (strcmp(g_cfg.meta[j].key, key) == 0) {
+                    slot = j;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                if (g_cfg.meta_count >= PULSE_MAX_META) {
+                    fprintf(stderr, "--meta: at most %d annotations\n",
+                            PULSE_MAX_META);
+                    return 2;
+                }
+                slot = g_cfg.meta_count++;
+            }
+            snprintf(g_cfg.meta[slot].key,
+                     sizeof g_cfg.meta[slot].key, "%s", key);
+            snprintf(g_cfg.meta[slot].value,
+                     sizeof g_cfg.meta[slot].value, "%s", value);
         } else if (strcmp(argv[i], "--ipv6") == 0) {
             g_cfg.ipv6 = 1;
         } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
@@ -1246,6 +1321,22 @@ int main(int argc, char **argv) {
     self->last_seen_ms = g_start_ms;
     self->state_since_ms = g_start_ms;
 
+    /* Member metadata: --meta flags win; without flags, restore the
+     * annotations saved from the last run, so a restart keeps them
+     * even when the operator forgets the flags. The effective set is
+     * saved back, so a node started with flags persists them for the
+     * next restart too. */
+    if (g_cfg.meta_count == 0) {
+        int n_saved = 0;
+        if (pulse_meta_load(g_cfg.data_dir, g_cfg.meta, PULSE_MAX_META,
+                            &n_saved) >= 0)
+            g_cfg.meta_count = n_saved;
+    }
+    for (int i = 0; i < g_cfg.meta_count; i++)
+        member_meta_set(self, g_cfg.meta[i].key, g_cfg.meta[i].value);
+    if (g_cfg.meta_count > 0)
+        pulse_meta_save(g_cfg.data_dir, g_cfg.meta, g_cfg.meta_count);
+
     /* Membership persistence: reload the peers this node knew before
      * its last shutdown, so a restarted node re-probes its old peers
      * instead of starting from only the seed list. Restored entries
@@ -1282,6 +1373,12 @@ int main(int argc, char **argv) {
         log_line("START %s inc=%u port=%d%s%s", g_self_id, g_incarnation,
                  g_cfg.port, sec, v6);
     }
+    if (g_cfg.meta_count > 0) {
+        char metabuf[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
+        if (member_meta_format(self, metabuf, sizeof metabuf) < 0)
+            metabuf[0] = '\0';
+        log_line("META %s", metabuf);
+    }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -1311,6 +1408,7 @@ int main(int argc, char **argv) {
         g_hooks.snapshot = snapshot_hook;
         g_hooks.metrics = metrics_hook;
         g_hooks.force_leave = force_leave_hook;
+        g_hooks.set_meta = set_meta_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
         g_hooks.self_id = g_self_id;
         g_hooks.start_ms = g_start_ms;

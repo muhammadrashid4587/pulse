@@ -7,7 +7,7 @@ HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h src/met
 
 .PHONY: all test clean
 
-all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive
+all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta
 
 pulse-node: $(NODE_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $(NODE_SRC) $(LDFLAGS)
@@ -39,7 +39,10 @@ test_persist: tests/test_persist.c src/member.c src/phi.c src/persist.c src/memb
 test_adaptive: tests/test_adaptive.c src/adaptive.c src/adaptive.h
 	$(CC) $(CFLAGS) -o $@ tests/test_adaptive.c src/adaptive.c $(LDFLAGS)
 
-test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive
+test_meta: tests/test_meta.c src/member.c src/phi.c src/gossip.c src/secret.c src/member.h src/phi.h src/gossip.h src/secret.h
+	$(CC) $(CFLAGS) -o $@ tests/test_meta.c src/member.c src/phi.c src/gossip.c src/secret.c $(LDFLAGS)
+
+test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta
 	./test_member
 	./test_phi
 	./test_secret
@@ -48,6 +51,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	./test_metrics
 	./test_persist
 	./test_adaptive
+	./test_meta
 	bash tests/test_cluster.sh
 	bash tests/test_gc.sh
 	bash tests/test_rejoin.sh
@@ -61,6 +65,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_join_sync.sh
 	bash tests/test_adaptive.sh
 	bash tests/test_refute.sh
+	bash tests/test_meta.sh
 
 clean:
-	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive
+	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta

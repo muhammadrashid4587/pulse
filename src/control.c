@@ -80,7 +80,9 @@ static void handle_members(int fd, const control_hooks_t *hooks) {
     hooks->snapshot(hooks->ctx, &t);
     int phi_on = hooks->phi_enabled(hooks->ctx);
     int64_t now = pulse_now_ms();
-    char line[256];
+    /* A member line can carry up to 8 annotations at 64 chars each,
+     * plus the id, incarnation, state and phi. */
+    char line[768];
     for (int i = 0; i < t.count; i++) {
         const member_t *m = &t.members[i];
         /* Phi is meaningful only in phi mode, only for peers with
@@ -93,8 +95,12 @@ static void handle_members(int fd, const control_hooks_t *hooks) {
             snprintf(phibuf, sizeof phibuf, "%.2f",
                      phi_value(&m->phi, now));
         }
-        snprintf(line, sizeof line, "MEMBER %s %u %s %s\n", m->id,
-                 m->incarnation, member_state_name(m->state), phibuf);
+        char meta[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
+        if (member_meta_format(m, meta, sizeof meta) < 0 || meta[0] == '\0')
+            snprintf(meta, sizeof meta, "-");
+        snprintf(line, sizeof line, "MEMBER %s %u %s %s %s\n", m->id,
+                 m->incarnation, member_state_name(m->state), phibuf,
+                 meta);
         if (send_all(fd, line) != 0) return;
     }
     send_all(fd, "END\n");
@@ -130,7 +136,8 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
  * number when phi-accrual is on and the peer has heartbeat history,
  * null otherwise (including self). Latency means are null when there
  * are no samples. Built into a fixed buffer: 64 members at ~120
- * bytes each is under 8 KB, so 16 KB has ample headroom. */
+ * bytes each plus up to ~520 bytes of annotations each is under
+ * 48 KB, so 64 KB has ample headroom. */
 static void handle_json(int fd, const control_hooks_t *hooks) {
     member_table_t t;
     hooks->snapshot(hooks->ctx, &t);
@@ -139,7 +146,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
     int phi_on = hooks->phi_enabled(hooks->ctx);
     int64_t now = pulse_now_ms();
     int64_t uptime = (now - hooks->start_ms) / 1000;
-    static char buf[16384];
+    static char buf[65536];
     size_t used = 0;
     int w = snprintf(buf + used, sizeof buf - used,
         "{\"id\":\"%s\",\"uptime\":%lld,\"alive\":%d,\"suspect\":%d,"
@@ -160,11 +167,16 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
             snprintf(phibuf, sizeof phibuf, "%.2f",
                      phi_value(&mem->phi, now));
         }
+        /* Annotations are a JSON object: {"role":"worker"} — keys and
+         * values are restricted to JSON-safe characters, so no
+         * escaping is needed (see member_meta_json). */
+        char metajson[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1) + 32];
+        member_meta_json(mem, metajson, sizeof metajson);
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
-                     "\"phi\":%s}",
+                     "\"phi\":%s,\"meta\":%s}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
-                     member_state_name(mem->state), phibuf);
+                     member_state_name(mem->state), phibuf, metajson);
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }
@@ -224,6 +236,37 @@ static void handle_leave(int fd, const control_hooks_t *hooks,
     send_all(fd, line);
 }
 
+static void handle_meta(int fd, const control_hooks_t *hooks,
+                        const char *arg) {
+    if (!arg || arg[0] == '\0') {
+        send_all(fd, "ERR usage: META <key=value>\n");
+        return;
+    }
+    if (!hooks->set_meta) {
+        send_all(fd, "ERR meta not supported\n");
+        return;
+    }
+    char key[PULSE_META_KEY_LEN + 1];
+    char value[PULSE_META_VAL_LEN + 1];
+    if (member_meta_parse(arg, key, sizeof key, value, sizeof value) != 0) {
+        char line[128];
+        snprintf(line, sizeof line, "ERR invalid meta %s\n", arg);
+        send_all(fd, line);
+        return;
+    }
+    int r = hooks->set_meta(hooks->ctx, key, value);
+    char line[128];
+    if (r == 0) {
+        snprintf(line, sizeof line, "OK %s=%s\n", key, value);
+    } else if (r == -2) {
+        snprintf(line, sizeof line,
+                 "ERR meta full (max %d)\n", PULSE_MAX_META);
+    } else {
+        snprintf(line, sizeof line, "ERR invalid meta %s\n", arg);
+    }
+    send_all(fd, line);
+}
+
 static void handle_connection(int fd, const control_hooks_t *hooks) {
     char line[CONTROL_MAX_LINE];
     int n = read_line(fd, line, sizeof line);
@@ -246,6 +289,8 @@ static void handle_connection(int fd, const control_hooks_t *hooks) {
         handle_status(fd, hooks);
     } else if (strcmp(line, "LEAVE") == 0) {
         handle_leave(fd, hooks, arg);
+    } else if (strcmp(line, "META") == 0) {
+        handle_meta(fd, hooks, arg);
     } else if (strcmp(line, "METRICS") == 0) {
         handle_metrics(fd, hooks);
     } else if (strcmp(line, "JSON") == 0) {

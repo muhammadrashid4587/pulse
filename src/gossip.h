@@ -26,6 +26,14 @@
  * State codes in gossip entries: A alive, S suspect, D dead.
  * Member ids are always "host:port", so a gossip entry is self-contained.
  *
+ * Member metadata (0.20.0): an entry may carry the member's
+ * annotations after the state code, ";k=v,k=v" — e.g.
+ * "127.0.0.1:17102:3:A;role=worker,zone=us-east-1". Keys and values
+ * are [A-Za-z0-9._-], so the suffix holds no space, colon or comma
+ * that could confuse the parser; entries without it (older nodes)
+ * parse exactly as before, and a malformed suffix is dropped while
+ * the entry itself still merges.
+ *
  * SYNC is the anti-entropy message: unlike GOSSIP, which carries a
  * 16-entry digest (urgent entries first, then a random window), SYNC
  * carries the sender's whole membership table, so a peer that missed

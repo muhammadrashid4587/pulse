@@ -75,14 +75,21 @@ int gossip_send_join(int sock, const struct sockaddr_storage *to,
     return send_str(sock, to, buf);
 }
 
-/* Append one " id:inc:state" entry to the digest buffer. Returns 0 on
- * success, -1 when the buffer is full. */
+/* Append one " id:inc:state" entry to the digest buffer, with the
+ * member's annotations when it has any: ";k=v,k=v" after the state
+ * code. Returns 0 on success, -1 when the buffer is full. */
 static int append_entry(char *entries, size_t size, int *off,
-                        const char *id, uint32_t inc, member_state_t state) {
+                        const char *id, uint32_t inc, member_state_t state,
+                        const char *meta) {
     int w = snprintf(entries + *off, size - (size_t)*off, " %s:%u:%c", id,
                      inc, member_state_code(state));
     if (w < 0 || (size_t)(*off + w) >= size) return -1;
     *off += w;
+    if (meta && meta[0] != '\0') {
+        w = snprintf(entries + *off, size - (size_t)*off, ";%s", meta);
+        if (w < 0 || (size_t)(*off + w) >= size) return -1;
+        *off += w;
+    }
     return 0;
 }
 
@@ -169,12 +176,15 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
             if (items[k].is_tombstone) {
                 const tombstone_t *ts = &t->tombstones[items[k].idx];
                 if (append_entry(entries, sizeof entries, &off, ts->id,
-                                 ts->incarnation, MEMBER_DEAD) != 0)
+                                 ts->incarnation, MEMBER_DEAD, "") != 0)
                     break;
             } else {
                 const member_t *m = &t->members[items[k].idx];
+                char meta[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
+                if (member_meta_format(m, meta, sizeof meta) < 0)
+                    meta[0] = '\0';
                 if (append_entry(entries, sizeof entries, &off, m->id,
-                                 m->incarnation, m->state) != 0)
+                                 m->incarnation, m->state, meta) != 0)
                     break;
             }
             total++;
@@ -221,8 +231,11 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
     if (n_first > PULSE_GOSSIP_ENTRIES) n_first = PULSE_GOSSIP_ENTRIES;
     for (int k = 0; k < n_first; k++) {
         const member_t *m = &t->members[urgent[k]];
+        char meta[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
+        if (member_meta_format(m, meta, sizeof meta) < 0)
+            meta[0] = '\0';
         if (append_entry(entries, sizeof entries, &off, m->id,
-                         m->incarnation, m->state) != 0)
+                         m->incarnation, m->state, meta) != 0)
             break;
         total++;
         if (m->changed_version > through)
@@ -244,8 +257,11 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
         }
         if (already) continue;
         const member_t *m = &t->members[idx];
+        char meta[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
+        if (member_meta_format(m, meta, sizeof meta) < 0)
+            meta[0] = '\0';
         if (append_entry(entries, sizeof entries, &off, m->id,
-                         m->incarnation, m->state) != 0)
+                         m->incarnation, m->state, meta) != 0)
             break;
         total++;
         if (m->changed_version > through)
@@ -259,7 +275,7 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
     for (int k = 0; k < t->tombstone_count && total < PULSE_GOSSIP_ENTRIES; k++) {
         const tombstone_t *ts = &t->tombstones[k];
         if (append_entry(entries, sizeof entries, &off, ts->id,
-                         ts->incarnation, MEMBER_DEAD) != 0)
+                         ts->incarnation, MEMBER_DEAD, "") != 0)
             break;
         total++;
         if (ts->changed_version > through)
@@ -296,8 +312,11 @@ int gossip_send_full_table(int sock, const struct sockaddr_storage *to,
     int start = g_sync_offset % n;
     for (int k = 0; k < n; k++) {
         const member_t *m = &t->members[(start + k) % n];
+        char meta[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
+        if (member_meta_format(m, meta, sizeof meta) < 0)
+            meta[0] = '\0';
         if (append_entry(entries, sizeof entries, &off, m->id,
-                         m->incarnation, m->state) != 0)
+                         m->incarnation, m->state, meta) != 0)
             break;
         total++;
     }
@@ -307,7 +326,7 @@ int gossip_send_full_table(int sock, const struct sockaddr_storage *to,
     for (int k = 0; k < t->tombstone_count; k++) {
         const tombstone_t *ts = &t->tombstones[k];
         if (append_entry(entries, sizeof entries, &off, ts->id,
-                         ts->incarnation, MEMBER_DEAD) != 0)
+                         ts->incarnation, MEMBER_DEAD, "") != 0)
             break;
         total++;
     }
@@ -391,6 +410,19 @@ int gossip_parse(const char *buf, size_t len, gmsg_t *out) {
         for (int i = 0; i < count && i < PULSE_MAX_MEMBERS; i++) {
             s = strtok_r(NULL, " \t\r\n", &save);
             if (!s) break;
+            /* An entry is "host:port:inc:state", optionally followed
+             * by ";k=v,k=v" annotations (0.20.0). The meta suffix is
+             * split off first: it contains no ':' — keys and values
+             * are [A-Za-z0-9._-] — so the remaining token parses
+             * exactly as before. A malformed meta list is dropped,
+             * not fatal: the entry still merges, without annotations.
+             * Entries from older nodes carry no suffix at all. */
+            char *semi = strchr(s, ';');
+            char *meta_str = NULL;
+            if (semi) {
+                *semi = '\0';
+                meta_str = semi + 1;
+            }
             /* Entry is "host:port:inc:state"; split from the right. */
             char *last = strrchr(s, ':');
             if (!last || last == s) continue;
@@ -407,6 +439,13 @@ int gossip_parse(const char *buf, size_t len, gmsg_t *out) {
             if (member_parse_addr(e->id, &e->addr) != 0) continue;
             e->last_seen_ms = 0;
             e->state_since_ms = 0;
+            e->meta_count = 0;
+            if (meta_str) {
+                int nmeta = 0;
+                if (member_meta_parse_list(meta_str, e->meta,
+                                           PULSE_MAX_META, &nmeta) == 0)
+                    e->meta_count = nmeta;
+            }
             out->entry_count++;
         }
     }

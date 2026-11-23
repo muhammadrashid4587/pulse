@@ -102,7 +102,7 @@ json="$(ctl 18401 JSON)"
 if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
    && echo "$json" | grep -q '"id":"127.0.0.1:17401"' \
    && echo "$json" | grep -q '"total":1' \
-   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17401","incarnation":1,"state":"ALIVE","phi":null}\]' \
+   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17401","incarnation":1,"state":"ALIVE","phi":null,"meta":{}}\]' \
    && echo "$json" | grep -q '"metrics":{"suspected":0,"dead":0,"refutes":0,"joins":0' \
    && echo "$json" | grep -q '"detect_latency_ms":{"mean":null,"max":0,"samples":0,"hist":\[0,0,0,0,0\]}' \
    && echo "$json" | grep -q "^END$"; then
@@ -224,7 +224,7 @@ fi
 # (not null).
 json="$(ctl 18401 JSON)"
 if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
-   && echo "$json" | grep -q '"id":"127.0.0.1:17402","incarnation":1,"state":"DEAD"' \
+   && echo "$json" | grep -q '"id":"127.0.0.1:17402","incarnation":1,"state":"DEAD","phi":null,"meta":{}}' \
    && echo "$json" | grep -q '"dead":1' \
    && echo "$json" | grep -qE '"suspected":[1-9][0-9]*' \
    && echo "$json" | grep -qE '"detect_latency_ms":\{"mean":[0-9]+,"max":[0-9]+,"samples":[1-9][0-9]*,"hist":\[[0-9,]+\]\}' \

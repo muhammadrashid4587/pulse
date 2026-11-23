@@ -37,7 +37,8 @@ building block, not a production service mesh.
 - TCP control plane (opt-in, `--control-port`): a line-based protocol
   for asking a running node for its membership (`MEMBERS`), its status
   (`STATUS`), its failure-detector metrics (`METRICS`), the whole
-  picture as one machine-readable JSON object (`JSON`), or
+  picture as one machine-readable JSON object (`JSON`), setting an
+  annotation on the node (`META <key=value>`), or
   force-removing a member (`LEAVE <id>`). See
   "Control plane" below. Query it with the bundled `pulse-ctl` client
   or plain netcat.
@@ -103,6 +104,12 @@ building block, not a production service mesh.
   operator can see how long false suspicions stay visible to the
   cluster. A DEAD peer coming back is a restart, not a refutation,
   and is not counted. See "Suspicion-refutation window" below.
+- Member metadata: each node carries a small set of `key=value`
+  annotations about itself (`role=worker`, `zone=us-east-1`,
+  `version=1.2.3`), set with `--meta` or the control plane's `META`
+  command, gossiped with its membership entry, visible in `MEMBERS`
+  and `JSON`, and persisted across restarts. See "Member metadata"
+  below.
 
 ## What it is not
 
@@ -230,6 +237,7 @@ scripts/demo.sh
 | `--sync-interval-ms` | 10000 | How often to exchange full tables (anti-entropy SYNC) with a random peer |
 | `--control-port` | — (disabled) | TCP port for the control plane (`MEMBERS`, `STATUS`, `LEAVE`) |
 | `--secret` / `--shared-secret` | — (none) | Shared secret for joins: only peers presenting the same secret are accepted |
+| `--meta KEY=VALUE` | — (none) | An annotation this node carries about itself (repeatable, at most 8): gossiped with its membership entry, shown in `MEMBERS`/`JSON`, persisted across restarts |
 | `--ipv6` | off | Run over IPv6: bind `::`, ids are `[::1]:port`, control plane on `::1` |
 | `--bind HOST` | — (wildcard) | Bind address override, a literal IP: decides the family and the default id host (`--bind ::1` is IPv6, `--bind 127.0.0.1` is IPv4) |
 
@@ -261,9 +269,12 @@ the port beyond localhost.
 ./pulse-node --port 17101 --control-port 18401 --data-dir /tmp/p1
 
 ./pulse-ctl 127.0.0.1:18401 MEMBERS
-# MEMBER 127.0.0.1:17101 1 ALIVE -
-# MEMBER 127.0.0.1:17102 1 ALIVE 0.42
+# MEMBER 127.0.0.1:17101 1 ALIVE - role=worker,zone=us-east-1
+# MEMBER 127.0.0.1:17102 1 ALIVE 0.42 -
 # END
+
+./pulse-ctl 127.0.0.1:18401 META version=1.2.3
+# OK version=1.2.3
 
 ./pulse-ctl 127.0.0.1:18401 STATUS
 # STATUS id=127.0.0.1:17101 uptime=42 alive=2 suspect=0 dead=0 total=2
@@ -277,7 +288,7 @@ the port beyond localhost.
 # END
 
 ./pulse-ctl 127.0.0.1:18401 JSON
-# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}}}
+# {"id":"127.0.0.1:17101","uptime":42,"alive":2,"suspect":0,"dead":0,"total":2,"members":[{"id":"127.0.0.1:17101","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"}},{"id":"127.0.0.1:17102","incarnation":1,"state":"ALIVE","phi":0.42,"meta":{}}],"metrics":{"suspected":1,"dead":1,"refutes":0,"joins":2,"adaptive_fast_cycles":3,"suspect_refuted":0,"detect_latency_ms":{"mean":203,"max":203,"samples":1,"hist":[0,0,1,0,0]},"suspect_to_dead_ms":{"mean":301,"max":301,"samples":1},"refute_latency_ms":{"mean":null,"max":0,"samples":0}}}
 # END
 ```
 
@@ -291,11 +302,12 @@ Commands:
 
 | Command | Reply |
 | ------- | ----- |
-| `MEMBERS` | One `MEMBER <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <phi\|->` line per member, then `END`. Phi is the peer's current phi (two decimals) when phi-accrual is on and the peer has heartbeat history; `-` otherwise, including self. |
+| `MEMBERS` | One `MEMBER <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <phi\|-> <annotations\|->` line per member, then `END`. Phi is the peer's current phi (two decimals) when phi-accrual is on and the peer has heartbeat history; `-` otherwise, including self. Annotations are the member's comma-separated `key=value` list, `-` when it carries none. |
 | `STATUS` | One `STATUS id=<self> uptime=<seconds> alive=N suspect=N dead=N total=N` line, then `END`. |
+| `META <key=value>` | Set one annotation on this node itself: `OK <key=value>`. The change is gossiped with the next digest and persisted to the data dir, so it survives a restart. Bad syntax: `ERR invalid meta <arg>`; a ninth distinct key: `ERR meta full (max 8)`; missing argument: `ERR usage: META <key=value>`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
 | `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. |
-| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Built for tooling that polls cluster state without scraping the text protocol. |
+| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none). Built for tooling that polls cluster state without scraping the text protocol. |
 | anything else | `ERR unknown command` |
 
 ## Shared secret
@@ -628,6 +640,57 @@ at most); a refute latency that keeps approaching the suspect
 timeout means the cluster is flapping on the edge of declaring live
 peers dead, and the timeouts or the network deserve a look.
 
+## Member metadata
+
+A node can carry a small set of `key=value` annotations about
+itself — what it is for, where it runs, which build it is — so an
+operator looking at the cluster can tell the members apart without
+memorizing ports:
+
+```sh
+./pulse-node --port 17101 --meta role=worker --meta zone=us-east-1 \
+    --meta version=1.2.3 --data-dir /tmp/p1
+./pulse-ctl 127.0.0.1:18401 MEMBERS
+# MEMBER 127.0.0.1:17101 1 ALIVE - role=worker,zone=us-east-1,version=1.2.3
+```
+
+The rules are deliberately tight, because annotations ride in every
+gossip entry and in the JSON output: at most 8 per node, each
+`key=value` at most 64 chars, and keys and values use only
+`[A-Za-z0-9._-]` — no spaces, commas, semicolons, colons, or `=`
+inside a key or value, so an annotation survives the wire format and
+needs no escaping in JSON. A repeated key updates the value instead
+of adding a second pair.
+
+Annotations travel with the membership entry: on the wire an entry is
+`id:inc:state;k=v,k=v` (entries without the suffix — older nodes —
+parse exactly as before), so a peer learns a member's annotations
+from the same gossip that tells it the member exists, and a changed
+annotation bumps the table version, so the next digest carries it as
+a delta. The control plane shows them in `MEMBERS` (a `-` when a
+member carries none) and as a `meta` object per member in `JSON`
+(`{}` when there are none), and `META key=value` sets one on a
+running node — the change is gossiped and persisted at once.
+
+Persistence has two halves. A node's own annotations are saved to
+`<data-dir>/meta`, one `key=value` per line: a node started with
+`--meta` flags saves those, and a node started without flags loads
+the saved ones, so a restart keeps its annotations even when the
+flags are forgotten. What a node knows about its *peers* is saved in
+`<data-dir>/members` as an optional fifth field on each line, so a
+restarted node restores its peers' annotations until gossip
+refreshes them.
+
+Two honest caveats. An entry that carries no annotations never wipes
+stored ones: a peer that predates annotations, or one relaying an
+entry it learned without them, simply has nothing to say about them.
+So a node that drops *all* its annotations cannot propagate the
+removal — it can only replace them. And annotations are not
+authenticated: like the membership entries themselves, they are
+whoever claims them. With a shared secret only trusted peers can
+inject them; without one, any process on the network can already
+claim to be a member.
+
 ## Tests
 
 ```sh
@@ -716,7 +779,13 @@ make test
   (including a bracketed IPv6 id), self and never-contacted entries
   are not saved, a DEAD entry loads back as SUSPECT (re-probed, not
   trusted), malformed lines are skipped, an empty save leaves an
-  empty file, and ages clamp at one day.
+  empty file, and ages clamp at one day. Annotations ride along as a
+  fifth field in the members file and survive the round trip (with
+  `-` for members that carry none, and a malformed annotations field
+  dropped while the entry still loads), and the node's own
+  annotations round-trip through the `meta` file (missing file loads
+  zero, malformed lines are skipped, a duplicate key keeps its first
+  value).
 - `tests/test_persist.sh`: integration test for membership
   persistence — a 3-node cluster converges, node 3 stops cleanly and
   its peers land in the members file, node 3 restarts with no seed
@@ -773,6 +842,27 @@ make test
   still open); node 1 logs ALIVE, never DEAD, and `METRICS` reports
   `suspect_refuted=1` with one measured refute-latency sample, and
   `JSON` carries the same count and latency group.
+- `tests/test_meta.c`: unit tests for member metadata — `key=value`
+  parsing and validation (bad syntax, bad characters, the 32-char
+  key/value and 64-char total limits), set/update and the 8-pair cap,
+  format and list round-trips, order-insensitive equality, JSON
+  rendering (`{"role":"worker"}` or `{}`), the gossip wire round-trip
+  over real UDP loopback (annotations ride in the digest and parse
+  back, a malformed suffix is dropped while the entry still merges,
+  plain entries still parse), and merge propagation (learned
+  annotations stamp the entry changed, the same set twice is a
+  no-op, an entry with no annotations never wipes stored ones, self
+  entries are untouched).
+- `tests/test_meta.sh`: integration test for member metadata — a node
+  started with `--meta` flags logs them and shows them in `MEMBERS`
+  and as a `meta` object in `JSON`, a joiner with no annotations
+  learns the seed's via gossip and shows `-` / `{}` itself, `META`
+  at runtime is gossiped to peers within seconds, bad `META` usage
+  gets clean `ERR` lines and the 8 cap is enforced (the ninth key is
+  refused), and a clean restart with the same data dir and no
+  `--meta` flags restores the node's own annotations from the saved
+  meta file and its peers' annotations from the members file, with
+  peers seeing them again after the rejoin.
 
 ## Roadmap
 
@@ -795,3 +885,4 @@ make test
 - ~~Detection-latency histogram: the locally measured detection latencies are bucketed (<100, 100–249, 250–499, 500–999, ≥1000 ms) alongside the existing mean/max, and exposed as `hist` in the `METRICS` text line and as `detect_latency_ms.hist` in `JSON`, so the mean cannot hide a slow tail — a detection that usually lands in ~200 ms but sometimes takes over a second is exactly what the ward-device use case needs to see.~~ Done in 0.17.0.
 - ~~Adaptive probe interval: while any peer is SUSPECT the probe cycle shortens from the base interval to a fast interval (default half the base, `--probe-interval-fast-ms` to set it, floored at 25 ms, never slower than base), so direct probes, indirect PING_REQ, the suspect-to-dead sweep and gossip rounds all run faster exactly while the cluster is mid-incident, then return to base when the table is suspect-free; each switch is logged as an `ADAPTIVE` line and the fast cycles are counted as `adaptive_fast_cycles` in `METRICS` and `JSON`.~~ Done in 0.18.0.
 - ~~Suspicion-refutation window: a SUSPECT that comes back ALIVE is counted as a refuted suspicion (`suspect_refuted` in `METRICS` and `JSON`), with the time it sat SUSPECT recorded as a refute latency (mean/max/samples) — locally revived peers add a measured sample, gossip-learned refutations count only, and a DEAD peer coming back is a restart, not a refutation — so an operator can see how long false suspicions stay visible to the cluster.~~ Done in 0.19.0.
+- ~~Member metadata/annotations: each node carries up to 8 `key=value` annotations about itself (`role=worker`, `zone=us-east-1`, `version=1.2.3`), set with repeatable `--meta` flags or the control plane's `META` command, gossiped with its membership entry as an `;k=v,k=v` suffix (entries from older nodes parse unchanged), visible in `MEMBERS` and as a `meta` object per member in `JSON`, and persisted across restarts — the node's own set in `<data-dir>/meta` (flags win, otherwise the saved set is restored) and peers' sets as an optional fifth field in `<data-dir>/members`; an entry carrying no annotations never wipes stored ones.~~ Done in 0.20.0.

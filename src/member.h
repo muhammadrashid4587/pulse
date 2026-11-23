@@ -10,6 +10,26 @@
 #define PULSE_ID_LEN 64
 #define PULSE_MAX_TOMBSTONES 16
 
+/* Member metadata/annotations (0.20.0): a small set of key=value pairs
+ * a node carries about itself — role=worker, zone=us-east-1,
+ * version=1.2.3 — gossiped with its membership entry, shown in the
+ * control plane, and persisted across restarts. At most
+ * PULSE_MAX_META annotations per member, each "key=value" at most
+ * PULSE_META_MAX_LEN chars long. Keys and values use only
+ * [A-Za-z0-9._-]: no spaces, commas, semicolons, colons or '=' inside
+ * a key or value, so an annotation survives the wire format (entries
+ * are space-separated, meta pairs comma-separated after a ';') and
+ * needs no escaping in JSON. */
+#define PULSE_MAX_META 8
+#define PULSE_META_KEY_LEN 32
+#define PULSE_META_VAL_LEN 32
+#define PULSE_META_MAX_LEN 64 /* "key=value" at most this long */
+
+typedef struct {
+    char key[PULSE_META_KEY_LEN + 1];
+    char value[PULSE_META_VAL_LEN + 1];
+} meta_kv_t;
+
 typedef enum {
     MEMBER_ALIVE = 0,
     MEMBER_SUSPECT = 1,
@@ -42,6 +62,16 @@ typedef struct {
      * (member_mark_alive). Gossip about a peer is not a heartbeat —
      * only a packet from the peer itself proves it is alive. */
     phi_accrual_t phi;
+    /* Metadata the member carries about itself (role, zone, version,
+     * ...): set at startup with --meta, changeable at runtime with
+     * the control plane's META command, gossiped with the membership
+     * entry, and persisted across restarts. meta_count 0 means the
+     * member carries no annotations — which is also what an entry
+     * learned from a node that predates annotations looks like, so a
+     * merge never wipes stored annotations on the strength of an
+     * entry that carries none (see member_merge_meta). */
+    meta_kv_t meta[PULSE_MAX_META];
+    int meta_count;
 } member_t;
 
 typedef struct {
@@ -118,6 +148,40 @@ int pulse_addr_equal(const struct sockaddr_storage *a,
 int member_merge(member_table_t *t, const char *self_id, const char *id,
                  const struct sockaddr_storage *addr, uint32_t incarnation,
                  member_state_t state, int64_t now);
+/* Merge metadata learned from gossip into an existing entry: when the
+ * incoming annotations (meta_count > 0) differ from the stored ones,
+ * replace them and stamp the entry changed, so the change re-gossips
+ * onward; returns 1 when anything changed, 0 otherwise. An entry
+ * that carries no annotations never wipes stored ones — a peer that
+ * predates annotations, or one relaying an entry it learned without
+ * them, simply has nothing to say about them — so a node that drops
+ * all its annotations cannot propagate the removal; it can only
+ * replace them. Entries about self are ignored: our own annotations
+ * are ours to set. The caller passes the entry's id, not self's. */
+int member_merge_meta(member_table_t *t, const char *self_id, const char *id,
+                      const meta_kv_t *meta, int meta_count);
+
+/* Metadata helpers. member_meta_parse splits "key=value" into the two
+ * buffers and validates both (1..PULSE_META_KEY_LEN / VAL_LEN chars,
+ * [A-Za-z0-9._-] only, "key=value" at most PULSE_META_MAX_LEN chars);
+ * returns 0 on success, -1 on bad input. member_meta_set adds or
+ * updates one pair on an entry: 0 ok, -1 invalid, -2 full (already
+ * PULSE_MAX_META distinct keys). member_meta_format writes the
+ * comma-separated "k=v,k=v" list ("" when there are none) and returns
+ * the length, or -1 when the buffer is too small. member_meta_parse_list
+ * parses such a list into out (at most max pairs): 0 ok, -1 on any bad
+ * item. member_meta_equal is 1 when two entries carry the same set of
+ * pairs, regardless of order. member_meta_json writes the JSON object
+ * {"k":"v",...} ({} when there are none) — keys and values are
+ * restricted to JSON-safe characters, so no escaping is needed. */
+int member_meta_parse(const char *s, char *key, size_t klen, char *value,
+                      size_t vlen);
+int member_meta_set(member_t *m, const char *key, const char *value);
+int member_meta_format(const member_t *m, char *buf, size_t len);
+int member_meta_parse_list(const char *s, meta_kv_t *out, int max,
+                           int *out_count);
+int member_meta_equal(const member_t *a, const member_t *b);
+void member_meta_json(const member_t *m, char *buf, size_t len);
 
 int member_mark_suspect(member_table_t *t, const char *id, int64_t now);
 int member_mark_dead(member_table_t *t, const char *id, int64_t now);
