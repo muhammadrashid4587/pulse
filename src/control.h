@@ -71,6 +71,7 @@
  *           peer_file=<path|'-'> last_reload=<unix|'-'>
  *           last_mtime=<unix|'-'> pf_peers=<N|'-'> pf_added=<N|'-'>
  *           pf_dropped=<N|'-'> pf_kept=<N|'-'> pf_bad=<N|'-'>
+ *           watch_subscribers=<N> watch_sessions=<N>
  *       detect_latency_ms is last-direct-contact -> SUSPECT for
  *       suspicions this node detected itself (mean/max in ms, "-" when
  *       there are no samples); suspect_to_dead_ms is SUSPECT -> DEAD.
@@ -87,6 +88,13 @@
  *       reload, the file's mtime at that load, and the counts from
  *       that load (the same numbers as the PEERFILE RELOAD log line).
  *       All of them are "-" when the node runs without --peer-file.
+ *       watch_subscribers (0.33.0) is how many WATCH streams are
+ *       connected right now, and watch_sessions is how many WATCH
+ *       sessions the node has served since startup — so an operator
+ *       can see how many consumers are attached to the event
+ *       stream, and whether any ever were. A client that went away
+ *       drops out of the current count within about a second; the
+ *       session count only ever grows.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -104,7 +112,10 @@
  *       slow). A top-level "peer_file" object carries the --peer-file
  *       state (path, last_reload / last_mtime as unix seconds, and
  *       the counts from the last load), or null when the node runs
- *       without --peer-file.
+ *       without --peer-file. A top-level "watch" object (0.33.0)
+ *       carries "subscribers" (how many WATCH streams are connected
+ *       right now) and "sessions" (how many WATCH sessions the node
+ *       has served since startup).
  *   WATCH [types] [ids] [FROM <seq>]
  *       A long-lived stream of membership events, for tooling that
  *       watches a cluster instead of polling MEMBERS or JSON once a
@@ -166,6 +177,12 @@
  *       and is sent regardless of the filter; any line sent —
  *       EVENT, GAP, or HEARTBEAT — resets the 5 s clock, so a
  *       busy cluster never sees one.
+ *       Subscriber count (0.33.0): METRICS and JSON report how many
+ *       WATCH streams are connected right now ("watch_subscribers"
+ *       / "watch"."subscribers") and how many sessions the node has
+ *       served since startup ("watch_sessions" / "watch"."sessions"),
+ *       so an operator can see how many consumers are attached to
+ *       the event stream without counting connections by hand.
  *   anything else
  *       ERR unknown command
  *

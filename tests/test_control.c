@@ -39,7 +39,11 @@
  * stream sends a HEARTBEAT line with the current unix time once 5 s
  * pass with nothing sent, and a second one about 5 s later, with no
  * EVENT line in between; the heartbeat end to end is covered by
- * tests/test_watch_heartbeat.sh. */
+ * tests/test_watch_heartbeat.sh. WATCH subscriber count (0.33.0) is
+ * covered here too: METRICS and JSON report the number of WATCH
+ * streams connected right now and the sessions served since startup,
+ * rising as watchers connect and falling as they go away; the count
+ * end to end is covered by tests/test_watch_subscribers.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -293,6 +297,26 @@ static int watch_read_line_with_prefix(int fd, char *buf, size_t cap,
     }
 }
 
+/* Poll METRICS until its line contains needle (or the timeout
+ * elapses). A WATCH thread notices a closed client only on its next
+ * 1 s wait timeout, so the subscriber count lags a close by up to
+ * a second and an exact read right after closing is racy — the
+ * poll waits for the count to settle instead. Returns 1 when
+ * found. */
+static int metrics_wait_contains(int port, const char *needle,
+                                 int timeout_ms) {
+    char reply[4096];
+    int64_t deadline = pulse_now_ms() + timeout_ms;
+    for (;;) {
+        if (send_cmd(port, "METRICS\n", reply, sizeof reply) > 0 &&
+            strstr(reply, needle) != NULL)
+            return 1;
+        if (pulse_now_ms() >= deadline) return 0;
+        struct timespec ts = {0, 100 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+}
+
 /* Records one event into the log after a short sleep, so the
  * wakeup path of pulse_event_wait is exercised from another
  * thread instead of only the already-buffered path. */
@@ -499,7 +523,7 @@ int main(void) {
                  "slow_peers=0 peer_file=/tmp/peers "
                  "last_reload=1700000000 last_mtime=1699999000 "
                  "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
-                 "pf_bad=0\nEND\n") == 0);
+                 "pf_bad=0 watch_subscribers=0 watch_sessions=0\nEND\n") == 0);
 
     /* JSON (0.28.0): the same state as a "peer_file" object, and
      * each member carries its "source" — the peer-file peer is
@@ -583,6 +607,59 @@ int main(void) {
                                "EVENT 2 SUSPECTED 127.0.0.1:17903 2 1700000001\n",
                                3000));
         close(wfd);
+    }
+
+    /* WATCH subscriber count (0.33.0): METRICS and JSON report how
+     * many WATCH streams are connected right now and how many
+     * sessions the node has served since startup. The wfd stream
+     * above was session 1; this one is session 2, so the counts
+     * are subscribers=1 sessions=2 while it is open — the poll
+     * waits for the closed wfd thread to drop out of the count
+     * first (up to a second after its client closed). A second
+     * stream takes it to subscribers=2 sessions=3, closing the
+     * second drops it back to 1, and closing the first leaves 0
+     * with the session count still at 3: sessions only ever grow.
+     * A WATCH refused up front (bad filter, checked below) never
+     * becomes a session, so it counts in neither number. */
+    int sfd = watch_connect(18991);
+    CHECK(sfd >= 0);
+    if (sfd >= 0) {
+        const char *scmd = "WATCH\n";
+        CHECK(send(sfd, scmd, strlen(scmd), 0) == (ssize_t)strlen(scmd));
+        char sbuf[4096];
+        size_t slen = 0;
+        sbuf[0] = '\0';
+        CHECK(watch_read_until(sfd, sbuf, sizeof sbuf, &slen, "END\n",
+                               3000));
+        CHECK(strncmp(sbuf, "OK watching\n", 12) == 0);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=1 watch_sessions=2", 5000));
+        CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+        CHECK(strstr(reply,
+                     "\"watch\":{\"subscribers\":1,\"sessions\":2}") != NULL);
+        int tfd = watch_connect(18991);
+        CHECK(tfd >= 0);
+        if (tfd >= 0) {
+            const char *tcmd = "WATCH\n";
+            CHECK(send(tfd, tcmd, strlen(tcmd), 0) ==
+                  (ssize_t)strlen(tcmd));
+            char tbuf[4096];
+            size_t tlen = 0;
+            tbuf[0] = '\0';
+            CHECK(watch_read_until(tfd, tbuf, sizeof tbuf, &tlen,
+                                   "END\n", 3000));
+            CHECK(metrics_wait_contains(
+                18991, "watch_subscribers=2 watch_sessions=3", 5000));
+            close(tfd);
+            CHECK(metrics_wait_contains(
+                18991, "watch_subscribers=1 watch_sessions=3", 5000));
+        }
+        close(sfd);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=0 watch_sessions=3", 5000));
+        CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+        CHECK(strstr(reply,
+                     "\"watch\":{\"subscribers\":0,\"sessions\":3}") != NULL);
     }
 
     /* WATCH filter (0.30.0): a type list, an id list, or both narrows

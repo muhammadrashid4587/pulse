@@ -24,6 +24,28 @@
  * half-open connection is noticed quickly. */
 #define WATCH_HEARTBEAT_IDLE_MS 5000
 
+/* WATCH subscribers (0.33.0): how many WATCH streams are currently
+ * connected, and how many WATCH sessions the node has served since
+ * startup — so an operator polling METRICS or JSON can see how many
+ * consumers are attached to the event stream. Counted here, in the
+ * control plane, because the watch threads live here: the current
+ * count is live state, like slow_peers, not a failure-detector
+ * metric, so it needs no hook. A session is counted when its thread
+ * starts (a WATCH refused up front — bad filter, no watch hooks —
+ * never becomes a session); the count drops when the thread ends,
+ * so a client that went away is gone from the count within about a
+ * second of the disconnect being noticed. */
+static pthread_mutex_t g_watch_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_watch_current = 0;
+static uint64_t g_watch_total = 0;
+
+static void watch_subscriber_stats(int *current, uint64_t *total) {
+    pthread_mutex_lock(&g_watch_mu);
+    *current = g_watch_current;
+    *total = g_watch_total;
+    pthread_mutex_unlock(&g_watch_mu);
+}
+
 int control_listen(int port, int family) {
     int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -264,6 +286,18 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
                  " peer_file=- last_reload=- last_mtime=- pf_peers=- "
                  "pf_added=- pf_dropped=- pf_kept=- pf_bad=-");
     }
+    /* WATCH subscribers (0.33.0): how many WATCH streams are
+     * connected right now, and how many sessions the node has
+     * served since startup. The current count is live state — a
+     * client that went away drops out of it within about a second
+     * — while the session count only ever grows. */
+    int watch_current = 0;
+    uint64_t watch_total = 0;
+    watch_subscriber_stats(&watch_current, &watch_total);
+    used = strlen(line);
+    snprintf(line + used, sizeof line - used,
+             " watch_subscribers=%d watch_sessions=%llu", watch_current,
+             (unsigned long long)watch_total);
     if (send_all(fd, line) != 0) return;
     send_all(fd, "\nEND\n");
 }
@@ -386,6 +420,12 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
     else
         snprintf(rmean, sizeof rmean, "null");
     metrics_detect_hist_json(&m, dhist, sizeof dhist);
+    /* WATCH subscribers (0.33.0): the same counts METRICS reports,
+     * as a top-level "watch" object — how many WATCH streams are
+     * connected right now, and how many sessions since startup. */
+    int watch_current = 0;
+    uint64_t watch_total = 0;
+    watch_subscriber_stats(&watch_current, &watch_total);
     w = snprintf(buf + used, sizeof buf - used,
         "],\"metrics\":{\"suspected\":%lld,\"dead\":%lld,\"refutes\":%lld,"
         "\"joins\":%lld,\"adaptive_fast_cycles\":%lld,"
@@ -393,7 +433,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
         "\"max\":%lld,\"samples\":%lld},\"refute_latency_ms\":{\"mean\":%s,"
-        "\"max\":%lld,\"samples\":%lld}},\"peer_file\":%s}\nEND\n",
+        "\"max\":%lld,\"samples\":%lld}},\"peer_file\":%s,"
+        "\"watch\":{\"subscribers\":%d,\"sessions\":%llu}}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
         (long long)m.joins, (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
@@ -403,7 +444,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (long long)m.suspect_dead_max_ms,
         (long long)m.suspect_dead_samples,
         rmean, (long long)m.refute_max_ms,
-        (long long)m.refute_samples, pfjson);
+        (long long)m.refute_samples, pfjson, watch_current,
+        (unsigned long long)watch_total);
     if (w < 0 || (size_t)w >= sizeof buf - used) return;
     send_all(fd, buf);
 }
@@ -858,6 +900,12 @@ static void *watch_thread(void *arg) {
     watch_arg_t *w = arg;
     handle_watch(w->fd, w->hooks, w->arg);
     free(w);
+    /* The stream is over: this subscriber leaves the count. The
+     * increment happened in start_watch before the thread was
+     * created, so the count can never dip below zero here. */
+    pthread_mutex_lock(&g_watch_mu);
+    g_watch_current--;
+    pthread_mutex_unlock(&g_watch_mu);
     return NULL;
 }
 
@@ -879,8 +927,20 @@ static int start_watch(int fd, const control_hooks_t *hooks,
     w->fd = fd;
     w->hooks = hooks;
     snprintf(w->arg, sizeof w->arg, "%s", arg ? arg : "");
+    /* Count the session before the thread starts: a thread that
+     * runs and exits fast must not decrement before this increment
+     * lands. On a create failure the session never ran, so the
+     * count is given back. */
+    pthread_mutex_lock(&g_watch_mu);
+    g_watch_current++;
+    g_watch_total++;
+    pthread_mutex_unlock(&g_watch_mu);
     pthread_t th;
     if (pthread_create(&th, NULL, watch_thread, w) != 0) {
+        pthread_mutex_lock(&g_watch_mu);
+        g_watch_current--;
+        g_watch_total--;
+        pthread_mutex_unlock(&g_watch_mu);
         free(w);
         send_all(fd, "ERR watch not supported\n");
         return 0;
