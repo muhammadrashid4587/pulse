@@ -22,7 +22,9 @@ int main(void) {
     char buf[512];
     metrics_format(&m, buf, sizeof buf);
     CHECK(m.suspected == 0 && m.dead == 0 && m.refutes == 0 && m.joins == 0);
+    CHECK(m.seed_rejoins == 0);
     CHECK(strstr(buf, "suspected=0 dead=0 refutes=0 joins=0") != NULL);
+    CHECK(strstr(buf, "joins=0 seed_rejoins=0") != NULL);
     CHECK(strstr(buf, "detect_latency_ms mean=- max=- samples=0") != NULL);
     CHECK(strstr(buf, "suspect_to_dead_ms mean=- max=- samples=0") != NULL);
     CHECK(strstr(buf, "probe_rtt_ms mean=- max=- samples=0 "
@@ -133,6 +135,16 @@ int main(void) {
     CHECK(m.joins == 1);
     metrics_format(&m, buf, sizeof buf);
     CHECK(strstr(buf, "refutes=2 joins=1") != NULL);
+
+    /* Seed rejoins (0.53.0) are a plain counter too: one per re-JOIN
+     * sent to a seed that was not ALIVE. */
+    CHECK(m.seed_rejoins == 0);
+    metrics_note_seed_rejoin(&m);
+    metrics_note_seed_rejoin(&m);
+    metrics_note_seed_rejoin(&m);
+    CHECK(m.seed_rejoins == 3);
+    metrics_format(&m, buf, sizeof buf);
+    CHECK(strstr(buf, "joins=1 seed_rejoins=3") != NULL);
 
     /* A refuted suspicion: a peer that sat SUSPECT came back ALIVE.
      * Locally revived peers record how long the suspicion lasted;

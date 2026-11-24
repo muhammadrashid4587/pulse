@@ -47,6 +47,8 @@ void metrics_note_suspect_refuted(pulse_metrics_t *m, int64_t duration_ms) {
 
 void metrics_note_join(pulse_metrics_t *m) { m->joins++; }
 
+void metrics_note_seed_rejoin(pulse_metrics_t *m) { m->seed_rejoins++; }
+
 void metrics_note_adaptive_fast(pulse_metrics_t *m) {
     m->adaptive_fast_cycles++;
 }
@@ -112,11 +114,13 @@ void metrics_format(const pulse_metrics_t *m, char *buf, size_t len) {
     metrics_rtt_hist_json(m, rtthist, sizeof rtthist);
     snprintf(buf, len,
              "METRICS suspected=%lld dead=%lld refutes=%lld joins=%lld "
+             "seed_rejoins=%lld "
              "adaptive_fast_cycles=%lld suspect_refuted=%lld "
              "detect_latency_ms %s hist=[%s] suspect_to_dead_ms %s "
              "refute_latency_ms %s probe_rtt_ms %s hist=[%s]",
              (long long)m->suspected, (long long)m->dead,
              (long long)m->refutes, (long long)m->joins,
+             (long long)m->seed_rejoins,
              (long long)m->adaptive_fast_cycles,
              (long long)m->suspect_refuted, detect, hist,
              suspect_dead, refute, rtt, rtthist);

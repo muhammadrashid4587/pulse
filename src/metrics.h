@@ -49,6 +49,13 @@ typedef struct {
     int64_t dead;      /* SUSPECT -> DEAD transitions seen */
     int64_t refutes;   /* times this node refuted gossip about itself */
     int64_t joins;     /* first sightings of a member */
+    /* Seed-rejoin count (0.53.0): re-JOINs sent to a seed that was not
+     * ALIVE — the ~5 s retry while the seed is down, SUSPECT/DEAD in
+     * the table, or already GC'd. Zero on a node whose seeds were up
+     * at startup; it is the only trace that the rejoin retry ever
+     * fired, since a seed that never answers leaves no member behind
+     * to count. Local measurement, never gossiped, never persisted. */
+    int64_t seed_rejoins;
     int64_t detect_samples; /* suspicions with a measured latency */
     int64_t detect_sum_ms;
     int64_t detect_max_ms;
@@ -99,6 +106,10 @@ void metrics_note_suspect(pulse_metrics_t *m, int64_t latency_ms);
 void metrics_note_dead(pulse_metrics_t *m, int64_t duration_ms);
 void metrics_note_refute(pulse_metrics_t *m);
 void metrics_note_join(pulse_metrics_t *m);
+/* A re-JOIN was sent to a seed that was not ALIVE (the ~5 s seed
+ * rejoin retry). Counted once per re-JOIN sent, whether the seed was
+ * SUSPECT/DEAD in the table or already GC'd. */
+void metrics_note_seed_rejoin(pulse_metrics_t *m);
 /* A suspicion was refuted: a peer marked SUSPECT came back ALIVE.
  * duration_ms is how long it sat SUSPECT, or -1 when it was learned
  * from gossip and there is nothing local to measure. */
@@ -111,7 +122,7 @@ void metrics_note_adaptive_fast(pulse_metrics_t *m);
 void metrics_note_rtt(pulse_metrics_t *m, int64_t rtt_ms);
 
 /* Format one METRICS line (no trailing newline) into buf:
- *   METRICS suspected=N dead=N refutes=N joins=N
+ *   METRICS suspected=N dead=N refutes=N joins=N seed_rejoins=N
  *           adaptive_fast_cycles=N suspect_refuted=N
  *           detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e]
  *           suspect_to_dead_ms mean=X max=Y samples=N

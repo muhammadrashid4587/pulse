@@ -752,7 +752,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
      * fires the suspicion instead of hard-coding 8.0. */
     w = snprintf(buf + used, sizeof buf - used,
         "],\"metrics\":{\"suspected\":%lld,\"dead\":%lld,\"refutes\":%lld,"
-        "\"joins\":%lld,\"adaptive_fast_cycles\":%lld,"
+        "\"joins\":%lld,\"seed_rejoins\":%lld,\"adaptive_fast_cycles\":%lld,"
         "\"suspect_refuted\":%lld,\"slow_peers\":%d,"
         "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
@@ -764,7 +764,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"paused\":%d,\"event_log_cap\":%d,\"streams\":%s},"
         "\"gossip_digest_size\":%d,\"phi_threshold\":%.2f}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
-        (long long)m.joins, (long long)m.adaptive_fast_cycles,
+        (long long)m.joins, (long long)m.seed_rejoins,
+        (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
         member_count_slow(&t, hooks->slow_rtt_threshold_ms),
         dmean, (long long)m.detect_max_ms,
@@ -794,9 +795,9 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
  * control plane's usual trailer; this is the exposition format, not
  * an HTTP endpoint — scrape it with pulse-ctl, or point a scraper
  * at a tiny exporter that forwards the command). Counters are the
- * lifetime transition totals (suspected, dead, refutes, joins,
- * adaptive fast cycles, suspect refuted, watch sessions and the
- * watch delivery / drop counts); gauges are the current membership
+ * lifetime transition totals (suspected, dead, refutes, joins, seed
+ * rejoins, adaptive fast cycles, suspect refuted, watch sessions and
+ * the watch delivery / drop counts); gauges are the current membership
  * counts, slow peers, uptime and current watch subscribers.
  * Latencies are mean/max gauges (0 with no samples — Prometheus
  * has no null, and the matching _samples gauge says whether the
@@ -897,6 +898,12 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         "# HELP pulse_joins_total First sightings of a member.\n"
         "# TYPE pulse_joins_total counter\n"
         "pulse_joins_total %lld\n", (long long)m.joins) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_seed_rejoin_total Re-JOINs sent to a seed "
+        "that was not ALIVE.\n"
+        "# TYPE pulse_seed_rejoin_total counter\n"
+        "pulse_seed_rejoin_total %lld\n",
+        (long long)m.seed_rejoins) == 0;
     ok &= prom_add(buf, sizeof buf, &used,
         "# HELP pulse_adaptive_fast_cycles_total Probe cycles that "
         "ran at the fast interval because a peer was SUSPECT.\n"

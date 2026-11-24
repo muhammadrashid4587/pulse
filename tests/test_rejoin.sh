@@ -13,6 +13,7 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/pulse-node"
+CTL="$ROOT/pulse-ctl"
 TMP="$(mktemp -d /tmp/pulse-rejoin-test.XXXXXX)"
 PASS=0
 FAIL=0
@@ -48,8 +49,9 @@ mkdir -p "$TMP/n1" "$TMP/n2"
 
 # exec: the subshell replaces itself with the node, so $! is the node pid.
 # Ports 17401-17402 so this test never clashes with the other tests.
-# Node 2 starts first; its seed (node 1) is down.
-(cd "$TMP/n2" && exec "$BIN" --port 17402 --seed 127.0.0.1:17401 --dead-retention 2 > "$TMP/n2.log" 2>&1 & echo $! > "$TMP/n2.pid")
+# Node 2 starts first; its seed (node 1) is down. Its control port is
+# 18402, so the test can read METRICS at the end.
+(cd "$TMP/n2" && exec "$BIN" --port 17402 --seed 127.0.0.1:17401 --control-port 18402 --dead-retention 2 > "$TMP/n2.log" 2>&1 & echo $! > "$TMP/n2.pid")
 
 # 1. Node 2 suspects, deads and GCs the unanswering seed.
 if wait_for "$TMP/n2.log" "GC 127.0.0.1:17401" 10; then
@@ -85,6 +87,18 @@ else
     note fail "both nodes converge on alive=2 after the seed comes up"
     echo "--- n1.log"; tail -20 "$TMP/n1.log"
     echo "--- n2.log"; tail -20 "$TMP/n2.log"
+fi
+
+# 4. The rejoin retry is visible (0.53.0): METRICS on node 2 counts
+# the re-JOINs it sent while its seed was down — at least the one
+# after the GC, and usually one while the seed was SUSPECT/DEAD in
+# the table too. The count is stable now that the seed is ALIVE.
+metrics="$("$CTL" 127.0.0.1:18402 METRICS 2>/dev/null)"
+if echo "$metrics" | grep -qE "seed_rejoins=[1-9][0-9]*"; then
+    note ok "METRICS counts the seed rejoins (seed_rejoins above 0)"
+else
+    note fail "METRICS counts the seed rejoins (seed_rejoins above 0)"
+    echo "--- metrics"; echo "$metrics"
 fi
 
 echo "test_rejoin: $PASS passed, $FAIL failed"
