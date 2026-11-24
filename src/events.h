@@ -89,6 +89,14 @@ const char *pulse_event_type_name(pulse_event_type_t type);
  * (0.30.0), which takes the same words on the command line. */
 int pulse_event_type_parse(const char *name, pulse_event_type_t *out);
 
+/* The member state an event leaves its member in (0.39.0): JOINED,
+ * REVIVED and REFUTED land on ALIVE, SUSPECTED on SUSPECT, DEAD on
+ * DEAD. DROPPED leaves no state — the member left the table — so
+ * it returns 0 and never matches a state filter. Used by the WATCH
+ * state filter (0.39.0), which subscribes to events by the state
+ * they land on. */
+int pulse_event_result_state(pulse_event_type_t type, member_state_t *out);
+
 /* Append one event (assigning it the next sequence number) and wake
  * any waiter. Thread-safe; never blocks. Returns the sequence
  * number assigned, so the caller can append the same event to the

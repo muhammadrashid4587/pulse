@@ -28,7 +28,14 @@
  * covered here too: a filtered stream's snapshot holds only the
  * filtered peer, only matching events arrive, and a bad filter is
  * refused up front; the filter end to end is covered by
- * tests/test_watch_filter.sh. WATCH replay / resume (0.31.0) is
+ * tests/test_watch_filter.sh. WATCH state filtering (0.39.0) is
+ * covered here too: a STATE SUSPECT,DEAD stream snapshots only
+ * the canned DEAD member and carries only SUSPECTED and DEAD
+ * events — JOINED, DROPPED and REVIVED are filtered out —
+ * while a STATE ALIVE stream snapshots the three ALIVE members
+ * and not the dead one, and a bad STATE is refused up front; the
+ * state filter end to end is covered by
+ * tests/test_watch_state_filter.sh. WATCH replay / resume (0.31.0) is
  * covered here too: FROM <seq> replays the buffered events from
  * that seq after the snapshot and END, before live events; a FROM
  * below the oldest buffered event replays from the oldest instead,
@@ -1420,6 +1427,116 @@ int main(void) {
                    sizeof reply) > 0);
     CHECK(strcmp(reply,
                  "ERR invalid watch filter duplicate FROM\n") == 0);
+
+    /* WATCH state filter (0.39.0): "WATCH STATE <list>" narrows
+     * the stream to events that leave their member in one of the
+     * listed states — JOINED, REVIVED and REFUTED land on ALIVE,
+     * SUSPECTED on SUSPECT, DEAD on DEAD — and narrows the
+     * snapshot by the member's current state too. DROPPED lands
+     * on no state, so it never matches a state filter. The log
+     * holds seqs 1-146 here. Sessions 1-14 are streams, and the
+     * five refused WATCHes just above (two bad filters, three bad
+     * FROMs) each counted as a session too — start_watch counts
+     * the session before the thread parses the filter — so this
+     * stream is session 20 and the events below are 147-151. */
+    {
+        member_state_t st;
+        CHECK(pulse_event_result_state(PULSE_EVENT_JOINED, &st) == 1
+              && st == MEMBER_ALIVE);
+        CHECK(pulse_event_result_state(PULSE_EVENT_SUSPECTED, &st) == 1
+              && st == MEMBER_SUSPECT);
+        CHECK(pulse_event_result_state(PULSE_EVENT_DEAD, &st) == 1
+              && st == MEMBER_DEAD);
+        CHECK(pulse_event_result_state(PULSE_EVENT_REVIVED, &st) == 1
+              && st == MEMBER_ALIVE);
+        CHECK(pulse_event_result_state(PULSE_EVENT_REFUTED, &st) == 1
+              && st == MEMBER_ALIVE);
+        CHECK(pulse_event_result_state(PULSE_EVENT_DROPPED, &st) == 0);
+    }
+    int vfd = watch_connect(18991);
+    CHECK(vfd >= 0);
+    if (vfd >= 0) {
+        const char *vcmd = "WATCH STATE SUSPECT,DEAD\n";
+        CHECK(send(vfd, vcmd, strlen(vcmd), 0) == (ssize_t)strlen(vcmd));
+        char vbuf[4096];
+        size_t vlen = 0;
+        vbuf[0] = '\0';
+        CHECK(watch_read_until(vfd, vbuf, sizeof vbuf, &vlen, "END\n",
+                               3000));
+        CHECK(strncmp(vbuf, "OK watching\n", 12) == 0);
+        /* The snapshot holds only the canned DEAD member: the
+         * other three are ALIVE, and the state filter narrows
+         * the snapshot by current state. The dead member was
+         * never heard from, so its last-seen is '-'. */
+        CHECK(strstr(vbuf, "SNAPSHOT 127.0.0.1:17902 1 DEAD - discovered\n") != NULL);
+        CHECK(strstr(vbuf, "SNAPSHOT 127.0.0.1:17901") == NULL);
+        CHECK(strstr(vbuf, "SNAPSHOT 127.0.0.1:17903") == NULL);
+        CHECK(strstr(vbuf, "SNAPSHOT 127.0.0.1:17999") == NULL);
+        /* Only SUSPECTED and DEAD arrive: JOINED lands on ALIVE,
+         * DROPPED lands on no state at all, and REVIVED lands on
+         * ALIVE — all three are filtered out, but still consume
+         * their sequence numbers, so the numbers jump. */
+        pulse_event_record(&g_watch_log, PULSE_EVENT_SUSPECTED,
+                           "127.0.0.1:17903", 2, 1700000600);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_JOINED,
+                           "127.0.0.1:17901", 1, 1700000601);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_DEAD,
+                           "127.0.0.1:17903", 2, 1700000602);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_DROPPED,
+                           "127.0.0.1:17901", 1, 1700000603);
+        pulse_event_record(&g_watch_log, PULSE_EVENT_REVIVED,
+                           "127.0.0.1:17903", 2, 1700000604);
+        CHECK(watch_read_until(vfd, vbuf, sizeof vbuf, &vlen,
+                               "EVENT 147 SUSPECTED 127.0.0.1:17903 2 1700000600\n",
+                               3000));
+        CHECK(watch_read_until(vfd, vbuf, sizeof vbuf, &vlen,
+                               "EVENT 149 DEAD 127.0.0.1:17903 2 1700000602\n",
+                               3000));
+        CHECK(watch_read_until(vfd, vbuf, sizeof vbuf, &vlen,
+                               "EVENT 999", 1500) == 0);
+        CHECK(strstr(vbuf, "EVENT 148 JOINED") == NULL);
+        CHECK(strstr(vbuf, "EVENT 150 DROPPED") == NULL);
+        CHECK(strstr(vbuf, "EVENT 151 REVIVED") == NULL);
+        close(vfd);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=0 watch_sessions=20", 5000));
+    }
+    /* A STATE ALIVE stream snapshots the three ALIVE members of
+     * the canned table — and not the dead one — and a bad STATE
+     * is refused up front: an unknown state, a missing list, and
+     * a duplicate STATE, exactly like a duplicate FROM. */
+    int afd = watch_connect(18991);
+    CHECK(afd >= 0);
+    if (afd >= 0) {
+        const char *acmd = "WATCH STATE ALIVE\n";
+        CHECK(send(afd, acmd, strlen(acmd), 0) == (ssize_t)strlen(acmd));
+        char abuf[4096];
+        size_t alen = 0;
+        abuf[0] = '\0';
+        CHECK(watch_read_until(afd, abuf, sizeof abuf, &alen, "END\n",
+                               3000));
+        CHECK(strncmp(abuf, "OK watching\n", 12) == 0);
+        CHECK(strstr(abuf, "SNAPSHOT 127.0.0.1:17999 1 ALIVE - self\n") != NULL);
+        CHECK(strstr(abuf, "SNAPSHOT 127.0.0.1:17901 1 ALIVE ") != NULL);
+        CHECK(strstr(abuf, "SNAPSHOT 127.0.0.1:17903 2 ALIVE ") != NULL);
+        CHECK(strstr(abuf, "SNAPSHOT 127.0.0.1:17902") == NULL);
+        close(afd);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=0 watch_sessions=21", 5000));
+    }
+    CHECK(send_cmd(18991, "WATCH STATE BOGUS\n", reply,
+                   sizeof reply) > 0);
+    CHECK(strcmp(reply,
+                 "ERR invalid watch filter unknown member state BOGUS\n")
+          == 0);
+    CHECK(send_cmd(18991, "WATCH STATE\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply,
+                 "ERR invalid watch filter STATE requires a state "
+                 "list\n") == 0);
+    CHECK(send_cmd(18991, "WATCH STATE ALIVE STATE DEAD\n", reply,
+                   sizeof reply) > 0);
+    CHECK(strcmp(reply,
+                 "ERR invalid watch filter duplicate STATE\n") == 0);
 
     shutdown(fd, SHUT_RDWR);
     close(fd);

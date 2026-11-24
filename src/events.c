@@ -72,6 +72,35 @@ int pulse_event_type_parse(const char *name, pulse_event_type_t *out) {
     return -1;
 }
 
+/* The member state an event leaves its member in (0.39.0): JOINED,
+ * REVIVED and REFUTED all land on ALIVE — a join is a live peer
+ * appearing, a revival is a SUSPECT/DEAD peer answering again, a
+ * refutation is this node bumping its incarnation to answer a
+ * verdict about itself — SUSPECTED lands on SUSPECT and DEAD on
+ * DEAD. DROPPED has no state to land on: the member left the
+ * table, so it never matches a state filter — a watcher that wants
+ * removals subscribes to the DROPPED type instead. Returns 1 with
+ * *out filled, or 0 for DROPPED. */
+int pulse_event_result_state(pulse_event_type_t type, member_state_t *out) {
+    switch (type) {
+        case PULSE_EVENT_JOINED:
+        case PULSE_EVENT_REVIVED:
+        case PULSE_EVENT_REFUTED:
+            *out = MEMBER_ALIVE;
+            return 1;
+        case PULSE_EVENT_SUSPECTED:
+            *out = MEMBER_SUSPECT;
+            return 1;
+        case PULSE_EVENT_DEAD:
+            *out = MEMBER_DEAD;
+            return 1;
+        case PULSE_EVENT_DROPPED:
+            return 0;
+        default:
+            return 0;
+    }
+}
+
 /* Insert one event into the ring at the given sequence number.
  * Caller holds the lock. The ring keeps the last <cap> events:
  * inserting past the capacity scrolls the oldest out, exactly as

@@ -221,6 +221,19 @@
  *       numbers jump by design — a jump means filtered-out events,
  *       not lost ones. A bad filter is refused up front:
  *       ERR invalid watch filter <reason>.
+ *       A state filter (0.39.0) narrows the stream by the member
+ *       state an event leaves its member in: "WATCH STATE
+ *       SUSPECT,DEAD" carries only events that land on SUSPECT
+ *       or DEAD. JOINED, REVIVED and REFUTED land on ALIVE,
+ *       SUSPECTED on SUSPECT, DEAD on DEAD, and DROPPED lands on
+ *       no state — the member left the table — so it never
+ *       matches a state filter; a watcher that wants removals
+ *       subscribes to the DROPPED type instead. The state filter
+ *       narrows the snapshot too, by the member's current state,
+ *       and composes with the type/id filters and FROM, in any
+ *       order. A second STATE is refused, like a second FROM,
+ *       and a bad state is refused up front with "ERR invalid
+ *       watch filter unknown member state <name>".
  *       Replay / resume (0.31.0): "WATCH FROM <seq>" replays the
  *       buffered events from that sequence number — in order,
  *       after the snapshot and END, before live events — so a

@@ -82,6 +82,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_peers.sh
 	bash tests/test_watch.sh
 	bash tests/test_watch_filter.sh
+	bash tests/test_watch_state_filter.sh
 	bash tests/test_watch_replay.sh
 	bash tests/test_watch_heartbeat.sh
 	bash tests/test_watch_subscribers.sh

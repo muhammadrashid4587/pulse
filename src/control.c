@@ -1095,6 +1095,15 @@ typedef struct {
     int have_ids;
     char ids[PULSE_MAX_MEMBERS][PULSE_ID_LEN];
     int n_ids;
+    /* State filter (0.39.0): "STATE <list>" narrows the stream to
+     * events that leave their member in one of these states —
+     * JOINED/REVIVED/REFUTED land on ALIVE, SUSPECTED on SUSPECT,
+     * DEAD on DEAD — and narrows the snapshot the same way, so a
+     * watcher subscribed to DEAD snapshots only the dead members.
+     * One bit per member_state_t; DROPPED lands on no state, so it
+     * never matches a state filter. */
+    int have_states;
+    uint32_t state_mask;
     /* Replay / resume (0.31.0): "FROM <seq>" asks the stream to
      * replay buffered events from that sequence number before
      * going live. have_from is 0 for a plain live WATCH. from_seq
@@ -1147,6 +1156,42 @@ static int parse_watch_filter_token(const char *token, watch_filter_t *f,
     return 0;
 }
 
+/* Parse one STATE token: the token after "STATE" must be a
+ * comma-separated list of member states (ALIVE, SUSPECT, DEAD).
+ * Returns 0 on success, -1 with err filled. A second STATE is
+ * refused: one state list per stream. */
+static int parse_watch_state(const char *tok, watch_filter_t *f,
+                             char *err, size_t errcap) {
+    if (f->have_states) {
+        snprintf(err, errcap, "duplicate STATE");
+        return -1;
+    }
+    if (!tok || tok[0] == '\0') {
+        snprintf(err, errcap, "STATE requires a state list");
+        return -1;
+    }
+    char copy[CONTROL_MAX_LINE];
+    snprintf(copy, sizeof copy, "%s", tok);
+    char *save = NULL;
+    for (char *part = strtok_r(copy, ",", &save); part;
+         part = strtok_r(NULL, ",", &save)) {
+        member_state_t state;
+        if (strcmp(part, "ALIVE") == 0) {
+            state = MEMBER_ALIVE;
+        } else if (strcmp(part, "SUSPECT") == 0) {
+            state = MEMBER_SUSPECT;
+        } else if (strcmp(part, "DEAD") == 0) {
+            state = MEMBER_DEAD;
+        } else {
+            snprintf(err, errcap, "unknown member state %s", part);
+            return -1;
+        }
+        f->state_mask |= (uint32_t)(1u << state);
+        f->have_states = 1;
+    }
+    return 0;
+}
+
 /* Parse one FROM token: the token after "FROM" must be a decimal
  * sequence number (digits only, fits in a uint64_t). Returns 0 on
  * success, -1 with err filled. A second FROM is refused: one
@@ -1181,7 +1226,8 @@ static int parse_watch_from(const char *tok, watch_filter_t *f,
 
 /* Parse the argument of a WATCH command into a filter: a type list,
  * an id list, or both, in any order, each list comma-separated and
- * each token whitespace-separated, plus an optional "FROM <seq>"
+ * each token whitespace-separated, plus an optional "STATE <list>"
+ * state filter (0.39.0) and an optional "FROM <seq>"
  * replay point (0.31.0). A NULL or empty argument is an unfiltered
  * live WATCH. Returns 0 on success, -1 with err filled. */
 static int parse_watch_filter(const char *arg, watch_filter_t *f,
@@ -1201,18 +1247,36 @@ static int parse_watch_filter(const char *arg, watch_filter_t *f,
                 return -1;
             continue;
         }
+        if (strcmp(tok, "STATE") == 0) {
+            /* Consume the state list right after STATE, the same
+             * way FROM consumes its sequence number. */
+            char *state_tok = strtok_r(NULL, " \t", &save);
+            if (parse_watch_state(state_tok, f, err, errcap) != 0)
+                return -1;
+            continue;
+        }
         if (parse_watch_filter_token(tok, f, err, errcap) != 0)
             return -1;
     }
     return 0;
 }
 
-/* Does this event pass the filter? A filtered-out type or an id
- * outside the list is dropped server-side, before sending. */
+/* Does this event pass the filter? A filtered-out type, state, or
+ * an id outside the list is dropped server-side, before sending.
+ * The state filter (0.39.0) matches on the state the event leaves
+ * its member in: an event that lands on no state (DROPPED) never
+ * matches it. */
 static int watch_filter_match(const watch_filter_t *f,
                               const pulse_event_t *ev) {
     if (f->have_types && !(f->type_mask & (uint32_t)(1u << ev->type)))
         return 0;
+    if (f->have_states) {
+        member_state_t state;
+        if (!pulse_event_result_state(ev->type, &state))
+            return 0;
+        if (!(f->state_mask & (uint32_t)(1u << state)))
+            return 0;
+    }
     if (f->have_ids) {
         for (int i = 0; i < f->n_ids; i++)
             if (strcmp(f->ids[i], ev->id) == 0) return 1;
@@ -1221,14 +1285,24 @@ static int watch_filter_match(const watch_filter_t *f,
     return 1;
 }
 
-/* Does this peer id pass the filter's id list (the snapshot side:
- * a type filter does not narrow the snapshot, which has no event
- * type — only an id filter does)? */
-static int watch_filter_match_id(const watch_filter_t *f, const char *id) {
-    if (!f->have_ids) return 1;
-    for (int i = 0; i < f->n_ids; i++)
-        if (strcmp(f->ids[i], id) == 0) return 1;
-    return 0;
+/* Does this member pass the filter's snapshot side (0.39.0): the
+ * snapshot is narrowed by the id list and by the state list — a
+ * type filter does not narrow the snapshot, which has no event
+ * type, but a state filter does, since a SNAPSHOT line carries the
+ * member's current state. With no id or state filter, everything
+ * passes. */
+static int watch_filter_match_member(const watch_filter_t *f,
+                                     const member_t *m) {
+    if (f->have_ids) {
+        int found = 0;
+        for (int i = 0; i < f->n_ids; i++)
+            if (strcmp(f->ids[i], m->id) == 0) found = 1;
+        if (!found) return 0;
+    }
+    if (f->have_states &&
+        !(f->state_mask & (uint32_t)(1u << m->state)))
+        return 0;
+    return 1;
 }
 
 /* WATCH PAUSE / WATCH RESUME (0.37.0): one-shot commands on a
@@ -1357,6 +1431,20 @@ static int watch_wait_paused(int fd, watch_pause_entry_t *pause_entry,
  * refused up front with "ERR invalid watch filter <reason>" and
  * the connection closes.
  *
+ * A state filter (0.39.0) narrows the stream by the member state
+ * an event leaves its member in: "WATCH STATE SUSPECT,DEAD"
+ * carries only events that land on SUSPECT or DEAD, so a watcher
+ * that only cares about trouble never sees joins or revivals.
+ * JOINED, REVIVED and REFUTED land on ALIVE, SUSPECTED on SUSPECT,
+ * DEAD on DEAD, and DROPPED lands on no state at all — the member
+ * left the table — so it never matches a state filter; a watcher
+ * that wants removals subscribes to the DROPPED type instead.
+ * The state filter narrows the snapshot too, by the member's
+ * current state, and composes with the type/id filters and FROM,
+ * in any order. A second STATE is refused, like a second FROM,
+ * and a bad state is refused up front with "ERR invalid watch
+ * filter unknown member state <name>".
+ *
  * Replay / resume (0.31.0): "WATCH FROM <seq>" replays the
  * buffered events from that sequence number — in order, after the
  * snapshot and END, before live events — so a client that
@@ -1473,7 +1561,7 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
     int64_t now = pulse_now_ms();
     char line[256];
     for (int i = 0; i < t.count; i++) {
-        if (!watch_filter_match_id(&filter, t.members[i].id)) continue;
+        if (!watch_filter_match_member(&filter, &t.members[i])) continue;
         format_peer_line(line, sizeof line, "SNAPSHOT", &t.members[i],
                          hooks, now);
         if (send_all(fd, line) != 0) {
