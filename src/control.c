@@ -138,6 +138,15 @@ static void watch_stream_unregister(int slot) {
     pthread_mutex_unlock(&g_watch_mu);
 }
 
+/* The WATCH event ring capacity (0.36.0): the --event-log-cap the
+ * node started with. A NULL hook — an older harness, or a node
+ * that does not support watching — reports the default, so
+ * METRICS / JSON / PROMETHEUS never print a nonsense cap. */
+static int event_log_cap_or_default(const control_hooks_t *hooks) {
+    if (hooks->event_log_cap) return hooks->event_log_cap(hooks->ctx);
+    return PULSE_EVENT_LOG_CAP;
+}
+
 int control_listen(int port, int family) {
     int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -395,11 +404,12 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
     snprintf(line + used, sizeof line - used,
              " watch_subscribers=%d watch_sessions=%llu "
              "watch_delivered=%llu watch_filtered=%llu "
-             "watch_dropped=%llu",
+             "watch_dropped=%llu watch_event_log_cap=%d",
              ws.current, (unsigned long long)ws.sessions,
              (unsigned long long)ws.delivered,
              (unsigned long long)ws.filtered,
-             (unsigned long long)ws.dropped);
+             (unsigned long long)ws.dropped,
+             event_log_cap_or_default(hooks));
     if (send_all(fd, line) != 0) return;
     send_all(fd, "\nEND\n");
 }
@@ -567,7 +577,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"max\":%lld,\"samples\":%lld}},\"peer_file\":%s,"
         "\"watch\":{\"subscribers\":%d,\"sessions\":%llu,"
         "\"delivered\":%llu,\"filtered\":%llu,\"dropped\":%llu,"
-        "\"streams\":%s}}\nEND\n",
+        "\"event_log_cap\":%d,\"streams\":%s}}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
         (long long)m.joins, (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
@@ -581,7 +591,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (unsigned long long)ws.sessions,
         (unsigned long long)ws.delivered,
         (unsigned long long)ws.filtered,
-        (unsigned long long)ws.dropped, streams_json);
+        (unsigned long long)ws.dropped,
+        event_log_cap_or_default(hooks), streams_json);
     if (w < 0 || (size_t)w >= sizeof buf - used) return;
     send_all(fd, buf);
 }
@@ -825,6 +836,16 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         "# TYPE pulse_watch_dropped_total counter\n"
         "pulse_watch_dropped_total %llu\n",
         (unsigned long long)ws.dropped) == 0;
+    /* The event ring capacity (0.36.0): how many events the WATCH
+     * ring holds — the --event-log-cap the node started with, 128
+     * by default — as a gauge, so a scraper can see how far back
+     * a replay can reach. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_watch_event_log_cap Events the WATCH event "
+        "ring holds.\n"
+        "# TYPE pulse_watch_event_log_cap gauge\n"
+        "pulse_watch_event_log_cap %d\n",
+        event_log_cap_or_default(hooks)) == 0;
     /* One info gauge per member, labelled by member, state and
      * source — the Prometheus way of exposing per-member state
      * without a separate metric per peer. */
@@ -1148,7 +1169,8 @@ static int watch_filter_match_id(const watch_filter_t *f, const char *id) {
  * from the oldest buffered event; a FROM past the latest sequence
  * starts live, with nothing to replay yet. A FROM below the oldest
  * buffered event — the requested event has been evicted from the
- * 128-event ring — replays from the oldest buffered event instead,
+ * event ring (whose capacity is --event-log-cap, 128 by default)
+ * — replays from the oldest buffered event instead,
  * after a "GAP <requested> <oldest>" line that says how much was
  * lost; the stream stays open, unlike the mid-stream gap below.
  * FROM composes with the type/id filters, in any order, and the
@@ -1265,10 +1287,10 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
     }
     /* first_wait is still set while no event has been consumed:
      * a gap on the very first wait means the replay point was
-     * evicted between the snapshot and the wait (a burst of 128
-     * events in that window) — re-read the ring and resume from
-     * the new oldest with a GAP line, instead of dropping a
-     * stream that only just opened. Once an event has been
+     * evicted between the snapshot and the wait (a burst of more
+     * events than the ring holds in that window) — re-read the
+     * ring and resume from the new oldest with a GAP line, instead
+     * of dropping a stream that only just opened. Once an event has been
      * consumed the client is live, and a gap then means it fell
      * behind mid-stream: ERR and close, as before. */
     int first_wait = 1;

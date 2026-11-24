@@ -3,14 +3,42 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-void pulse_event_log_init(pulse_event_log_t *log) {
+void pulse_event_log_init(pulse_event_log_t *log, int cap) {
     memset(log, 0, sizeof *log);
+    if (cap <= 0) cap = PULSE_EVENT_LOG_CAP;
+    log->cap = cap;
+    /* The ring is heap-allocated so the cap is a runtime choice
+     * (--event-log-cap), not a compile-time one. A node never
+     * frees its log, so an allocation failure here is fatal
+     * rather than a degraded start with a 0-capacity ring. */
+    log->events = calloc((size_t)cap, sizeof *log->events);
+    if (!log->events) {
+        fprintf(stderr, "pulse: cannot allocate event log (%d events)\n",
+                cap);
+        exit(1);
+    }
     pthread_mutex_init(&log->lock, NULL);
     pthread_cond_init(&log->cond, NULL);
     log->next_seq = 1;
+}
+
+void pulse_event_log_free(pulse_event_log_t *log) {
+    free(log->events);
+    log->events = NULL;
+    log->cap = 0;
+    pthread_mutex_destroy(&log->lock);
+    pthread_cond_destroy(&log->cond);
+}
+
+int pulse_event_log_cap(pulse_event_log_t *log) {
+    pthread_mutex_lock(&log->lock);
+    int cap = log->cap;
+    pthread_mutex_unlock(&log->lock);
+    return cap;
 }
 
 const char *pulse_event_type_name(pulse_event_type_t type) {
@@ -54,8 +82,8 @@ void pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
     snprintf(slot->id, sizeof slot->id, "%s", id);
     slot->incarnation = incarnation;
     slot->unix_ts = unix_ts;
-    log->head = (log->head + 1) % PULSE_EVENT_LOG_CAP;
-    if (log->count < PULSE_EVENT_LOG_CAP) log->count++;
+    log->head = (log->head + 1) % log->cap;
+    if (log->count < log->cap) log->count++;
     /* A waiter may be waiting for exactly this event; a broadcast
      * wakes it, and it re-checks under the lock. */
     pthread_cond_broadcast(&log->cond);
@@ -104,8 +132,8 @@ int pulse_event_wait(pulse_event_log_t *log, uint64_t after_seq,
              * -(CAP - 1), so one add of CAP fixes a negative. */
             int idx = (log->head - log->count +
                        (int)(wanted - oldest)) %
-                      PULSE_EVENT_LOG_CAP;
-            if (idx < 0) idx += PULSE_EVENT_LOG_CAP;
+                      log->cap;
+            if (idx < 0) idx += log->cap;
             *out = log->events[idx];
             pthread_mutex_unlock(&log->lock);
             return 1;

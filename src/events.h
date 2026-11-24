@@ -14,19 +14,24 @@
  * reads them in sequence-number order as they happen, after a
  * snapshot of the current table (see control.h).
  *
- * The log is a bounded ring: the last PULSE_EVENT_LOG_CAP events
- * are kept, older ones scroll out. A consumer that falls more than
- * a ring behind is told so (pulse_event_wait returns -1) instead of
- * the log growing without bound: WATCH then drops the connection
- * with an ERR line and the client reconnects and re-reads the
- * snapshot. Sequence numbers are 1-based and monotonic for the
- * node's life, so a client that sees a jump in them knows it
- * missed events even when the gap is smaller than the ring. The
- * log is not persisted: a restarted node starts at sequence 1,
- * and the members it restores from disk are pre-existing state,
- * not events. */
+ * The log is a bounded ring: the last <cap> events are kept, older
+ * ones scroll out. A consumer that falls more than a ring behind
+ * is told so (pulse_event_wait returns -1) instead of the log
+ * growing without bound: WATCH then drops the connection with an
+ * ERR line and the client reconnects and re-reads the snapshot.
+ * Sequence numbers are 1-based and monotonic for the node's life,
+ * so a client that sees a jump in them knows it missed events
+ * even when the gap is smaller than the ring. The log is not
+ * persisted: a restarted node starts at sequence 1, and the
+ * members it restores from disk are pre-existing state, not
+ * events.
+ *
+ * The cap is set at init time, not compile time: a node takes
+ * --event-log-cap (0.36.0) so an operator watching a busy cluster
+ * can hold more history for replay, or a small node can hold less.
+ * The default is PULSE_EVENT_LOG_CAP (128). */
 
-#define PULSE_EVENT_LOG_CAP 128
+#define PULSE_EVENT_LOG_CAP 128 /* default ring capacity */
 
 typedef enum {
     PULSE_EVENT_JOINED = 0,    /* a peer appeared in the table */
@@ -50,13 +55,22 @@ typedef struct {
 typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
-    pulse_event_t events[PULSE_EVENT_LOG_CAP];
+    pulse_event_t *events; /* heap ring, cap entries */
+    int cap;       /* ring capacity, set at init (default 128) */
     int head;      /* index of the next slot to write */
-    int count;     /* events held, at most PULSE_EVENT_LOG_CAP */
+    int count;     /* events held, at most cap */
     uint64_t next_seq; /* seq the next recorded event gets */
 } pulse_event_log_t;
 
-void pulse_event_log_init(pulse_event_log_t *log);
+/* Allocate the ring with room for cap events (cap <= 0 means the
+ * default PULSE_EVENT_LOG_CAP). Call pulse_event_log_free when the
+ * log is no longer needed; a node that runs for its whole process
+ * lifetime never needs to. */
+void pulse_event_log_init(pulse_event_log_t *log, int cap);
+void pulse_event_log_free(pulse_event_log_t *log);
+
+/* The ring capacity this log was initialised with. */
+int pulse_event_log_cap(pulse_event_log_t *log);
 
 /* "JOINED", "SUSPECTED", "DEAD", "REVIVED", "DROPPED", "REFUTED":
  * the word that rides in the EVENT line for a type. */

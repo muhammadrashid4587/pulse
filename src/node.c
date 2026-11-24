@@ -86,6 +86,9 @@ typedef struct {
     int64_t slow_peer_rtt_ms;  /* slow-peer warning threshold: warn when
                                   a peer's mean probe RTT is above this
                                   many ms, 0 = disabled (see member.h) */
+    int event_log_cap;         /* WATCH event ring capacity: how many
+                                  membership events the log holds for
+                                  replay (0.36.0), 0 = default 128 */
     char secret[PULSE_SECRET_MAX]; /* shared secret for joins, "" = none */
     int ipv6;                  /* use IPv6 (bind ::, ids are "[::1]:port") */
     char bind_host[128];       /* bind address override, "" = wildcard */
@@ -1524,6 +1527,13 @@ static uint64_t watch_oldest_seq_hook(void *ctx) {
     return pulse_event_oldest_seq(&g_event_log);
 }
 
+/* WATCH event ring capacity (0.36.0): how many events the log
+ * holds, so METRICS / JSON / PROMETHEUS can report it. */
+static int watch_event_log_cap_hook(void *ctx) {
+    (void)ctx;
+    return pulse_event_log_cap(&g_event_log);
+}
+
 /* Set one annotation on this node itself (control plane META): update
  * the self entry, stamp it changed so the next digest gossips it, and
  * persist the set to the data dir so it survives a restart. Returns
@@ -1619,6 +1629,7 @@ static void usage(const char *prog) {
             "       [--phi-accrual] [--phi-threshold N]\n"
             "       [--sync-interval-ms N]\n"
             "       [--control-port PORT]\n"
+            "       [--event-log-cap N]\n"
             "       [--secret SECRET | --shared-secret SECRET]\n"
             "       [--meta KEY=VALUE]... (repeatable, at most 8)\n"
             "       [--ipv6] [--bind HOST]\n",
@@ -1638,6 +1649,7 @@ int main(int argc, char **argv) {
     g_cfg.phi_threshold = 8.0;
     g_cfg.sync_interval_ms = 10000; /* anti-entropy full-table exchange */
     g_cfg.slow_peer_rtt_ms = 0; /* slow-peer warning disabled */
+    g_cfg.event_log_cap = 0; /* default WATCH event ring (128 events) */
     g_cfg.control_port = -1; /* disabled unless --control-port is given */
 
     for (int i = 1; i < argc; i++) {
@@ -1702,6 +1714,20 @@ int main(int argc, char **argv) {
             g_cfg.control_port = atoi(argv[++i]);
             if (g_cfg.control_port <= 0 || g_cfg.control_port > 65535) {
                 fprintf(stderr, "--control-port must be a port number\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--event-log-cap") == 0 && i + 1 < argc) {
+            /* Configurable WATCH event ring (0.36.0): how many
+             * membership events the log holds for replay. A busy
+             * cluster wants a bigger ring so a reconnecting
+             * watcher can catch up further back; a small node can
+             * hold less. 1 is the floor (a ring that holds nothing
+             * can never replay), 100000 the ceiling (about 9 MB
+             * of ring, at 88 bytes per event). */
+            g_cfg.event_log_cap = atoi(argv[++i]);
+            if (g_cfg.event_log_cap < 1 || g_cfg.event_log_cap > 100000) {
+                fprintf(stderr,
+                        "--event-log-cap must be between 1 and 100000\n");
                 return 2;
             }
         } else if ((strcmp(argv[i], "--secret") == 0 ||
@@ -1957,7 +1983,7 @@ int main(int argc, char **argv) {
 
     member_table_init(&g_table);
     metrics_init(&g_metrics);
-    pulse_event_log_init(&g_event_log);
+    pulse_event_log_init(&g_event_log, g_cfg.event_log_cap);
     /* The address stored for self is the one the id advertises: peers
      * already reply to the advertised id, so the table entry should
      * agree with it. (An unparseable --id falls back to loopback.) */
@@ -2101,6 +2127,7 @@ int main(int argc, char **argv) {
         g_hooks.watch_next = watch_next_hook;
         g_hooks.watch_latest_seq = watch_latest_seq_hook;
         g_hooks.watch_oldest_seq = watch_oldest_seq_hook;
+        g_hooks.event_log_cap = watch_event_log_cap_hook;
         g_hooks.set_meta = set_meta_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
         g_hooks.peer_source = peer_source_hook;

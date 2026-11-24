@@ -73,6 +73,7 @@
  *           pf_dropped=<N|'-'> pf_kept=<N|'-'> pf_bad=<N|'-'>
  *           watch_subscribers=<N> watch_sessions=<N>
  *           watch_delivered=<N> watch_filtered=<N> watch_dropped=<N>
+ *           watch_event_log_cap=<N>
  *       detect_latency_ms is last-direct-contact -> SUSPECT for
  *       suspicions this node detected itself (mean/max in ms, "-" when
  *       there are no samples); suspect_to_dead_ms is SUSPECT -> DEAD.
@@ -112,6 +113,13 @@
  *       stream in trouble: filtered events were excluded on
  *       purpose, while a growing dropped count means a consumer
  *       is not keeping up with the cluster.
+ *       watch_event_log_cap (0.36.0) is how many events the WATCH
+ *       event ring holds — the --event-log-cap the node started
+ *       with, 128 by default — so an operator can see how far
+ *       back a replay can reach before a GAP, and whether the
+ *       node is running a bigger or smaller ring than the
+ *       default. JSON carries the same cap, and PROMETHEUS as
+ *       pulse_watch_event_log_cap.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -135,9 +143,12 @@
  *       has served since startup), plus the delivery / drop counts
  *       (0.34.0): "delivered" (EVENT lines sent in total),
  *       "filtered" (events skipped by a stream's filter) and
- *       "dropped" (events lost to a gap in the event ring), and a
- *       "streams" array with the same three counts per
- *       currently-connected stream, keyed by its "session" number.
+ *       "dropped" (events lost to a gap in the event ring), and
+ *       "event_log_cap" (0.36.0, how many events the WATCH ring
+ *       holds — the --event-log-cap the node started with, 128 by
+ *       default), and a "streams" array with the same three
+ *       counts per currently-connected stream, keyed by its
+ *       "session" number.
  *   PROMETHEUS
  *       The same values METRICS and JSON report, as Prometheus text
  *       exposition format, then END. Each metric family carries a
@@ -146,7 +157,8 @@
  *       lifetime transition totals (suspected, dead, refutes,
  *       joins, adaptive fast cycles, suspect refuted, watch
  *       sessions and the watch delivery / drop counts) as counters;
- *       the three latency groups as mean/max/samples gauges (mean
+ *       the event ring capacity (pulse_watch_event_log_cap, 0.36.0)
+ *       as a gauge; the three latency groups as mean/max/samples
  *       and max are 0 with no samples — Prometheus has no null —
  *       and the samples gauge says whether the mean is real); the
  *       detection latency also as a real histogram (the same five
@@ -208,7 +220,8 @@
  *       from now. FROM 0 replays from the oldest buffered event.
  *       A FROM past the latest sequence starts live (nothing to
  *       replay yet). A FROM below the oldest buffered event — the
- *       requested event has been evicted from the 128-event ring
+ *       requested event has been evicted from the event ring
+ *       (whose capacity is --event-log-cap, 128 by default)
  *       — replays from the oldest buffered event instead, after
  *       a "GAP <requested> <oldest>" line that says how much was
  *       lost. FROM composes with the type/id filters, in any
@@ -360,6 +373,12 @@ typedef struct {
      * after a GAP line. NULL when the node does not support
      * watching. */
     uint64_t (*watch_oldest_seq)(void *ctx);
+    /* How many events the WATCH event ring holds (0.36.0): the
+     * --event-log-cap the node started with, 128 by default.
+     * METRICS / JSON / PROMETHEUS report it so an operator can
+     * see how far back a replay can reach. NULL when the node
+     * does not support watching. */
+    int (*event_log_cap)(void *ctx);
     const char *self_id;
     int64_t start_ms; /* monotonic ms when the node started */
 } control_hooks_t;

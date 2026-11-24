@@ -391,7 +391,7 @@ static void *record_later_thread(void *arg) {
  * cross-thread wakeup, and the gap when the ring overflows. */
 static void test_event_log(void) {
     pulse_event_log_t log;
-    pulse_event_log_init(&log);
+    pulse_event_log_init(&log, PULSE_EVENT_LOG_CAP);
 
     /* Type names are the words on the wire. */
     CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_JOINED), "JOINED") == 0);
@@ -449,6 +449,31 @@ static void test_event_log(void) {
     CHECK(pulse_event_wait(&log, 9, &ev, 20) == 1);
     CHECK(ev.seq == 10 && ev.type == PULSE_EVENT_JOINED &&
           strcmp(ev.id, "127.0.0.1:17902") == 0);
+    pulse_event_log_free(&log);
+
+    /* Configurable cap (0.36.0): a log initialised with a small
+     * cap holds exactly that many events, and the same gap rules
+     * apply at the smaller size — a replay point below the oldest
+     * held event is a gap, and the oldest surviving event is
+     * still readable. The cap is reported back, and a cap of 0
+     * means the default. */
+    pulse_event_log_t small;
+    pulse_event_log_init(&small, 4);
+    CHECK(pulse_event_log_cap(&small) == 4);
+    for (int i = 0; i < 6; i++)
+        pulse_event_record(&small, PULSE_EVENT_JOINED,
+                           "127.0.0.1:17903", 1, 1700000200 + i);
+    CHECK(pulse_event_latest_seq(&small) == 6);
+    CHECK(pulse_event_oldest_seq(&small) == 3);
+    CHECK(pulse_event_wait(&small, 1, &ev, 20) == -1);
+    CHECK(pulse_event_wait(&small, 2, &ev, 20) == 1);
+    CHECK(ev.seq == 3 && strcmp(ev.id, "127.0.0.1:17903") == 0);
+    pulse_event_log_free(&small);
+
+    pulse_event_log_t def;
+    pulse_event_log_init(&def, 0);
+    CHECK(pulse_event_log_cap(&def) == PULSE_EVENT_LOG_CAP);
+    pulse_event_log_free(&def);
 }
 
 int main(void) {
@@ -582,7 +607,8 @@ int main(void) {
                  "last_reload=1700000000 last_mtime=1699999000 "
                  "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
                  "pf_bad=0 watch_subscribers=0 watch_sessions=0 "
-                 "watch_delivered=0 watch_filtered=0 watch_dropped=0\nEND\n") == 0);
+                 "watch_delivered=0 watch_filtered=0 watch_dropped=0 "
+                 "watch_event_log_cap=128\nEND\n") == 0);
 
     /* JSON (0.28.0): the same state as a "peer_file" object, and
      * each member carries its "source" — the peer-file peer is
@@ -597,6 +623,10 @@ int main(void) {
     CHECK(strstr(reply, "\"source\":\"seed\"") != NULL);
     CHECK(strstr(reply, "\"source\":\"peer-file\"") != NULL);
     CHECK(strstr(reply, "\"source\":\"discovered\"") != NULL);
+    /* The event ring capacity (0.36.0) rides in the "watch"
+     * object: no hook is set in this harness, so it reports the
+     * default 128. */
+    CHECK(strstr(reply, "\"event_log_cap\":128") != NULL);
     /* The peer_file object sits at the top level, after metrics. */
     {
         const char *metrics = strstr(reply, "\"metrics\":{");
@@ -741,7 +771,7 @@ int main(void) {
      * with 1-based sequence numbers. While the WATCH is open, a
      * one-shot command on another connection still answers: the
      * stream does not starve the control plane. */
-    pulse_event_log_init(&g_watch_log);
+    pulse_event_log_init(&g_watch_log, PULSE_EVENT_LOG_CAP);
     g_hooks.watch_next = watch_next_hook;
     g_hooks.watch_latest_seq = watch_latest_seq_hook;
     g_hooks.watch_oldest_seq = watch_oldest_seq_hook;
@@ -807,6 +837,7 @@ int main(void) {
         CHECK(strstr(reply,
                      "\"watch\":{\"subscribers\":1,\"sessions\":2,"
                      "\"delivered\":2,\"filtered\":0,\"dropped\":0,"
+                     "\"event_log_cap\":128,"
                      "\"streams\":[{\"session\":2,\"delivered\":0,"
                      "\"filtered\":0,\"dropped\":0}]}") != NULL);
         int tfd = watch_connect(18991);
@@ -833,6 +864,7 @@ int main(void) {
         CHECK(strstr(reply,
                      "\"watch\":{\"subscribers\":0,\"sessions\":3,"
                      "\"delivered\":2,\"filtered\":0,\"dropped\":0,"
+                     "\"event_log_cap\":128,"
                      "\"streams\":[]}") != NULL);
     }
 

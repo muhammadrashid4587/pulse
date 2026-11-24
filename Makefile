@@ -86,6 +86,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_watch_heartbeat.sh
 	bash tests/test_watch_subscribers.sh
 	bash tests/test_watch_delivery.sh
+	bash tests/test_watch_event_log_cap.sh
 	bash tests/test_prometheus.sh
 
 clean:
