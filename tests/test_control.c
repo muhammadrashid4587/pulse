@@ -78,7 +78,12 @@
  * pulse_member_rtt_mean_ms gauges, one line per member that
  * answered a probe, with self and a never-heard-from peer absent
  * entirely; the RTT end to end is covered by
- * tests/test_prometheus.sh. */
+ * tests/test_prometheus.sh. Per-member phi in METRICS (0.44.0)
+ * is covered here too: with phi mode on, a "PHI <id> <value>"
+ * line rides after the METRICS line for the peer with canned
+ * phi history, and no PHI line at all for self, a peer with no
+ * history, or a never-heard-from peer — and with phi mode off
+ * there is no PHI line for anyone. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -920,6 +925,28 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_phi{member=\"127.0.0.1:17902\"}") == NULL);
     }
     g_phi_mode = 0;
+    /* Per-member phi in METRICS (0.44.0): phi mode on, the seed
+     * peer's canned history produces a PHI line at the 30.00 cap
+     * after the METRICS line and before END, while self (no phi
+     * history), the peer-file peer (no phi history) and the
+     * never-heard-from dead peer have no PHI line at all — and
+     * with phi mode off there is no PHI line for anyone. */
+    g_phi_mode = 1;
+    CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "\nPHI 127.0.0.1:17901 30.00\n") != NULL);
+    CHECK(strstr(reply, "PHI 127.0.0.1:17999") == NULL);
+    CHECK(strstr(reply, "PHI 127.0.0.1:17903") == NULL);
+    CHECK(strstr(reply, "PHI 127.0.0.1:17902") == NULL);
+    {
+        const char *metrics = strstr(reply, "METRICS ");
+        const char *phi = strstr(reply, "\nPHI 127.0.0.1:17901 30.00\n");
+        const char *end = strstr(reply, "\nEND\n");
+        CHECK(metrics != NULL && phi != NULL && end != NULL &&
+              phi > metrics && end > phi);
+    }
+    g_phi_mode = 0;
+    CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "\nPHI ") == NULL);
     /* No peer file: the peer-file gauges are absent entirely, not
      * zero — an absent metric is how Prometheus says "not
      * applicable" — while the rest of the exposition is unchanged. */

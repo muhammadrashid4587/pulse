@@ -131,6 +131,17 @@
  *       bandwidth. JSON carries the same size as a top-level
  *       "gossip_digest_size", and PROMETHEUS as
  *       pulse_gossip_digest_size.
+ *       Per-member phi (0.44.0): after the METRICS line, one
+ *       "PHI <id> <value>" line per member that has a phi — phi
+ *       mode on, not self, heartbeat history with at least
+ *       PULSE_PHI_MIN_SAMPLES intervals — the live phi at reply
+ *       time, two decimals like JSON's "phi" and PROMETHEUS's
+ *       pulse_member_phi, so the phi trio is complete: an
+ *       operator polling the text protocol can watch a peer's
+ *       phi rise without parsing JSON or scraping Prometheus.
+ *       A node without --phi-accrual emits no PHI line at all,
+ *       and a peer never heard from has none either; a dead
+ *       member keeps its last-known phi until GC.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number

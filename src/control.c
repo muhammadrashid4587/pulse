@@ -522,6 +522,30 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
              event_log_cap_or_default(hooks),
              gossip_digest_size_or_default(hooks));
     if (send_all(fd, line) != 0) return;
+    /* Per-member phi (0.44.0): the failure-detector value JSON and
+     * PROMETHEUS already report per member, as one "PHI <id>
+     * <value>" line per member that has a phi, under the same rule
+     * as JSON: phi mode on, not self, heartbeat history with at
+     * least PULSE_PHI_MIN_SAMPLES intervals. The value is the live
+     * phi at reply time, two decimals like JSON and PROMETHEUS, so
+     * it rises as a peer goes quiet. A node without --phi-accrual
+     * emits no PHI line at all, and a peer never heard from has
+     * none either; a dead member keeps its last-known phi until
+     * GC, the same as JSON reports it. */
+    {
+        int phi_on = hooks->phi_enabled(hooks->ctx);
+        int64_t now = pulse_now_ms();
+        for (int i = 0; i < t.count; i++) {
+            const member_t *mem = &t.members[i];
+            if (!phi_on || strcmp(mem->id, hooks->self_id) == 0 ||
+                !mem->phi.have_last ||
+                mem->phi.count < PULSE_PHI_MIN_SAMPLES) continue;
+            char philine[128];
+            snprintf(philine, sizeof philine, "\nPHI %s %.2f",
+                     mem->id, phi_value(&mem->phi, now));
+            if (send_all(fd, philine) != 0) return;
+        }
+    }
     send_all(fd, "\nEND\n");
 }
 
