@@ -117,3 +117,24 @@ void phi_history_stats(const phi_accrual_t *p, double *latest, double *max,
         *latest = v;
     }
 }
+
+void phi_history_hist(const phi_accrual_t *p, const double *bounds,
+                      int n_bounds, int *counts, double *sum, int *count) {
+    for (int b = 0; b <= n_bounds; b++) counts[b] = 0;
+    *sum = 0.0;
+    *count = p->hist_count;
+    if (p->hist_count == 0) return;
+    /* Oldest first, the same ring walk as phi_history_json. */
+    int start = p->hist_head - p->hist_count;
+    if (start < 0) start += PULSE_PHI_HISTORY;
+    for (int k = 0; k < p->hist_count; k++) {
+        int idx = (start + k) % PULSE_PHI_HISTORY;
+        double v = p->hist_phi[idx];
+        *sum += v;
+        for (int b = 0; b < n_bounds; b++) {
+            if (v <= bounds[b]) counts[b]++;
+        }
+    }
+    /* The +Inf bucket holds every sample. */
+    counts[n_bounds] = p->hist_count;
+}

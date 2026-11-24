@@ -1265,6 +1265,59 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             "pulse_member_phi_history_samples{member=\"%s\"} %d\n",
             t.members[i].id, n) == 0;
     }
+    /* Phi history histogram per member (0.52.0): the same 16
+     * sampled phi values the gauges above summarise, as a real
+     * histogram — cumulative buckets at le 0.5, 1, 2, 4, 8 and
+     * +Inf, plus _sum and _count — so a scraper can compute
+     * quantiles of a peer's phi history instead of trusting the
+     * latest and max alone: a peer that spent most of its window
+     * near 0 with one spike to 7.9 reads differently from one
+     * that climbed steadily. Same rule as the history gauges:
+     * phi mode on, not self, heartbeat history with at least
+     * PULSE_PHI_MIN_SAMPLES intervals, and at least one sample
+     * taken; a member that goes DEAD keeps its frozen histogram
+     * until GC, like its gauges, so the shape of the rise at
+     * suspicion stays visible after the peer is gone. The sum is
+     * the sum of the sampled values to two decimals like the
+     * gauges, and the +Inf bucket always equals the samples
+     * gauge for the same member. */
+    {
+        static const double bounds[] = PULSE_PHI_HIST_BOUNDS;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_member_phi_history Sampled phi values "
+            "in the member's phi history, cumulative histogram.\n"
+            "# TYPE pulse_member_phi_history histogram\n") == 0;
+        for (int i = 0; i < t.count; i++) {
+            if (!phi_on ||
+                strcmp(t.members[i].id, hooks->self_id) == 0 ||
+                !t.members[i].phi.have_last ||
+                t.members[i].phi.count < PULSE_PHI_MIN_SAMPLES)
+                continue;
+            int counts[PULSE_PHI_HIST_NBOUNDS + 1];
+            double sum;
+            int n;
+            phi_history_hist(&t.members[i].phi, bounds,
+                             PULSE_PHI_HIST_NBOUNDS, counts, &sum, &n);
+            if (n == 0) continue;
+            for (int b = 0; b <= PULSE_PHI_HIST_NBOUNDS; b++) {
+                if (b < PULSE_PHI_HIST_NBOUNDS) {
+                    ok &= prom_add(buf, sizeof buf, &used,
+                        "pulse_member_phi_history_bucket{member="
+                        "\"%s\",le=\"%g\"} %d\n",
+                        t.members[i].id, bounds[b], counts[b]) == 0;
+                } else {
+                    ok &= prom_add(buf, sizeof buf, &used,
+                        "pulse_member_phi_history_bucket{member="
+                        "\"%s\",le=\"+Inf\"} %d\n",
+                        t.members[i].id, counts[b]) == 0;
+                }
+            }
+            ok &= prom_add(buf, sizeof buf, &used,
+                "pulse_member_phi_history_sum{member=\"%s\"} %.2f\n"
+                "pulse_member_phi_history_count{member=\"%s\"} %d\n",
+                t.members[i].id, sum, t.members[i].id, n) == 0;
+        }
+    }
     /* Peer-file state (0.28.0): only when the node runs with
      * --peer-file — an absent metric is how Prometheus says "not
      * applicable", matching METRICS reporting "-" and JSON null. */

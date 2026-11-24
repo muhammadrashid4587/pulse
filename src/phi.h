@@ -78,5 +78,21 @@ int phi_history_json(const phi_accrual_t *p, int64_t start_ms, char *buf,
  * went quiet. */
 void phi_history_stats(const phi_accrual_t *p, double *latest, double *max,
                        int *count);
+/* Phi-history histogram (0.52.0): bucket bounds for the per-member
+ * phi-history histogram in PROMETHEUS — a healthy peer sits near
+ * 0 and suspicion fires at the 8.0 threshold, so the buckets split
+ * the climb: under 0.5, 1, 2, 4, then the threshold itself. The
+ * last bucket is +Inf, so the total bucket count is NBOUNDS + 1. */
+#define PULSE_PHI_HIST_BOUNDS { 0.5, 1.0, 2.0, 4.0, 8.0 }
+#define PULSE_PHI_HIST_NBOUNDS 5
+/* Cumulative bucket counts over the sampled phi history:
+ * counts[b] is how many samples are <= bounds[b] (the last entry,
+ * counts[n_bounds], is the +Inf bucket — every sample), *sum is
+ * the sum of the sampled phi values, and *count is how many
+ * samples the ring holds (0 when no probe cycle has sampled it
+ * yet). A sample exactly at a bound lands in that bucket, like
+ * the detection-latency and probe-RTT histograms. */
+void phi_history_hist(const phi_accrual_t *p, const double *bounds,
+                      int n_bounds, int *counts, double *sum, int *count);
 
 #endif

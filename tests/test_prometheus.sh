@@ -141,6 +141,9 @@ if [ -n "$P1" ] \
    && ! printf '%s' "$P1" | grep -q 'pulse_member_phi_history_latest{member=' \
    && ! printf '%s' "$P1" | grep -q 'pulse_member_phi_history_max{member=' \
    && ! printf '%s' "$P1" | grep -q 'pulse_member_phi_history_samples{member=' \
+   && ! printf '%s' "$P1" | grep -q 'pulse_member_phi_history_bucket{member=' \
+   && ! printf '%s' "$P1" | grep -q 'pulse_member_phi_history_sum{member=' \
+   && ! printf '%s' "$P1" | grep -q 'pulse_member_phi_history_count{member=' \
    && printf '%s' "$P1" | tail -n 1 | grep -q '^END$'; then
     note ok "PROMETHEUS exposes the converged cluster (gauges, counters, member info, per-member RTT, peer-file gauges, END)"
 else
@@ -284,6 +287,44 @@ else
     printf '%s\n' "$PP" | grep -E 'pulse_member_phi_history' || true
 fi
 
+# 4d. Phi history histogram in PROMETHEUS (0.52.0): the same 16
+# sampled phi values ride as a real histogram per member —
+# cumulative buckets at le 0.5, 1, 2, 4, 8 and +Inf, plus _sum
+# and _count — one line per member that has a phi, none for self.
+# The +Inf bucket always equals the samples gauge for the same
+# member, and the buckets are cumulative, so each is at least the
+# one before it.
+HIST_INF="$(printf '%s' "$PP" | grep '^pulse_member_phi_history_bucket{member="127.0.0.1:17892",le="+Inf"} ' | awk '{print $2}')"
+HIST_SUM="$(printf '%s' "$PP" | grep '^pulse_member_phi_history_sum{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+HIST_COUNT="$(printf '%s' "$PP" | grep '^pulse_member_phi_history_count{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+HIST_CUM_OK=0
+if [ -n "$HIST_INF" ] && [ -n "$HIST_N" ] && [ "$HIST_INF" = "$HIST_N" ] \
+   && [ -n "$HIST_COUNT" ] && [ "$HIST_COUNT" = "$HIST_N" ]; then
+    # Cumulative check: read the six bucket counts in order and
+    # confirm none decreases.
+    if printf '%s' "$PP" | grep '^pulse_member_phi_history_bucket{member="127.0.0.1:17892"' \
+        | awk '{print $2}' | awk 'NR == 1 { prev = $1; next } { if ($1 < prev) exit 1; prev = $1 } END { exit 0 }'; then
+        HIST_CUM_OK=1
+    fi
+fi
+if [ -n "$PP" ] \
+   && printf '%s' "$PP" | grep -q '^# TYPE pulse_member_phi_history histogram$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_bucket{member="127.0.0.1:17892",le="0.5"} [0-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_bucket{member="127.0.0.1:17892",le="1"} [0-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_bucket{member="127.0.0.1:17892",le="2"} [0-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_bucket{member="127.0.0.1:17892",le="4"} [0-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_bucket{member="127.0.0.1:17892",le="8"} [0-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_bucket{member="127.0.0.1:17892",le="+Inf"} [1-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_sum{member="127.0.0.1:17892"} [0-9][0-9]*\.[0-9][0-9]$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_count{member="127.0.0.1:17892"} [1-9][0-9]*$' \
+   && ! printf '%s' "$PP" | grep -q 'pulse_member_phi_history_bucket{member="127.0.0.1:17891"' \
+   && [ "$HIST_CUM_OK" = 1 ]; then
+    note ok "PROMETHEUS exposes the phi history histogram (+Inf $HIST_INF = samples $HIST_N, sum $HIST_SUM, cumulative; no self series)"
+else
+    note fail "PROMETHEUS exposes the phi history histogram (+Inf $HIST_INF, samples $HIST_N, sum $HIST_SUM, count $HIST_COUNT)"
+    printf '%s\n' "$PP" | grep -E 'pulse_member_phi_history_bucket|pulse_member_phi_history_sum|pulse_member_phi_history_count' || true
+fi
+
 kill -9 "$(cat "$TMP/p2.pid")"
 if wait_for "$TMP/p1.log" "DEAD 127.0.0.1:17892" 10; then
     note ok "phi-mode node 1 marks the killed node DEAD"
@@ -305,6 +346,17 @@ if wait_prom 18891 '^pulse_member_phi_history_max\{member="127.0.0.1:17892"\} [0
     note ok "dead member keeps its frozen phi history gauges until GC"
 else
     note fail "dead member keeps its frozen phi history gauges until GC"
+    prom 18891 | grep -E 'pulse_member_phi_history' || true
+fi
+# And the frozen histogram with it: the dead member's bucket
+# lines, sum and count are still there, at the values the rise
+# reached at suspicion.
+if wait_prom 18891 '^pulse_member_phi_history_bucket\{member="127.0.0.1:17892",le="\+Inf"\} [1-9][0-9]*$' 5 \
+   && wait_prom 18891 '^pulse_member_phi_history_sum\{member="127.0.0.1:17892"\} [0-9][0-9]*\.[0-9][0-9]$' 5 \
+   && wait_prom 18891 '^pulse_member_phi_history_count\{member="127.0.0.1:17892"\} [1-9][0-9]*$' 5; then
+    note ok "dead member keeps its frozen phi history histogram until GC"
+else
+    note fail "dead member keeps its frozen phi history histogram until GC"
     prom 18891 | grep -E 'pulse_member_phi_history' || true
 fi
 

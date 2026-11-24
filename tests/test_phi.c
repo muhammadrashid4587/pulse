@@ -176,6 +176,54 @@ int main(void) {
     CHECK(latest == 30.0);
     CHECK(mx == 30.0);
 
+    /* Phi history histogram (0.52.0): cumulative bucket counts
+     * over the sampled history, plus the sum of the samples. */
+    phi_accrual_t hh;
+    phi_init(&hh);
+    static const double bounds[] = PULSE_PHI_HIST_BOUNDS;
+    int counts[PULSE_PHI_HIST_NBOUNDS + 1];
+    double sum = -1.0;
+    int hn = -1;
+    phi_history_hist(&hh, bounds, PULSE_PHI_HIST_NBOUNDS, counts, &sum,
+                     &hn);
+    CHECK(hn == 0); /* no sample yet: every bucket is 0, sum is 0 */
+    CHECK(sum == 0.0);
+    for (int b = 0; b <= PULSE_PHI_HIST_NBOUNDS; b++)
+        CHECK(counts[b] == 0);
+    feed_regular(&hh, 1000, 11, 100); /* 10 intervals, last at 2000 */
+    phi_sample(&hh, 2100); /* 100 ms after last beat: phi near 0 */
+    phi_sample(&hh, 2600); /* 600 ms after: phi climbing */
+    phi_sample(&hh, 3000); /* 1000 ms after: phi past 8 */
+    phi_history_hist(&hh, bounds, PULSE_PHI_HIST_NBOUNDS, counts, &sum,
+                     &hn);
+    CHECK(hn == 3);
+    CHECK(counts[0] == 1); /* only the near-0 sample is <= 0.5 */
+    CHECK(counts[1] == 1); /* the climbing sample is past 1 */
+    CHECK(counts[2] == 1); /* ... and past 2 */
+    CHECK(counts[3] == 1); /* ... and past 4 */
+    CHECK(counts[4] == 2); /* the near-0 sample and the climbing
+                              one (about 6.8) are <= 8; the past-8
+                              sample is not */
+    CHECK(counts[5] == 3); /* +Inf holds every sample */
+    CHECK(sum > 8.0);      /* sum of the three sampled values */
+    /* A sample exactly at a bound lands in that bucket: seed the
+     * ring directly with a 1.0 value — the bucket rule is <=, so
+     * it counts in the 1.0 bucket and in every higher one. */
+    phi_accrual_t hb;
+    phi_init(&hb);
+    hb.hist_phi[0] = 1.0;
+    hb.hist_ms[0] = 2100;
+    hb.hist_count = 1;
+    hb.hist_head = 1;
+    phi_history_hist(&hb, bounds, PULSE_PHI_HIST_NBOUNDS, counts, &sum,
+                     &hn);
+    CHECK(hn == 1);
+    CHECK(counts[0] == 0); /* 1.0 is above the 0.5 bucket */
+    CHECK(counts[1] == 1); /* exactly at the 1.0 bound: in it */
+    CHECK(counts[2] == 1);
+    CHECK(counts[5] == 1);
+    CHECK(sum == 1.0);
+
     printf("test_phi: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
