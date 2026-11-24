@@ -143,6 +143,15 @@ building block, not a production service mesh.
   that load, and each member in `JSON` carries where it came from
   (`source`), so a peer-file peer is distinguishable from a
   discovered one. See "Peer-file state in METRICS and JSON" below.
+- Prometheus exposition format: the control plane's `PROMETHEUS`
+  command answers the same values `METRICS` and `JSON` report as
+  Prometheus text format — membership counts as gauges, lifetime
+  transition totals as counters, the detection latency as a real
+  histogram, one `pulse_member_info` gauge per member labelled by
+  member, state and source, and the peer-file gauges when the node
+  runs with `--peer-file` — so a scraper can watch the cluster
+  without parsing the text protocol. See "Prometheus exposition
+  format (PROMETHEUS)" below.
 
 ## What it is not
 
@@ -371,6 +380,7 @@ Commands:
 | `RELOAD` | Re-read `--peer-file` and merge it into the seed list — the same reload SIGHUP triggers, for an operator who cannot send the node a signal: `OK peers=N added=A dropped=D kept=K bad=B`. `peers` is how many peers the file lists; `added`/`dropped`/`kept` are the merge outcome (a still-ALIVE peer removed from the file is kept, never dropped on a file edit alone); `bad` is how many lines were skipped as malformed. No `--peer-file`: `ERR no peer file`. Unreadable file: `ERR cannot read peer file <path>: <reason>`, and the old list is kept. |
 | `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N slow_peers=N peer_file=<path\|-> last_reload=<unix\|-> last_mtime=<unix\|-> pf_peers=<N\|-> pf_added=<N\|-> pf_dropped=<N\|-> pf_kept=<N\|-> pf_bad=<N\|-> watch_subscribers=<N> watch_sessions=<N> watch_delivered=<N> watch_filtered=<N> watch_dropped=<N>` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. The peer-file fields (0.28.0) are the `--peer-file` state — the path, the wall-clock time of the last successful load or reload, the file's mtime at that load, and the counts from that load (the same numbers as the `PEERFILE RELOAD` log line) — and are all `-` when the node runs without `--peer-file`; see "Peer-file state in METRICS and JSON". `watch_subscribers` / `watch_sessions` (0.33.0) are how many `WATCH` streams are connected right now and how many sessions the node has served since startup; see "WATCH subscriber count in METRICS and JSON". `watch_delivered` / `watch_filtered` / `watch_dropped` (0.34.0) are the lifetime totals of EVENT lines streams sent, events streams consumed but skipped because their filter excluded them, and events streams lost to a gap in the bounded event ring; see "WATCH drop and delivery counts in METRICS and JSON". |
 | `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning") — and `source`, where the peer came from (`seed`, `peer-file`, `discovered`, or `self`, the same provenance `PEERS` reports). The metrics object also carries `slow_peers`, the count of currently slow members. A top-level `peer_file` object carries the `--peer-file` state (path, `last_reload` / `last_mtime` as unix seconds, and the counts from the last load), or `null` when the node runs without `--peer-file` (0.28.0). A top-level `watch` object carries `subscribers` (how many `WATCH` streams are connected right now) and `sessions` (how many `WATCH` sessions the node has served since startup) (0.33.0), plus the delivery / drop counts (0.34.0): `delivered` (EVENT lines sent in total), `filtered` (events skipped by a stream's filter), `dropped` (events lost to a gap in the event ring), and a `streams` array with the same three counts per currently-connected stream, keyed by its `session` number; see "WATCH subscriber count in METRICS and JSON" and "WATCH drop and delivery counts in METRICS and JSON". Built for tooling that polls cluster state without scraping the text protocol. |
+| `PROMETHEUS` | The same values `METRICS` and `JSON` report, as Prometheus text exposition format, then `END`. Each metric family carries a `# HELP` and a `# TYPE` line: membership counts (`pulse_members_alive`, `pulse_members_suspect`, `pulse_members_dead`, `pulse_members_total`), `pulse_slow_peers`, `pulse_uptime_seconds` and `pulse_watch_subscribers` as gauges; the lifetime transition totals (`pulse_suspected_total`, `pulse_dead_total`, `pulse_refutes_total`, `pulse_joins_total`, `pulse_adaptive_fast_cycles_total`, `pulse_suspect_refuted_total`, `pulse_watch_sessions_total`, `pulse_watch_delivered_total`, `pulse_watch_filtered_total`, `pulse_watch_dropped_total`) as counters; the three latency groups as `mean` / `max` / `samples` gauges (`pulse_detect_latency_ms_mean`, `pulse_suspect_to_dead_ms_mean`, `pulse_refute_latency_ms_mean`, and the matching `max` and `samples` — mean and max are 0 with no samples, since Prometheus has no null, and the `samples` gauge says whether the mean is real); the detection latency also as a real histogram (`pulse_detect_latency_ms_bucket{le="100"|"250"|"500"|"1000"|"+Inf"}`, plus `_sum` and `_count`, the same five buckets `METRICS` reports as `hist`). Each member rides as a `pulse_member_info{member="<id>",state="<ALIVE\|SUSPECT\|DEAD>",source="<seed\|peer-file\|discovered\|self>"} 1` gauge, so a scraper can alert on a member's state without polling `JSON`. The peer-file gauges (`pulse_peer_file_peers`, `pulse_peer_file_added`, `pulse_peer_file_dropped`, `pulse_peer_file_kept`, `pulse_peer_file_bad`, `pulse_peer_file_last_reload_seconds`, `pulse_peer_file_last_mtime_seconds`) are only emitted when the node runs with `--peer-file`: an absent metric is how Prometheus says "not applicable". This is the exposition format, not an HTTP endpoint — scrape it with `pulse-ctl`, or point a scraper at a tiny exporter that forwards the command. See "Prometheus exposition format (PROMETHEUS)" below. |
 | `WATCH [types] [ids] [FROM <seq>]` | A long-lived stream: `OK watching`, then one `SNAPSHOT <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <last-seen-ms\|-> <seed\|peer-file\|discovered\|self>` line per member (the `PEERS` shape), then `END`, then one `EVENT <seq> <JOINED\|SUSPECTED\|DEAD\|REVIVED\|DROPPED\|REFUTED> <id> <incarnation> <unix-seconds>` line per membership event as it happens, until the client closes the connection. Sequence numbers are 1-based and monotonic for the node's life; a slow consumer that falls more than the event log holds gets `ERR gap: events lost, reconnect` and must reconnect and re-read the snapshot. Runs on its own thread, so other commands keep answering while a client watches. An optional filter (0.30.0) narrows the stream server-side: a comma-separated type list (`WATCH JOINED,DEAD`), a comma-separated peer-id list (`WATCH 127.0.0.1:17102`), or both, in any order — the snapshot is narrowed by the id list too, a filtered-out event still consumes its sequence number so a filtered stream's numbers jump by design, and a bad filter is refused up front with `ERR invalid watch filter <reason>`. Replay / resume (0.31.0): `WATCH FROM <seq>` replays the buffered events from that seq, in order, after the snapshot and `END` and before live events, so a reconnecting client catches up instead of starting from now — `FROM 0` replays from the oldest buffered event, a `FROM` past the latest starts live, and a `FROM` below the oldest buffered event replays from the oldest instead, after a `GAP <requested> <oldest>` line; `FROM` composes with the type/id filters, in any order, and a bad `FROM` is refused up front. Heartbeat (0.32.0): a stream that has sent nothing for 5 s sends `HEARTBEAT <unix-seconds>`, so a client on a quiet cluster can tell "nothing happened" from "the connection died silently" — it carries no sequence number and is sent regardless of the filter, and any line sent resets the 5 s clock. See "Control-plane event stream (WATCH)" below. |
 | anything else | `ERR unknown command` |
 
@@ -662,6 +672,66 @@ in `METRICS` and `"peer_file":null` in `JSON`; the per-member
 file. One honest caveat: the `METRICS` line is space-separated, so
 a peer-file path containing a space breaks its field parsing —
 `JSON` is the machine-readable form, and its path is escaped.
+
+## Prometheus exposition format (`PROMETHEUS`)
+
+`METRICS` is one line a human can read and `JSON` is one object a
+program can parse, but neither is what a monitoring stack scrapes:
+Prometheus wants `# HELP` / `# TYPE` lines and `name value` pairs,
+with counters for things that only grow and gauges for current
+state. Since 0.35.0 the control plane answers that directly:
+
+```sh
+./pulse-ctl 127.0.0.1:18401 PROMETHEUS
+# # HELP pulse_members_alive Members currently ALIVE.
+# # TYPE pulse_members_alive gauge
+# pulse_members_alive 2
+# # HELP pulse_suspected_total ALIVE to SUSPECT transitions seen.
+# # TYPE pulse_suspected_total counter
+# pulse_suspected_total 1
+# # HELP pulse_detect_latency_ms Detection latency in ms, last direct contact to SUSPECT.
+# # TYPE pulse_detect_latency_ms histogram
+# pulse_detect_latency_ms_bucket{le="100"} 0
+# pulse_detect_latency_ms_bucket{le="250"} 1
+# pulse_detect_latency_ms_bucket{le="500"} 1
+# pulse_detect_latency_ms_bucket{le="1000"} 1
+# pulse_detect_latency_ms_bucket{le="+Inf"} 1
+# pulse_detect_latency_ms_sum 203
+# pulse_detect_latency_ms_count 1
+# pulse_member_info{member="127.0.0.1:17101",state="ALIVE",source="self"} 1
+# pulse_member_info{member="127.0.0.1:17102",state="ALIVE",source="peer-file"} 1
+# pulse_peer_file_peers 3
+# END
+```
+
+The mapping from `METRICS` / `JSON` is one-to-one, so nothing new
+is measured — it is the same values in a scrapable shape. The
+lifetime totals are counters (`_total`): suspected, dead, refutes,
+joins, adaptive fast cycles, suspect refuted, watch sessions, and
+the watch delivery / drop counts. Current state is gauges:
+membership counts, slow peers, uptime, current watch subscribers.
+The three latency groups are `mean` / `max` / `samples` gauges;
+mean and max are 0 with no samples, because Prometheus has no null
+— the `samples` gauge is what says whether the mean is real, the
+same way `JSON` uses `null`. The detection latency also rides as
+a real histogram: the same five buckets `METRICS` reports as
+`hist` (<100, 100–249, 250–499, 500–999, ≥1000 ms), cumulative,
+with `_sum` and `_count`, so a scraper can compute quantiles
+instead of trusting the mean. Each member is one
+`pulse_member_info` gauge (always 1), labelled by member, state
+and source — the Prometheus way of exposing per-member state
+without a separate metric per peer — and the peer-file gauges
+carry the last load's counts and times, emitted only when the node
+runs with `--peer-file`.
+
+Two honest caveats. This is the exposition *format*, not an HTTP
+endpoint: the control plane is a line-based TCP protocol, so the
+reply ends with the usual `END` trailer, which a Prometheus
+scraper would not understand — scrape it with `pulse-ctl`, or
+point a scraper at a tiny exporter that forwards the command and
+strips the trailer. And the uptime gauge is seconds since this
+node started, not since the process was built: a restarted node
+resets it, which is exactly what an uptime gauge should do.
 
 ## Peer provenance
 
@@ -1767,6 +1837,23 @@ make test
   test (`tests/test_control.c`): it needs 128 events to evict the
   ring, so the integration test does not flood the cluster to
   force one.
+- `tests/test_prometheus.sh`: integration test for the Prometheus
+  exposition format (0.35.0) — two nodes converge from one shared
+  peer file and `PROMETHEUS` answers in Prometheus text format
+  (`# HELP` / `# TYPE` per family, then `name value` lines, then
+  `END`) with the membership gauges (alive=2, total=2), zeroed
+  counters, a `pulse_member_info` gauge per member labelled by
+  member, state and source, and the peer-file gauges from the
+  initial load (peers=2, added=2, bad=0); node 2 is killed with
+  SIGKILL — an unclean death, so no graceful-leave announcement —
+  and node 1's suspicion and death of it move the exposition
+  (suspected and dead totals above 0, the dead member's info gauge
+  at state="DEAD", the detection-latency histogram gaining one
+  sample); and a node with no `--peer-file` exposes no
+  `pulse_peer_file_*` metric at all. The exact counter, gauge and
+  histogram values are covered deterministically in the unit test
+  (`tests/test_control.c`), which serves canned metrics instead of
+  waiting on a real cluster.
 
 ## Roadmap
 
@@ -1805,3 +1892,4 @@ make test
 - ~~WATCH heartbeat on idle streams: a stream that has sent nothing for 5 s sends `HEARTBEAT <unix-seconds>`, so a client on a quiet cluster can tell "nothing happened" from "the connection died silently" — a half-open TCP connection otherwise looks exactly like a quiet cluster. The heartbeat carries no sequence number and is sent regardless of the type/id filter, and any line sent (EVENT, GAP, or HEARTBEAT) resets the 5 s clock, so a busy cluster never sees one.~~ Done in 0.32.0.
 - ~~WATCH subscriber count in METRICS and JSON: `METRICS` reports `watch_subscribers` (how many `WATCH` streams are connected right now) and `watch_sessions` (how many sessions the node has served since startup), and `JSON` carries the same counts as a top-level `watch` object, so an operator polling cluster state can see how many consumers are attached to the event stream — a client that went away drops out of the current count within about a second, while the session count only ever grows, so 0 subscribers with sessions above 0 means watchers that all went away and 0 / 0 means none ever connected.~~ Done in 0.33.0.
 - ~~WATCH drop and delivery counts in METRICS and JSON: each stream counts the `EVENT` lines it sent (`delivered`), the events it consumed but skipped because its type/id filter excluded them (`filtered`), and the events it lost to a gap in the bounded event ring (`dropped` — a replay `GAP`, or a mid-stream gap that ends the stream with `ERR gap`), and `METRICS` reports the three as lifetime totals while `JSON` carries the same three totals plus a `streams` array with the same three counts per currently-connected stream, keyed by its session number, so an operator can see whether consumers are keeping up with the cluster instead of only how many are connected.~~ Done in 0.34.0.
+- ~~Prometheus exposition format: a `PROMETHEUS` control-plane command answering the same values `METRICS` and `JSON` report as Prometheus text format — membership counts, slow peers, uptime and current watch subscribers as gauges, the lifetime transition totals as counters, the three latency groups as mean/max/samples gauges (0 with no samples, since Prometheus has no null), the detection latency as a real histogram (the same five buckets `METRICS` reports as `hist`, cumulative, with `_sum` and `_count`), one `pulse_member_info` gauge per member labelled by member, state and source, and the peer-file gauges only when the node runs with `--peer-file` — so a monitoring stack can scrape the cluster without parsing the text protocol; the reply still ends with the control plane's `END` trailer, since this is the exposition format, not an HTTP endpoint.~~ Done in 0.35.0.

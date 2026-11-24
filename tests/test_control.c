@@ -49,7 +49,13 @@
  * and the events it lost to a gap in the event ring, and METRICS
  * and JSON report the totals plus a per-stream breakdown keyed by
  * session number; the counts end to end are covered by
- * tests/test_watch_delivery.sh. */
+ * tests/test_watch_delivery.sh. Prometheus exposition format
+ * (0.35.0) is covered here too: the same values as counters,
+ * gauges, a real detection-latency histogram and one
+ * pulse_member_info gauge per member, with the peer-file gauges
+ * present only when the node runs with --peer-file, and zero
+ * samples meaning 0 means/maxima and an all-zero histogram; the
+ * exposition end to end is covered by tests/test_prometheus.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -137,9 +143,36 @@ static const char *peer_source_hook(void *ctx, const char *id) {
     return "discovered";
 }
 
+/* What the fake metrics hook reports (PROMETHEUS, 0.35.0). 0 = all
+ * zeros (the METRICS exact-line test depends on it); 1 = nonzero
+ * counts and latency samples, so the Prometheus counters, gauges
+ * and histogram buckets have real values to check. */
+static int g_metrics_mode = 0;
+
 static void metrics_hook(void *ctx, pulse_metrics_t *out) {
     (void)ctx;
     memset(out, 0, sizeof *out);
+    if (g_metrics_mode == 1) {
+        out->suspected = 2;
+        out->dead = 1;
+        out->refutes = 1;
+        out->joins = 3;
+        out->adaptive_fast_cycles = 5;
+        out->suspect_refuted = 1;
+        /* Two detection samples, 150 and 300 ms: mean 225, max 300,
+         * one in the 100-249 bucket and one in the 250-499 bucket. */
+        out->detect_samples = 2;
+        out->detect_sum_ms = 450;
+        out->detect_max_ms = 300;
+        out->detect_hist[1] = 1;
+        out->detect_hist[2] = 1;
+        out->suspect_dead_samples = 1;
+        out->suspect_dead_sum_ms = 301;
+        out->suspect_dead_max_ms = 301;
+        out->refute_samples = 1;
+        out->refute_sum_ms = 120;
+        out->refute_max_ms = 120;
+    }
 }
 
 static int force_leave_hook(void *ctx, const char *id) {
@@ -591,6 +624,116 @@ int main(void) {
     CHECK(strstr(reply, "\"peer_file\":null") != NULL);
     g_hooks.peer_file_state = peer_file_state_hook;
     g_peerfile_mode = 0;
+
+    /* PROMETHEUS (0.35.0): the same values METRICS and JSON report,
+     * as Prometheus text format — HELP/TYPE lines, counters for the
+     * lifetime totals, gauges for the current counts and latency
+     * mean/max/samples, a real histogram for the detection latency
+     * (cumulative buckets, _sum, _count), one pulse_member_info
+     * gauge per member labelled by member/state/source, and the
+     * peer-file gauges — then END. The reply is longer than the
+     * 4 KB buffer the other tests use, so it gets its own. */
+    g_metrics_mode = 1;
+    {
+        char preply[8192];
+        CHECK(send_cmd(18991, "PROMETHEUS\n", preply, sizeof preply) > 0);
+        /* HELP/TYPE pairs and the value lines for the counters. */
+        CHECK(strstr(preply, "# HELP pulse_suspected_total ") != NULL);
+        CHECK(strstr(preply, "# TYPE pulse_suspected_total counter\n") != NULL);
+        CHECK(strstr(preply, "pulse_suspected_total 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_dead_total 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_refutes_total 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_joins_total 3\n") != NULL);
+        CHECK(strstr(preply, "pulse_adaptive_fast_cycles_total 5\n") != NULL);
+        CHECK(strstr(preply, "pulse_suspect_refuted_total 1\n") != NULL);
+        /* Membership gauges from the canned table: 3 alive, 1 dead. */
+        CHECK(strstr(preply, "# TYPE pulse_members_alive gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_members_alive 3\n") != NULL);
+        CHECK(strstr(preply, "pulse_members_suspect 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_members_dead 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_members_total 4\n") != NULL);
+        CHECK(strstr(preply, "pulse_slow_peers 0\n") != NULL);
+        /* Uptime is timing-dependent: a number, nothing more.
+         * The leading newline keeps strstr off the HELP line,
+         * which names the metric too. */
+        {
+            const char *u = strstr(preply, "\npulse_uptime_seconds ");
+            CHECK(u != NULL);
+            if (u) {
+                u += strlen("\npulse_uptime_seconds ");
+                CHECK(*u >= '0' && *u <= '9');
+            }
+        }
+        /* Latency gauges: mean/max/samples for all three groups. */
+        CHECK(strstr(preply, "pulse_detect_latency_ms_mean 225\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_max 300\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_samples 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_suspect_to_dead_ms_mean 301\n") != NULL);
+        CHECK(strstr(preply, "pulse_suspect_to_dead_ms_max 301\n") != NULL);
+        CHECK(strstr(preply, "pulse_suspect_to_dead_ms_samples 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_refute_latency_ms_mean 120\n") != NULL);
+        CHECK(strstr(preply, "pulse_refute_latency_ms_max 120\n") != NULL);
+        CHECK(strstr(preply, "pulse_refute_latency_ms_samples 1\n") != NULL);
+        /* Detection-latency histogram: cumulative buckets, _sum,
+         * _count — one sample in 100-249, one in 250-499. */
+        CHECK(strstr(preply, "# TYPE pulse_detect_latency_ms histogram\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_bucket{le=\"100\"} 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_bucket{le=\"250\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_bucket{le=\"500\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_bucket{le=\"1000\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_bucket{le=\"+Inf\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_sum 450\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_count 2\n") != NULL);
+        /* Watch counts: no watcher has connected yet, all zero. */
+        CHECK(strstr(preply, "pulse_watch_subscribers 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_watch_sessions_total 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_watch_delivered_total 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_watch_filtered_total 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_watch_dropped_total 0\n") != NULL);
+        /* One pulse_member_info gauge per member, with state and
+         * source labels. */
+        CHECK(strstr(preply, "pulse_member_info{member=\"127.0.0.1:17999\",state=\"ALIVE\",source=\"self\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_info{member=\"127.0.0.1:17901\",state=\"ALIVE\",source=\"seed\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_info{member=\"127.0.0.1:17903\",state=\"ALIVE\",source=\"peer-file\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_info{member=\"127.0.0.1:17902\",state=\"DEAD\",source=\"discovered\"} 1\n") != NULL);
+        /* Peer-file gauges from the canned load. */
+        CHECK(strstr(preply, "pulse_peer_file_peers 3\n") != NULL);
+        CHECK(strstr(preply, "pulse_peer_file_added 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_peer_file_dropped 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_peer_file_kept 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_peer_file_bad 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_peer_file_last_reload_seconds 1700000000\n") != NULL);
+        CHECK(strstr(preply, "pulse_peer_file_last_mtime_seconds 1699999000\n") != NULL);
+        /* The reply ends with END, like every other one-shot. */
+        size_t plen = strlen(preply);
+        CHECK(plen >= 4 && strcmp(preply + plen - 4, "END\n") == 0);
+    }
+    /* No peer file: the peer-file gauges are absent entirely, not
+     * zero — an absent metric is how Prometheus says "not
+     * applicable" — while the rest of the exposition is unchanged. */
+    g_peerfile_mode = 1;
+    {
+        char preply[8192];
+        CHECK(send_cmd(18991, "PROMETHEUS\n", preply, sizeof preply) > 0);
+        CHECK(strstr(preply, "pulse_peer_file_") == NULL);
+        CHECK(strstr(preply, "pulse_suspected_total 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_members_total 4\n") != NULL);
+    }
+    g_peerfile_mode = 0;
+    /* With no samples at all the latency means and maxima are 0
+     * and the histogram is all zeros with _sum 0 and _count 0. */
+    g_metrics_mode = 0;
+    {
+        char preply[8192];
+        CHECK(send_cmd(18991, "PROMETHEUS\n", preply, sizeof preply) > 0);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_mean 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_max 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_samples 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_bucket{le=\"+Inf\"} 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_sum 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_detect_latency_ms_count 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_suspected_total 0\n") != NULL);
+    }
 
     /* WATCH (0.29.0): the stream starts with OK, a SNAPSHOT of the
      * canned table in the PEERS shape, and END — then live events

@@ -138,6 +138,28 @@
  *       "dropped" (events lost to a gap in the event ring), and a
  *       "streams" array with the same three counts per
  *       currently-connected stream, keyed by its "session" number.
+ *   PROMETHEUS
+ *       The same values METRICS and JSON report, as Prometheus text
+ *       exposition format, then END. Each metric family carries a
+ *       "# HELP" and "# TYPE" line: membership counts, slow peers,
+ *       uptime and current watch subscribers as gauges; the
+ *       lifetime transition totals (suspected, dead, refutes,
+ *       joins, adaptive fast cycles, suspect refuted, watch
+ *       sessions and the watch delivery / drop counts) as counters;
+ *       the three latency groups as mean/max/samples gauges (mean
+ *       and max are 0 with no samples — Prometheus has no null —
+ *       and the samples gauge says whether the mean is real); the
+ *       detection latency also as a real histogram (the same five
+ *       buckets METRICS reports as hist, cumulative, with _sum and
+ *       _count). Each member rides as a "pulse_member_info" gauge
+ *       (1, labelled by member, state and source). The peer-file
+ *       gauges (peers / added / dropped / kept / bad from the last
+ *       load, last_reload / last_mtime as unix seconds) are only
+ *       emitted when the node runs with --peer-file: an absent
+ *       metric is how Prometheus says "not applicable". This is
+ *       the exposition format, not an HTTP endpoint — scrape it
+ *       with pulse-ctl, or point a scraper at a tiny exporter
+ *       that forwards the command.
  *   WATCH [types] [ids] [FROM <seq>]
  *       A long-lived stream of membership events, for tooling that
  *       watches a cluster instead of polling MEMBERS or JSON once a

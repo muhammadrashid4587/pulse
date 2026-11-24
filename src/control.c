@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -583,6 +584,307 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (unsigned long long)ws.dropped, streams_json);
     if (w < 0 || (size_t)w >= sizeof buf - used) return;
     send_all(fd, buf);
+}
+
+/* Prometheus exposition format (0.35.0): the same values METRICS and
+ * JSON report, as Prometheus text format — one "# HELP" / "# TYPE"
+ * pair per metric family, then "name value" lines, then END (the
+ * control plane's usual trailer; this is the exposition format, not
+ * an HTTP endpoint — scrape it with pulse-ctl, or point a scraper
+ * at a tiny exporter that forwards the command). Counters are the
+ * lifetime transition totals (suspected, dead, refutes, joins,
+ * adaptive fast cycles, suspect refuted, watch sessions and the
+ * watch delivery / drop counts); gauges are the current membership
+ * counts, slow peers, uptime and current watch subscribers.
+ * Latencies are mean/max gauges (0 with no samples — Prometheus
+ * has no null, and the matching _samples gauge says whether the
+ * mean is real), and the detection latency also rides as a real
+ * histogram: the same five buckets METRICS reports as hist, with
+ * _sum and _count, so a scraper can compute quantiles instead of
+ * trusting the mean. Each member rides as a pulse_member_info
+ * gauge (1, labelled by member, state and source), so a scraper
+ * can alert on a member's state without polling JSON. The
+ * peer-file gauges are only emitted when the node runs with
+ * --peer-file: a node without one has no roster state to report,
+ * and an absent metric is the Prometheus way of saying "not
+ * applicable". Member ids are host:port (IPv6 bracketed), so they
+ * carry no quote or backslash and need no label escaping. */
+static int prom_add(char *buf, size_t cap, size_t *used,
+                    const char *fmt, ...) {
+    if (*used >= cap) return -1;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(buf + *used, cap - *used, fmt, ap);
+    va_end(ap);
+    if (w < 0 || (size_t)w >= cap - *used) return -1;
+    *used += (size_t)w;
+    return 0;
+}
+
+static void handle_prometheus(int fd, const control_hooks_t *hooks) {
+    pulse_metrics_t m;
+    hooks->metrics(hooks->ctx, &m);
+    member_table_t t;
+    hooks->snapshot(hooks->ctx, &t);
+    int64_t uptime = (pulse_now_ms() - hooks->start_ms) / 1000;
+    watch_stats_t ws;
+    watch_stats_snapshot(&ws);
+    pulse_peer_file_state_t pf;
+    peer_file_state_or_none(hooks, &pf);
+
+    /* 64 members at ~150 bytes each plus the fixed families is
+     * under 16 KB; 64 KB has ample headroom, as in handle_json. */
+    static char buf[65536];
+    size_t used = 0;
+    int ok = 1;
+    /* Membership counts: current state, so gauges. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_members_alive Members currently ALIVE.\n"
+        "# TYPE pulse_members_alive gauge\n"
+        "pulse_members_alive %d\n",
+        member_count_state(&t, MEMBER_ALIVE)) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_members_suspect Members currently SUSPECT.\n"
+        "# TYPE pulse_members_suspect gauge\n"
+        "pulse_members_suspect %d\n",
+        member_count_state(&t, MEMBER_SUSPECT)) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_members_dead Members currently DEAD.\n"
+        "# TYPE pulse_members_dead gauge\n"
+        "pulse_members_dead %d\n",
+        member_count_state(&t, MEMBER_DEAD)) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_members_total Members in the table.\n"
+        "# TYPE pulse_members_total gauge\n"
+        "pulse_members_total %d\n", t.count) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_slow_peers Members whose mean probe RTT is "
+        "above --slow-peer-rtt-ms.\n"
+        "# TYPE pulse_slow_peers gauge\n"
+        "pulse_slow_peers %d\n",
+        member_count_slow(&t, hooks->slow_rtt_threshold_ms)) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_uptime_seconds Seconds since this node "
+        "started.\n"
+        "# TYPE pulse_uptime_seconds gauge\n"
+        "pulse_uptime_seconds %lld\n", (long long)uptime) == 0;
+    /* Transition counts: lifetime totals, so counters. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_suspected_total ALIVE to SUSPECT transitions "
+        "seen.\n"
+        "# TYPE pulse_suspected_total counter\n"
+        "pulse_suspected_total %lld\n", (long long)m.suspected) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_dead_total SUSPECT to DEAD transitions seen.\n"
+        "# TYPE pulse_dead_total counter\n"
+        "pulse_dead_total %lld\n", (long long)m.dead) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_refutes_total Times this node refuted gossip "
+        "about itself.\n"
+        "# TYPE pulse_refutes_total counter\n"
+        "pulse_refutes_total %lld\n", (long long)m.refutes) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_joins_total First sightings of a member.\n"
+        "# TYPE pulse_joins_total counter\n"
+        "pulse_joins_total %lld\n", (long long)m.joins) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_adaptive_fast_cycles_total Probe cycles that "
+        "ran at the fast interval because a peer was SUSPECT.\n"
+        "# TYPE pulse_adaptive_fast_cycles_total counter\n"
+        "pulse_adaptive_fast_cycles_total %lld\n",
+        (long long)m.adaptive_fast_cycles) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_suspect_refuted_total SUSPECT to ALIVE "
+        "transitions: suspicions that turned out wrong.\n"
+        "# TYPE pulse_suspect_refuted_total counter\n"
+        "pulse_suspect_refuted_total %lld\n",
+        (long long)m.suspect_refuted) == 0;
+    /* Latency groups: mean/max/samples as gauges. A mean of 0
+     * with 0 samples means "no sample yet" — Prometheus has no
+     * null, and the samples gauge says whether the mean is real. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_detect_latency_ms_mean Mean last-direct-"
+        "contact to SUSPECT latency in ms.\n"
+        "# TYPE pulse_detect_latency_ms_mean gauge\n"
+        "pulse_detect_latency_ms_mean %lld\n",
+        (long long)(m.detect_samples > 0
+                        ? m.detect_sum_ms / m.detect_samples
+                        : 0)) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_detect_latency_ms_max Max last-direct-"
+        "contact to SUSPECT latency in ms.\n"
+        "# TYPE pulse_detect_latency_ms_max gauge\n"
+        "pulse_detect_latency_ms_max %lld\n",
+        (long long)m.detect_max_ms) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_detect_latency_ms_samples Suspicions with a "
+        "measured detection latency.\n"
+        "# TYPE pulse_detect_latency_ms_samples gauge\n"
+        "pulse_detect_latency_ms_samples %lld\n",
+        (long long)m.detect_samples) == 0;
+    /* Detection-latency histogram: the same five buckets METRICS
+     * reports as hist (<100, 100-249, 250-499, 500-999, >=1000 ms),
+     * cumulative, with _sum and _count — a real histogram, so a
+     * scraper can compute quantiles instead of trusting the mean. */
+    {
+        static const int64_t bounds[] = PULSE_DETECT_HIST_BOUNDS;
+        int64_t cumulative = 0;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_detect_latency_ms Detection latency in "
+            "ms, last direct contact to SUSPECT.\n"
+            "# TYPE pulse_detect_latency_ms histogram\n") == 0;
+        for (int b = 0; b < PULSE_DETECT_HIST_BUCKETS; b++) {
+            cumulative += m.detect_hist[b];
+            if (b < PULSE_DETECT_HIST_BUCKETS - 1) {
+                ok &= prom_add(buf, sizeof buf, &used,
+                    "pulse_detect_latency_ms_bucket{le=\"%lld\"} "
+                    "%lld\n",
+                    (long long)bounds[b],
+                    (long long)cumulative) == 0;
+            } else {
+                ok &= prom_add(buf, sizeof buf, &used,
+                    "pulse_detect_latency_ms_bucket{le=\"+Inf\"} "
+                    "%lld\n",
+                    (long long)cumulative) == 0;
+            }
+        }
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_detect_latency_ms_sum %lld\n"
+            "pulse_detect_latency_ms_count %lld\n",
+            (long long)m.detect_sum_ms,
+            (long long)m.detect_samples) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_suspect_to_dead_ms_mean Mean SUSPECT to DEAD "
+        "duration in ms.\n"
+        "# TYPE pulse_suspect_to_dead_ms_mean gauge\n"
+        "pulse_suspect_to_dead_ms_mean %lld\n",
+        (long long)(m.suspect_dead_samples > 0
+                        ? m.suspect_dead_sum_ms / m.suspect_dead_samples
+                        : 0)) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_suspect_to_dead_ms_max Max SUSPECT to DEAD "
+        "duration in ms.\n"
+        "# TYPE pulse_suspect_to_dead_ms_max gauge\n"
+        "pulse_suspect_to_dead_ms_max %lld\n",
+        (long long)m.suspect_dead_max_ms) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_suspect_to_dead_ms_samples Deaths with a "
+        "measured SUSPECT to DEAD duration.\n"
+        "# TYPE pulse_suspect_to_dead_ms_samples gauge\n"
+        "pulse_suspect_to_dead_ms_samples %lld\n",
+        (long long)m.suspect_dead_samples) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_refute_latency_ms_mean Mean time a refuted "
+        "suspicion sat SUSPECT, in ms.\n"
+        "# TYPE pulse_refute_latency_ms_mean gauge\n"
+        "pulse_refute_latency_ms_mean %lld\n",
+        (long long)(m.refute_samples > 0
+                        ? m.refute_sum_ms / m.refute_samples
+                        : 0)) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_refute_latency_ms_max Max time a refuted "
+        "suspicion sat SUSPECT, in ms.\n"
+        "# TYPE pulse_refute_latency_ms_max gauge\n"
+        "pulse_refute_latency_ms_max %lld\n",
+        (long long)m.refute_max_ms) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_refute_latency_ms_samples Refuted suspicions "
+        "with a measured SUSPECT duration.\n"
+        "# TYPE pulse_refute_latency_ms_samples gauge\n"
+        "pulse_refute_latency_ms_samples %lld\n",
+        (long long)m.refute_samples) == 0;
+    /* Watch stream state: current subscribers are a gauge, the
+     * session and delivery / drop counts are lifetime totals. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_watch_subscribers WATCH streams connected "
+        "right now.\n"
+        "# TYPE pulse_watch_subscribers gauge\n"
+        "pulse_watch_subscribers %d\n", ws.current) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_watch_sessions_total WATCH sessions served "
+        "since startup.\n"
+        "# TYPE pulse_watch_sessions_total counter\n"
+        "pulse_watch_sessions_total %llu\n",
+        (unsigned long long)ws.sessions) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_watch_delivered_total EVENT lines WATCH "
+        "streams have sent in total.\n"
+        "# TYPE pulse_watch_delivered_total counter\n"
+        "pulse_watch_delivered_total %llu\n",
+        (unsigned long long)ws.delivered) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_watch_filtered_total Events WATCH streams "
+        "consumed but skipped because their filter excluded them.\n"
+        "# TYPE pulse_watch_filtered_total counter\n"
+        "pulse_watch_filtered_total %llu\n",
+        (unsigned long long)ws.filtered) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_watch_dropped_total Events WATCH streams "
+        "lost to a gap in the bounded event ring.\n"
+        "# TYPE pulse_watch_dropped_total counter\n"
+        "pulse_watch_dropped_total %llu\n",
+        (unsigned long long)ws.dropped) == 0;
+    /* One info gauge per member, labelled by member, state and
+     * source — the Prometheus way of exposing per-member state
+     * without a separate metric per peer. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_info One per member, labelled by "
+        "member, state and source.\n"
+        "# TYPE pulse_member_info gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_info{member=\"%s\",state=\"%s\","
+            "source=\"%s\"} 1\n",
+            t.members[i].id, member_state_name(t.members[i].state),
+            peer_source_str(hooks, t.members[i].id)) == 0;
+    }
+    /* Peer-file state (0.28.0): only when the node runs with
+     * --peer-file — an absent metric is how Prometheus says "not
+     * applicable", matching METRICS reporting "-" and JSON null. */
+    if (pf.have_file) {
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_peer_file_peers Peers listed in "
+            "--peer-file at the last load.\n"
+            "# TYPE pulse_peer_file_peers gauge\n"
+            "pulse_peer_file_peers %d\n", pf.peers) == 0;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_peer_file_added Peers added by the last "
+            "peer-file load.\n"
+            "# TYPE pulse_peer_file_added gauge\n"
+            "pulse_peer_file_added %d\n", pf.added) == 0;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_peer_file_dropped Peers dropped by the "
+            "last peer-file load.\n"
+            "# TYPE pulse_peer_file_dropped gauge\n"
+            "pulse_peer_file_dropped %d\n", pf.dropped) == 0;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_peer_file_kept Peers kept by the last "
+            "peer-file load (removed from the file but still "
+            "ALIVE).\n"
+            "# TYPE pulse_peer_file_kept gauge\n"
+            "pulse_peer_file_kept %d\n", pf.kept) == 0;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_peer_file_bad Malformed lines skipped "
+            "by the last peer-file load.\n"
+            "# TYPE pulse_peer_file_bad gauge\n"
+            "pulse_peer_file_bad %d\n", pf.bad) == 0;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_peer_file_last_reload_seconds Unix time "
+            "of the last successful peer-file load.\n"
+            "# TYPE pulse_peer_file_last_reload_seconds gauge\n"
+            "pulse_peer_file_last_reload_seconds %lld\n",
+            (long long)pf.last_reload_unix) == 0;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_peer_file_last_mtime_seconds Mtime of "
+            "--peer-file at the last successful load.\n"
+            "# TYPE pulse_peer_file_last_mtime_seconds gauge\n"
+            "pulse_peer_file_last_mtime_seconds %lld\n",
+            (long long)pf.last_mtime_unix) == 0;
+    }
+    if (!ok) return; /* buffer full: send nothing, as in handle_json */
+    if (send_all(fd, buf) != 0) return;
+    send_all(fd, "END\n");
 }
 
 static void handle_leave(int fd, const control_hooks_t *hooks,
@@ -1167,6 +1469,8 @@ static int handle_connection(int fd, const control_hooks_t *hooks) {
         handle_reload(fd, hooks);
     } else if (strcmp(line, "METRICS") == 0) {
         handle_metrics(fd, hooks);
+    } else if (strcmp(line, "PROMETHEUS") == 0) {
+        handle_prometheus(fd, hooks);
     } else if (strcmp(line, "JSON") == 0) {
         handle_json(fd, hooks);
     } else if (strcmp(line, "WATCH") == 0) {
