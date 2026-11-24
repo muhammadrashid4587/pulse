@@ -156,6 +156,15 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         m->rtt_ms = 3;
         m->rtt_sum_ms = 10;
         m->rtt_samples = 4;
+        /* Phi history (0.42.0): two 100 ms intervals, last
+         * heartbeat ~9.8 s ago — so the live phi at scrape time
+         * is pinned at the 30.00 cap (the gap is ~97 floored
+         * spreads, erfc underflows to 0) and PROMETHEUS has a
+         * real phi gauge to check for this peer. The peer-file
+         * peer below gets no phi history, so it has no gauge. */
+        phi_heartbeat(&m->phi, now - 10000);
+        phi_heartbeat(&m->phi, now - 9900);
+        phi_heartbeat(&m->phi, now - 9800);
     }
     m = member_add(out, "127.0.0.1:17903", &addr, 2);
     if (m) {
@@ -221,9 +230,15 @@ static int force_leave_hook(void *ctx, const char *id) {
     return 0;
 }
 
+/* Phi mode for the fake hooks (0.42.0): 0 = fixed-timeout path, so
+ * MEMBERS / JSON report no phi and PROMETHEUS has no phi gauge;
+ * 1 = phi-accrual on, so the seed peer's canned history produces
+ * a real phi gauge. */
+static int g_phi_mode = 0;
+
 static int phi_enabled_hook(void *ctx) {
     (void)ctx;
-    return 0;
+    return g_phi_mode;
 }
 
 static void reload_hook(void *ctx, pulse_reload_result_t *out) {
@@ -850,6 +865,11 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17903\"} 0\n") != NULL);
         CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17999\"}") == NULL);
         CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17902\"}") == NULL);
+        /* Phi per member (0.42.0): phi mode is off in this
+         * harness, so no pulse_member_phi line at all — the
+         * canned phi history on the seed peer produces no gauge
+         * without --phi-accrual. */
+        CHECK(strstr(preply, "pulse_member_phi{member=") == NULL);
         /* Peer-file gauges from the canned load. */
         CHECK(strstr(preply, "pulse_peer_file_peers 3\n") != NULL);
         CHECK(strstr(preply, "pulse_peer_file_added 1\n") != NULL);
@@ -862,6 +882,21 @@ int main(void) {
         size_t plen = strlen(preply);
         CHECK(plen >= 4 && strcmp(preply + plen - 4, "END\n") == 0);
     }
+    /* Phi per member (0.42.0), phi mode on: the seed peer's canned
+     * history produces a phi gauge at the 30.00 cap, while self
+     * (no phi history), the peer-file peer (no phi history) and
+     * the never-heard-from dead peer have no phi gauge at all. */
+    g_phi_mode = 1;
+    {
+        char preply[8192];
+        CHECK(send_cmd(18991, "PROMETHEUS\n", preply, sizeof preply) > 0);
+        CHECK(strstr(preply, "# TYPE pulse_member_phi gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_phi{member=\"127.0.0.1:17901\"} 30.00\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_phi{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_phi{member=\"127.0.0.1:17903\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_phi{member=\"127.0.0.1:17902\"}") == NULL);
+    }
+    g_phi_mode = 0;
     /* No peer file: the peer-file gauges are absent entirely, not
      * zero — an absent metric is how Prometheus says "not
      * applicable" — while the rest of the exposition is unchanged. */

@@ -26,6 +26,12 @@
 #  3. A node with no --peer-file exposes no pulse_peer_file_* metric
 #     at all — an absent metric is how Prometheus says "not
 #     applicable" — while the rest of the exposition is unchanged.
+#  4. Two nodes started with --phi-accrual expose the per-member
+#     phi as a pulse_member_phi gauge (0.42.0) — a line for the peer
+#     that has heartbeat history, none for self, and the value
+#     agrees with the phi JSON reports for the same member. Kill
+#     the peer and the gauge stays, at the last-known phi, the
+#     same as the RTT gauge does for a dead member.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -131,6 +137,7 @@ if [ -n "$P1" ] \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_bad 0$' \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_last_reload_seconds [0-9][0-9]*$' \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_last_mtime_seconds [0-9][0-9]*$' \
+   && ! printf '%s' "$P1" | grep -q 'pulse_member_phi{' \
    && printf '%s' "$P1" | tail -n 1 | grep -q '^END$'; then
     note ok "PROMETHEUS exposes the converged cluster (gauges, counters, member info, per-member RTT, peer-file gauges, END)"
 else
@@ -185,6 +192,66 @@ if wait_for "$TMP/n3.log" "STATUS alive=2" 10; then
 else
     note fail "seed-only node joins the cluster (setup)"
     tail -5 "$TMP/n3.log"
+fi
+
+# 4. Phi per member (0.42.0): two nodes with --phi-accrual. The
+# peer's phi rides as a pulse_member_phi gauge — a line for the
+# peer, none for self — and the value agrees with the phi JSON
+# reports for the same member. Kill the peer and the gauge stays,
+# at the last-known phi, until GC.
+mkdir -p "$TMP/p1" "$TMP/p2"
+cat > "$TMP/peers-phi" <<'EOF'
+127.0.0.1:17891
+127.0.0.1:17892
+EOF
+
+(cd "$TMP/p1" && exec "$BIN" --port 17891 --peer-file "$TMP/peers-phi" --phi-accrual --control-port 18891 --dead-retention 120 > "$TMP/p1.log" 2>&1 & echo $! > "$TMP/p1.pid")
+(cd "$TMP/p2" && exec "$BIN" --port 17892 --peer-file "$TMP/peers-phi" --phi-accrual --control-port 18892 --dead-retention 120 > "$TMP/p2.log" 2>&1 & echo $! > "$TMP/p2.pid")
+
+if wait_for "$TMP/p1.log" "STATUS alive=2" 10 \
+   && wait_for "$TMP/p2.log" "STATUS alive=2" 10; then
+    note ok "2 phi-mode nodes converge from the peer file"
+else
+    note fail "2 phi-mode nodes converge from the peer file"
+    for f in p1 p2; do echo "--- $f.log"; tail -5 "$TMP/$f.log"; done
+fi
+
+# Give the peers a few probe rounds so the phi history is real
+# (at least PULSE_PHI_MIN_SAMPLES intervals) before scraping.
+sleep 2
+PP="$(prom 18891)"
+PROM_PHI="$(printf '%s' "$PP" | grep '^pulse_member_phi{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+JSON_PHI="$(ctl 18891 JSON | grep -o '"id":"127.0.0.1:17892","incarnation":[0-9]*,"state":"[A-Z]*","phi":[0-9.]*' | sed 's/.*"phi"://')"
+PHI_AGREES=0
+if [ -n "$PROM_PHI" ] && [ -n "$JSON_PHI" ]; then
+    if awk -v a="$PROM_PHI" -v b="$JSON_PHI" 'BEGIN { d = a - b; if (d < 0) d = -d; exit (d < 0.1 ? 0 : 1) }'; then
+        PHI_AGREES=1
+    fi
+fi
+if [ -n "$PP" ] \
+   && printf '%s' "$PP" | grep -q '^# TYPE pulse_member_phi gauge$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi{member="127.0.0.1:17892"} [0-9][0-9]*\.[0-9][0-9]$' \
+   && ! printf '%s' "$PP" | grep -q 'pulse_member_phi{member="127.0.0.1:17891"' \
+   && [ "$PHI_AGREES" = 1 ]; then
+    note ok "PROMETHEUS exposes per-member phi in phi mode (peer gauge, no self gauge, agrees with JSON phi=$JSON_PHI)"
+else
+    note fail "PROMETHEUS exposes per-member phi in phi mode (peer gauge, no self gauge, agrees with JSON)"
+    echo "PROM_PHI=$PROM_PHI JSON_PHI=$JSON_PHI"
+    printf '%s\n' "$PP" | grep -E 'pulse_member_phi|pulse_member_info' || true
+fi
+
+kill -9 "$(cat "$TMP/p2.pid")"
+if wait_for "$TMP/p1.log" "DEAD 127.0.0.1:17892" 10; then
+    note ok "phi-mode node 1 marks the killed node DEAD"
+else
+    note fail "phi-mode node 1 marks the killed node DEAD"
+    tail -5 "$TMP/p1.log"
+fi
+if wait_prom 18891 '^pulse_member_phi\{member="127.0.0.1:17892"\} [0-9][0-9]*\.[0-9][0-9]$' 5; then
+    note ok "dead member keeps its last-known phi gauge until GC"
+else
+    note fail "dead member keeps its last-known phi gauge until GC"
+    prom 18891 | grep -E 'pulse_member_phi' || true
 fi
 
 echo "test_prometheus: $PASS passed, $FAIL failed"

@@ -185,7 +185,16 @@
  *       detection latency also as a real histogram (the same five
  *       buckets METRICS reports as hist, cumulative, with _sum and
  *       _count). Each member rides as a "pulse_member_info" gauge
- *       (1, labelled by member, state and source). The peer-file
+ *       (1, labelled by member, state and source). The last and
+ *       mean probe RTT per member ride as "pulse_member_rtt_ms"
+ *       and "pulse_member_rtt_mean_ms" gauges (0.40.0), one line
+ *       per member that has answered a probe. The phi
+ *       failure-detector value per member rides as a
+ *       "pulse_member_phi" gauge (0.42.0), one line per member
+ *       that has a phi — phi mode on, not self, heartbeat history
+ *       with at least PULSE_PHI_MIN_SAMPLES intervals — two
+ *       decimals like JSON; a node without --phi-accrual emits no
+ *       such line. The peer-file
  *       gauges (peers / added / dropped / kept / bad from the last
  *       load, last_reload / last_mtime as unix seconds) are only
  *       emitted when the node runs with --peer-file: an absent

@@ -744,6 +744,11 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
     member_table_t t;
     hooks->snapshot(hooks->ctx, &t);
     int64_t uptime = (pulse_now_ms() - hooks->start_ms) / 1000;
+    /* Phi (0.42.0): the live phi values, at scrape time — the same
+     * now MEMBERS and JSON use, so the gauge agrees with JSON's
+     * "phi" to the second decimal. */
+    int phi_on = hooks->phi_enabled(hooks->ctx);
+    int64_t now = pulse_now_ms();
     watch_stats_t ws;
     watch_stats_snapshot(&ws);
     pulse_peer_file_state_t pf;
@@ -1017,6 +1022,31 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             "pulse_member_rtt_mean_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)member_rtt_mean_ms(&t.members[i])) == 0;
+    }
+    /* Phi per member (0.42.0): the failure-detector value JSON
+     * reports as "phi" per member, as a gauge a scraper can alert
+     * on — one line per member that has a phi, under the same
+     * rule as JSON: phi mode on, not self, heartbeat history with
+     * at least PULSE_PHI_MIN_SAMPLES intervals. Self has no phi
+     * history and a peer never heard from has none either, so
+     * both are absent; a node without --phi-accrual emits no
+     * pulse_member_phi line at all. The value is the live phi at
+     * scrape time, two decimals like JSON, so it rises as a peer
+     * goes quiet — a scraper can alert well before the threshold
+     * suspicion fires. A member that goes DEAD keeps its last
+     * heartbeat, so its phi keeps growing until GC, the same as
+     * JSON reports it. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_phi Phi-accrual failure-detector "
+        "value, per member.\n"
+        "# TYPE pulse_member_phi gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (!phi_on || strcmp(t.members[i].id, hooks->self_id) == 0 ||
+            !t.members[i].phi.have_last ||
+            t.members[i].phi.count < PULSE_PHI_MIN_SAMPLES) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_phi{member=\"%s\"} %.2f\n",
+            t.members[i].id, phi_value(&t.members[i].phi, now)) == 0;
     }
     /* Peer-file state (0.28.0): only when the node runs with
      * --peer-file — an absent metric is how Prometheus says "not
