@@ -98,6 +98,14 @@ building block, not a production service mesh.
   The speedup is counted as `adaptive_fast_cycles` in `METRICS` and
   `JSON`, and each switch is logged as an `ADAPTIVE` line. See
   "Adaptive probe interval" below.
+- Probe-interval jitter: every probe cycle sleeps the adaptive
+  interval times (1 + u) with u uniform in [-j, +j] (default j = 0.1,
+  `--probe-jitter-frac` to set it), so nodes that start together
+  drift out of lockstep within a few cycles instead of probing,
+  gossiping, and syncing in bursts — each node's mean interval stays
+  the base, and failure detection semantics are untouched (suspicion
+  still comes from the fixed ack timeout or from phi alone). See
+  "Probe-interval jitter" below.
 - Suspicion-refutation window: when a peer marked SUSPECT comes back
   ALIVE — a slow peer, a dropped probe, a transient partition — the
   suspicion is counted as refuted, and the time the peer sat SUSPECT
@@ -281,6 +289,7 @@ scripts/demo.sh
 | `--data-dir` | `.` | Directory holding the `incarnation` and `members` state files |
 | `--probe-interval-ms` | 100 | How often to probe a random peer |
 | `--probe-interval-fast-ms` | half of `--probe-interval-ms` | Probe interval while any peer is SUSPECT (adaptive probe interval; floored at 25 ms, never slower than the base) |
+| `--probe-jitter-frac` | 0.1 | ±fraction of jitter on the probe interval each cycle (see "Probe-interval jitter"); 0 disables it, clamped to 0.9 |
 | `--ack-timeout-ms` | 100 | How long to wait for an ACK before an indirect probe |
 | `--slow-peer-rtt-ms` | 0 (disabled) | Warn when a peer's mean probe RTT is above this many ms (see "Slow-peer warning") |
 | `--suspect-timeout-ms` | 300 | How long a SUSPECT lasts before becoming DEAD |
@@ -1582,6 +1591,44 @@ do not change — `--ack-timeout-ms` and `--suspect-timeout-ms` are
 still wall-clock durations — so the fast interval only makes the
 checks that enforce them run more often, it never redefines them.
 
+## Probe-interval jitter
+
+Nodes in a cluster usually start together — same deploy, same
+restart — and with the same base interval they probe in lockstep:
+every node picks its random peer, sends its PING, and gossips on
+roughly the same schedule, so the cluster's traffic comes in bursts
+and a slow peer gets probed by everyone at once. Jitter breaks the
+lockstep: each probe cycle sleeps the adaptive interval times
+(1 + u), with u drawn uniform in [-j, +j] and j the configured
+fraction (`--probe-jitter-frac`, default 0.1, so a 100 ms base sleeps
+90–110 ms per cycle). Two nodes with the same base drift apart
+within a few cycles, while each node's mean interval stays the base
+— jitter spreads the load, it does not speed the cluster up or slow
+it down.
+
+The jitter applies after the adaptive choice, so the base and fast
+intervals are both jittered, and the `ADAPTIVE` log lines and the
+`adaptive_fast_cycles` count still see the unjittered interval: a
+jittered cycle never looks like a switch, and a stable cluster still
+logs nothing. The cycle-based cadences inside the probe cycle — the
+~5 s seed rejoin, the anti-entropy SYNC, the gossip round every
+other cycle — are counted in cycles, so they inherit the jitter too:
+the whole cycle drifts, not just the sleep. The timeouts are
+untouched — `--ack-timeout-ms` and `--suspect-timeout-ms` are still
+wall-clock durations — and suspicion still comes from the fixed ack
+timeout or from phi alone, so a jittered probe cycle can never make
+a healthy peer look dead or a dead one look alive.
+
+The fraction clamps to [0, 0.9]: 0 disables jitter entirely, and
+beyond 0.9 a "probe interval" stops meaning anything. The jittered
+sleep never drops below the 25 ms floor when the base is at or above
+it — the same floor as the adaptive interval, so jitter cannot make
+the loop spin — and a base already below the floor floors at 1 ms
+instead. The randomness is an explicit xorshift32 state seeded once
+per node from time, pid, and port (not `rand()`), so nodes that start
+together still draw different sequences; the same code with a fixed
+seed replays the same sequence, which is what the unit tests use.
+
 ## Suspicion-refutation window
 
 Not every suspicion is a death. A peer can go quiet for a probe
@@ -1859,6 +1906,19 @@ make test
   the fast interval is clamped to the 25 ms floor and never slower
   than base, a base below the floor has nothing to speed up, and a
   nonsense base falls back to the floor instead of spinning.
+  Probe-interval jitter (0.50.0): a zero fraction sleeps the exact
+  base, 1000 draws at ±10% stay inside [90, 110] ms and land on both
+  sides of the base, 10000 draws average within 2 ms of the base, the
+  same seed replays the same sequence and a different seed draws a
+  different one, the fraction clamps at 0.9, a base at the floor never
+  sleeps below 25 ms, a nonsense base falls back to the floor, and a
+  NULL state returns the base unchanged.
+- `tests/test_jitter.sh`: integration test for probe-interval jitter —
+  a 2-node cluster converges with jitter on (one node at
+  `--probe-jitter-frac 0.2`, the other at the 0.1 default), both
+  members list the peer ALIVE, the members stay ALIVE after 3 s, and
+  the same pair still converges with jitter off
+  (`--probe-jitter-frac 0`).
 - `tests/test_control.sh`: integration test for the TCP control plane —
   `MEMBERS` lists the node itself, `STATUS` reports id and totals,
   `METRICS` reports zero counts and no samples on a fresh node and
@@ -2347,3 +2407,4 @@ make test
 - ~~Phi history in JSON: each member in `JSON` carries a `"phi_history"` — the last 16 phi values sampled for that peer, as `[[age_ms, phi], ...]` pairs oldest first, `age_ms` the ms since the node started — sampled once per probe cycle for ALIVE and SUSPECT peers and frozen when the peer goes DEAD, so an operator can see how a peer's suspicion evolved (near 0 while it answers, climbing past the threshold as it goes quiet) instead of only its live `"phi"`; `null` under the same rule as `"phi"` itself (phi-accrual off, self, or no heartbeat history), `[]` before the first sample, and polling `JSON` never moves the history it reads.~~ Done in 0.47.0.
 - ~~Probe RTT histogram: every answered direct probe adds one sample to a global RTT histogram — mean/max/samples plus five buckets (<1, 1–4, 5–9, 10–49, ≥50 ms), a sample exactly at a bound landing in the higher bucket like the detection-latency histogram — exposed as `probe_rtt_ms` at the end of the `METRICS` line, as a `probe_rtt_ms` object in the `JSON` metrics object, and as a real `pulse_probe_rtt_ms` histogram (cumulative buckets, `_sum`, `_count`) with mean/max/samples gauges in `PROMETHEUS`, so the mean RTT cannot hide a slow tail; a probe never answered adds no sample, and the histogram is local measurement, never gossiped or persisted.~~ Done in 0.48.0.
 - ~~Probe RTT in phi-accrual mode: the phi-mode probe creates a pending entry marked `rtt_only` — it exists only to match the ACK and measure the round-trip time, never to escalate to an indirect probe or suspect on age — so the per-member `rtt_ms` / `rtt_mean_ms` and the probe-RTT histogram are populated in `--phi-accrual` mode exactly as in the fixed-timeout mode, feeding the same `METRICS` / `JSON` / `PROMETHEUS` sample path; unanswered phi-mode probes leave stale entries that the probe cycle sweeps after twice the ack timeout, so the 32 pending slots never fill, and suspicion still comes from phi alone.~~ Done in 0.49.0.
+- ~~Probe-interval jitter: each probe cycle sleeps the adaptive interval times (1 + u) with u uniform in [-j, +j] (`--probe-jitter-frac`, default 0.1, clamped to [0, 0.9], 0 disables it) — an explicit xorshift32 state seeded once per node from time/pid/port, so nodes that start together drift out of lockstep within a few cycles while each node's mean interval stays the base; the jitter applies to the sleep only, so the `ADAPTIVE` log lines and `adaptive_fast_cycles` still see the unjittered interval, the jittered sleep never drops below the 25 ms floor, and failure detection semantics are untouched (suspicion still comes from the fixed ack timeout or from phi alone).~~ Done in 0.50.0.

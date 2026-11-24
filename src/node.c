@@ -75,6 +75,12 @@ typedef struct {
     int probe_interval_fast_ms; /* fast probe interval while any peer
                                    is SUSPECT, 0 = half the base
                                    interval (see adaptive.h) */
+    double probe_jitter_frac;  /* ±fraction of jitter on the probe
+                                  interval each cycle (0.50.0): each
+                                  cycle sleeps base * (1 + u) with u
+                                  uniform in [-frac, +frac], so nodes
+                                  that start together drift out of
+                                  lockstep; 0.1 by default, 0 = none */
     int ack_timeout_ms;
     int suspect_timeout_ms;
     int64_t dead_retention_ms; /* how long a DEAD entry stays in the table */
@@ -1680,6 +1686,13 @@ static void *prober_thread(void *arg) {
      * time along with the loop while the cluster is unstable — that
      * is the point. */
     int current_interval_ms = g_cfg.probe_interval_ms;
+    /* Jitter state (0.50.0): seeded once from time, pid and port, so
+     * nodes that start together still draw different sequences and
+     * drift out of lockstep within a few cycles. The state is local
+     * to this thread: nothing else draws from it. */
+    uint32_t jitter_state =
+        (uint32_t)(time(NULL) ^ ((uint32_t)getpid() << 16) ^
+                   (uint32_t)g_cfg.port);
     while (!g_stop) {
         int n_suspect;
         pthread_mutex_lock(&g_lock);
@@ -1701,9 +1714,17 @@ static void *prober_thread(void *arg) {
             metrics_note_adaptive_fast(&g_metrics);
             pthread_mutex_unlock(&g_lock);
         }
+        /* Jitter (0.50.0) applies to the sleep only: the ADAPTIVE log
+         * and the fast-cycle count above still see the unjittered
+         * interval, so a jittered cycle never looks like a switch
+         * and never spams the log. The cycle-based cadences inside
+         * probe_cycle inherit the jitter, which is the point — the
+         * whole cycle drifts, not just the sleep. */
+        int sleep_ms = pulse_jittered_interval_ms(
+            interval, g_cfg.probe_jitter_frac, &jitter_state);
         struct timespec ts;
-        ts.tv_sec = interval / 1000;
-        ts.tv_nsec = (long)(interval % 1000) * 1000000L;
+        ts.tv_sec = sleep_ms / 1000;
+        ts.tv_nsec = (long)(sleep_ms % 1000) * 1000000L;
         nanosleep(&ts, NULL);
         if (g_stop) break;
         probe_cycle(++cycle);
@@ -1717,6 +1738,7 @@ static void usage(const char *prog) {
             "       [--peer-file FILE]\n"
             "       [--data-dir DIR] [--probe-interval-ms N]\n"
             "       [--probe-interval-fast-ms N]\n"
+            "       [--probe-jitter-frac N]\n"
             "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
             "       [--slow-peer-rtt-ms N]\n"
             "       [--dead-retention SECONDS]\n"
@@ -1737,6 +1759,7 @@ int main(int argc, char **argv) {
     snprintf(g_cfg.data_dir, sizeof g_cfg.data_dir, ".");
     g_cfg.probe_interval_ms = 100;
     g_cfg.probe_interval_fast_ms = 0; /* default: half the base interval */
+    g_cfg.probe_jitter_frac = 0.1;    /* default: ±10% probe jitter */
     g_cfg.ack_timeout_ms = 100;
     g_cfg.suspect_timeout_ms = 300;
     g_cfg.dead_retention_ms = 60000; /* 60 s */
@@ -1775,6 +1798,13 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--probe-interval-fast-ms") == 0 &&
                    i + 1 < argc) {
             g_cfg.probe_interval_fast_ms = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--probe-jitter-frac") == 0 &&
+                   i + 1 < argc) {
+            g_cfg.probe_jitter_frac = atof(argv[++i]);
+            if (g_cfg.probe_jitter_frac < 0.0)
+                g_cfg.probe_jitter_frac = 0.0;
+            if (g_cfg.probe_jitter_frac > 0.9)
+                g_cfg.probe_jitter_frac = 0.9;
         } else if (strcmp(argv[i], "--ack-timeout-ms") == 0 && i + 1 < argc) {
             g_cfg.ack_timeout_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--suspect-timeout-ms") == 0 && i + 1 < argc) {
