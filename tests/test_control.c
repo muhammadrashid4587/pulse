@@ -708,7 +708,8 @@ int main(void) {
                  "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
                  "pf_bad=0 watch_subscribers=0 watch_sessions=0 "
                  "watch_delivered=0 watch_filtered=0 watch_dropped=0 "
-                 "watch_paused=0 watch_event_log_cap=128\nEND\n") == 0);
+                 "watch_paused=0 watch_event_log_cap=128 "
+                 "gossip_digest_size=16\nEND\n") == 0);
 
     /* JSON (0.28.0): the same state as a "peer_file" object, and
      * each member carries its "source" — the peer-file peer is
@@ -727,6 +728,9 @@ int main(void) {
      * object: no hook is set in this harness, so it reports the
      * default 128. */
     CHECK(strstr(reply, "\"event_log_cap\":128") != NULL);
+    /* The gossip digest size (0.41.0) rides top-level: no hook is
+     * set in this harness, so it reports the default 16. */
+    CHECK(strstr(reply, "\"gossip_digest_size\":16") != NULL);
     /* The peer_file object sits at the top level, after metrics. */
     {
         const char *metrics = strstr(reply, "\"metrics\":{");
@@ -820,6 +824,10 @@ int main(void) {
         CHECK(strstr(preply, "pulse_watch_delivered_total 0\n") != NULL);
         CHECK(strstr(preply, "pulse_watch_filtered_total 0\n") != NULL);
         CHECK(strstr(preply, "pulse_watch_dropped_total 0\n") != NULL);
+        /* Gossip digest size (0.41.0): no hook is set in this
+         * harness, so it reports the default 16. */
+        CHECK(strstr(preply, "# TYPE pulse_gossip_digest_size gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_gossip_digest_size 16\n") != NULL);
         /* One pulse_member_info gauge per member, with state and
          * source labels. */
         CHECK(strstr(preply, "pulse_member_info{member=\"127.0.0.1:17999\",state=\"ALIVE\",source=\"self\"} 1\n") != NULL);

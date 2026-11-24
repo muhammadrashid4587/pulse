@@ -5,8 +5,10 @@
  * Plus delta encoding (0.16.0): a digest to a peer at version V
  * carries only entries changed after V, oldest change first, and
  * nothing at all when nothing changed; the reported through-version
- * is an exact prefix bound. Digests are sent over real UDP loopback
- * sockets and parsed back. */
+ * is an exact prefix bound. Plus the configurable digest size
+ * (0.41.0): the digest carries at most max_entries entries, and
+ * the urgent leading slots are clamped to it. Digests are sent
+ * over real UDP loopback sockets and parsed back. */
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,9 +61,10 @@ static const char *id_at(int i) {
  * Returns the parsed entry count, or -1 if nothing arrived. since is
  * the peer version the digest is a delta against (0 = the old full
  * digest); through, when non-NULL, receives the through-version the
- * send reported. */
+ * send reported; max_entries is the digest size under test. */
 static int msg_roundtrip_digest(const member_table_t *t, uint64_t since,
-                                uint64_t *through, gmsg_t *out) {
+                                uint64_t *through, gmsg_t *out,
+                                int max_entries) {
     int recv_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (recv_sock < 0) return -1;
     struct sockaddr_in bind_addr;
@@ -104,7 +107,7 @@ static int msg_roundtrip_digest(const member_table_t *t, uint64_t since,
         return -1;
     }
     int rc = gossip_send_digest(send_sock, &dest, "127.0.0.1:17999", 1,
-                                t, since, through);
+                                t, since, through, max_entries);
     if (rc != 0) {
         close(send_sock);
         close(recv_sock);
@@ -124,7 +127,7 @@ static int msg_roundtrip_digest(const member_table_t *t, uint64_t since,
  * nothing arrived, 0 otherwise. through, when non-NULL, receives the
  * through-version the send reported. */
 static int nothing_sent(const member_table_t *t, uint64_t since,
-                        uint64_t *through) {
+                        uint64_t *through, int max_entries) {
     int recv_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (recv_sock < 0) return 0;
     struct sockaddr_in bind_addr;
@@ -160,7 +163,7 @@ static int nothing_sent(const member_table_t *t, uint64_t since,
         return 0;
     }
     int rc = gossip_send_digest(send_sock, &dest, "127.0.0.1:17999", 1,
-                                t, since, through);
+                                t, since, through, max_entries);
     if (rc != 0) {
         close(send_sock);
         close(recv_sock);
@@ -252,7 +255,7 @@ int main(void) {
         member_table_t t;
         build_table(&t, 3);
         member_mark_suspect(&t, id_at(1), 1000);
-        int n = msg_roundtrip_digest(&t, 0, NULL, &msg);
+        int n = msg_roundtrip_digest(&t, 0, NULL, &msg, PULSE_GOSSIP_ENTRIES);
         CHECK(n == 3);
         CHECK(msg.type == GMSG_GOSSIP);
         CHECK(strcmp(msg.entries[0].id, id_at(1)) == 0);
@@ -273,7 +276,7 @@ int main(void) {
         member_mark_dead(&t, id_at(3), 1200);    /* D: DEAD @1200 */
         member_mark_suspect(&t, id_at(4), 1800); /* E: SUSPECT @1800 */
         member_mark_dead(&t, id_at(5), 1100);    /* F: DEAD @1100 */
-        int n = msg_roundtrip_digest(&t, 0, NULL, &msg);
+        int n = msg_roundtrip_digest(&t, 0, NULL, &msg, PULSE_GOSSIP_ENTRIES);
         CHECK(n == PULSE_GOSSIP_ENTRIES);
         /* Expected lead order: B(2000), E(1800), C(1500), D(1200). */
         CHECK(strcmp(msg.entries[0].id, id_at(1)) == 0);
@@ -299,7 +302,7 @@ int main(void) {
         member_mark_suspect(&t, id_at(0), 5000);
         member_mark_suspect(&t, id_at(1), 5000);
         member_mark_dead(&t, id_at(1), 5000);
-        int n = msg_roundtrip_digest(&t, 0, NULL, &msg);
+        int n = msg_roundtrip_digest(&t, 0, NULL, &msg, PULSE_GOSSIP_ENTRIES);
         CHECK(n == 3);
         CHECK(strcmp(msg.entries[0].id, id_at(1)) == 0);
         CHECK(msg.entries[0].state == MEMBER_DEAD);
@@ -312,7 +315,7 @@ int main(void) {
     {
         member_table_t t;
         build_table(&t, 20);
-        int n = msg_roundtrip_digest(&t, 0, NULL, &msg);
+        int n = msg_roundtrip_digest(&t, 0, NULL, &msg, PULSE_GOSSIP_ENTRIES);
         CHECK(n == PULSE_GOSSIP_ENTRIES);
         for (int i = 0; i < msg.entry_count; i++) {
             CHECK(msg.entries[i].state == MEMBER_ALIVE);
@@ -329,7 +332,7 @@ int main(void) {
         member_mark_dead(&t, id_at(1), 1000);
         member_force_remove(&t, id_at(1), 2000);
         CHECK(t.tombstone_count == 1);
-        int n = msg_roundtrip_digest(&t, 0, NULL, &msg);
+        int n = msg_roundtrip_digest(&t, 0, NULL, &msg, PULSE_GOSSIP_ENTRIES);
         CHECK(n == 3); /* 2 live members + 1 tombstone */
         int idx = has_entry(&msg, id_at(1));
         CHECK(idx >= 0);
@@ -349,7 +352,8 @@ int main(void) {
         d4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         d4->sin_port = htons(1);
         CHECK(gossip_send_digest(send_sock, &dest, "127.0.0.1:17999", 1,
-                                 &t, 0, NULL) == 0);
+                                 &t, 0, NULL,
+                                 PULSE_GOSSIP_ENTRIES) == 0);
         close(send_sock);
         close(recv_sock);
     }
@@ -491,7 +495,7 @@ int main(void) {
         /* A peer that already knows version 5 gets nothing at all: no
          * datagram, and the reported through-version is current. */
         uint64_t through = 0;
-        CHECK(nothing_sent(&t, t.version, &through));
+        CHECK(nothing_sent(&t, t.version, &through, PULSE_GOSSIP_ENTRIES));
         CHECK(through == t.version);
         CHECK(member_changed_count(&t, t.version) == 0);
         /* One change after version 5: the delta is exactly that entry,
@@ -500,14 +504,14 @@ int main(void) {
         CHECK(t.version == 6);
         CHECK(member_changed_count(&t, 5) == 1);
         through = 0;
-        int n = msg_roundtrip_digest(&t, 5, &through, &msg);
+        int n = msg_roundtrip_digest(&t, 5, &through, &msg, PULSE_GOSSIP_ENTRIES);
         CHECK(n == 1);
         CHECK(msg.type == GMSG_GOSSIP);
         CHECK(strcmp(msg.entries[0].id, id_at(2)) == 0);
         CHECK(msg.entries[0].state == MEMBER_SUSPECT);
         CHECK(through == 6);
         /* The same delta re-sent against version 6 is empty again. */
-        CHECK(nothing_sent(&t, 6, &through));
+        CHECK(nothing_sent(&t, 6, &through, PULSE_GOSSIP_ENTRIES));
         CHECK(through == 6);
     }
 
@@ -523,7 +527,7 @@ int main(void) {
         CHECK(t.version == 8);
         CHECK(member_changed_count(&t, base) == 3);
         uint64_t through = 0;
-        int n = msg_roundtrip_digest(&t, base, &through, &msg);
+        int n = msg_roundtrip_digest(&t, base, &through, &msg, PULSE_GOSSIP_ENTRIES);
         CHECK(n == 3);
         CHECK(strcmp(msg.entries[0].id, id_at(1)) == 0);
         CHECK(msg.entries[0].state == MEMBER_SUSPECT);
@@ -548,14 +552,14 @@ int main(void) {
          * send — the version bump for the removal is the tombstone's. */
         CHECK(member_changed_count(&t, base) == 1);
         uint64_t through = 0;
-        int n = msg_roundtrip_digest(&t, base, &through, &msg);
+        int n = msg_roundtrip_digest(&t, base, &through, &msg, PULSE_GOSSIP_ENTRIES);
         CHECK(n == 1); /* the tombstone only: the member is gone */
         int idx = has_entry(&msg, id_at(1));
         CHECK(idx >= 0);
         CHECK(msg.entries[idx].state == MEMBER_DEAD);
         CHECK(through == t.version);
         /* Against the current version the tombstone is old news. */
-        CHECK(nothing_sent(&t, t.version, &through));
+        CHECK(nothing_sent(&t, t.version, &through, PULSE_GOSSIP_ENTRIES));
     }
 
     /* A delta bigger than one digest is a prefix, not a lie: with 18
@@ -573,7 +577,7 @@ int main(void) {
         CHECK(t.version == 38);
         CHECK(member_changed_count(&t, base) == 18);
         uint64_t through = 0;
-        int n = msg_roundtrip_digest(&t, base, &through, &msg);
+        int n = msg_roundtrip_digest(&t, base, &through, &msg, PULSE_GOSSIP_ENTRIES);
         CHECK(n == PULSE_GOSSIP_ENTRIES);
         /* Entries 0..15 changed at versions 21..36, oldest first. */
         CHECK(strcmp(msg.entries[0].id, id_at(0)) == 0);
@@ -583,11 +587,99 @@ int main(void) {
         CHECK(through == 36);
         /* The next digest against 36 carries exactly the two left. */
         through = 0;
-        n = msg_roundtrip_digest(&t, 36, &through, &msg);
+        n = msg_roundtrip_digest(&t, 36, &through, &msg, PULSE_GOSSIP_ENTRIES);
         CHECK(n == 2);
         CHECK(strcmp(msg.entries[0].id, id_at(16)) == 0);
         CHECK(strcmp(msg.entries[1].id, id_at(17)) == 0);
         CHECK(through == 38);
+    }
+
+    /* Configurable gossip digest size (0.41.0): a digest capped at
+     * 4 on a 20-member table carries exactly 4 entries, and the 4
+     * most recently changed urgent entries still lead — the urgent
+     * slots are clamped to the digest, not dropped by it. */
+    {
+        member_table_t t;
+        build_table(&t, 20);
+        member_mark_suspect(&t, id_at(0), 1000); /* A: SUSPECT @1000 */
+        member_mark_dead(&t, id_at(1), 2000);    /* B: DEAD @2000 */
+        member_mark_suspect(&t, id_at(2), 1500); /* C: SUSPECT @1500 */
+        member_mark_dead(&t, id_at(3), 1200);    /* D: DEAD @1200 */
+        member_mark_suspect(&t, id_at(4), 1800); /* E: SUSPECT @1800 */
+        member_mark_dead(&t, id_at(5), 1100);    /* F: DEAD @1100 */
+        int n = msg_roundtrip_digest(&t, 0, NULL, &msg, 4);
+        CHECK(n == 4);
+        /* Expected lead order: B(2000), E(1800), C(1500), D(1200) —
+         * the same 4 that lead the 16-entry digest. */
+        CHECK(strcmp(msg.entries[0].id, id_at(1)) == 0);
+        CHECK(msg.entries[0].state == MEMBER_DEAD);
+        CHECK(strcmp(msg.entries[1].id, id_at(4)) == 0);
+        CHECK(msg.entries[1].state == MEMBER_SUSPECT);
+        CHECK(strcmp(msg.entries[2].id, id_at(2)) == 0);
+        CHECK(msg.entries[2].state == MEMBER_SUSPECT);
+        CHECK(strcmp(msg.entries[3].id, id_at(3)) == 0);
+        CHECK(msg.entries[3].state == MEMBER_DEAD);
+    }
+
+    /* A digest of 1 still leads with the single most urgent entry:
+     * the floor is a working digest, not an empty one. */
+    {
+        member_table_t t;
+        build_table(&t, 20);
+        member_mark_suspect(&t, id_at(7), 1000);
+        member_mark_dead(&t, id_at(9), 2000);
+        int n = msg_roundtrip_digest(&t, 0, NULL, &msg, 1);
+        CHECK(n == 1);
+        CHECK(strcmp(msg.entries[0].id, id_at(9)) == 0);
+        CHECK(msg.entries[0].state == MEMBER_DEAD);
+    }
+
+    /* No urgent entries: a digest capped at 4 on a 20-member table
+     * carries 4 distinct ALIVE entries — the random window shrinks
+     * with the digest instead of always sending 16. */
+    {
+        member_table_t t;
+        build_table(&t, 20);
+        int n = msg_roundtrip_digest(&t, 0, NULL, &msg, 4);
+        CHECK(n == 4);
+        for (int i = 0; i < msg.entry_count; i++) {
+            CHECK(msg.entries[i].state == MEMBER_ALIVE);
+            for (int j = i + 1; j < msg.entry_count; j++) {
+                CHECK(strcmp(msg.entries[i].id, msg.entries[j].id) != 0);
+            }
+        }
+    }
+
+    /* A delta capped at 4 is a prefix, not a lie: with 6 changes
+     * the digest carries the 4 oldest, and the reported
+     * through-version is the 4th change — the newest two wait for
+     * the next digest. (The node never sends such a digest in
+     * production: more than 4 changes since a peer's version at a
+     * digest size of 4 falls back to a full SYNC.) */
+    {
+        member_table_t t;
+        build_table(&t, 8);
+        uint64_t base = t.version; /* 8 */
+        for (int i = 0; i < 6; i++)
+            member_mark_suspect(&t, id_at(i), 1000 + i);
+        CHECK(t.version == 14);
+        CHECK(member_changed_count(&t, base) == 6);
+        uint64_t through = 0;
+        int n = msg_roundtrip_digest(&t, base, &through, &msg, 4);
+        CHECK(n == 4);
+        /* Entries 0..3 changed at versions 9..12, oldest first. */
+        CHECK(strcmp(msg.entries[0].id, id_at(0)) == 0);
+        CHECK(strcmp(msg.entries[3].id, id_at(3)) == 0);
+        CHECK(has_entry(&msg, id_at(4)) < 0);
+        CHECK(has_entry(&msg, id_at(5)) < 0);
+        CHECK(through == 12);
+        /* The next digest against 12 carries exactly the two left. */
+        through = 0;
+        n = msg_roundtrip_digest(&t, 12, &through, &msg, 4);
+        CHECK(n == 2);
+        CHECK(strcmp(msg.entries[0].id, id_at(4)) == 0);
+        CHECK(strcmp(msg.entries[1].id, id_at(5)) == 0);
+        CHECK(through == 14);
     }
 
     /* A merge that changes an entry bumps the version; a merge that

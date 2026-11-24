@@ -89,6 +89,9 @@ typedef struct {
     int event_log_cap;         /* WATCH event ring capacity: how many
                                   membership events the log holds for
                                   replay (0.36.0), 0 = default 128 */
+    int gossip_digest_size;    /* how many members one gossip round's
+                                  digest covers (0.41.0), 0 = default
+                                  PULSE_GOSSIP_ENTRIES (16) */
     char secret[PULSE_SECRET_MAX]; /* shared secret for joins, "" = none */
     int ipv6;                  /* use IPv6 (bind ::, ids are "[::1]:port") */
     char bind_host[128];       /* bind address override, "" = wildcard */
@@ -191,6 +194,11 @@ static int peer_file_mtime(struct timespec *ts) {
 static uint32_t g_seq = 1;
 static pending_probe_t g_pending[MAX_PENDING];
 static pending_indirect_t g_indirect[MAX_PENDING];
+
+/* Forward: the configured gossip digest size (0.41.0), defined with
+ * the other control-plane hooks further down; probe_cycle uses it
+ * before that definition. */
+static int gossip_digest_size_hook(void *ctx);
 
 /* Per-peer gossip versions: the highest membership-table version we
  * believe each peer has already received from us (see
@@ -1406,7 +1414,7 @@ static void probe_cycle(int cycle) {
             int found = 0;
             uint64_t known = peer_known_version(digest_ids[i], &found);
             int changed = member_changed_count(&digest_copy, known);
-            if (!found || changed > PULSE_GOSSIP_ENTRIES) {
+            if (!found || changed > gossip_digest_size_hook(NULL)) {
                 if (gossip_send_full_table(g_send_sock, &digest_to[i],
                                            g_self_id, g_incarnation,
                                            &digest_copy) == 0)
@@ -1417,7 +1425,8 @@ static void probe_cycle(int cycle) {
                 if (gossip_send_digest(g_send_sock, &digest_to[i],
                                        g_self_id, g_incarnation,
                                        &digest_copy, known,
-                                       &through) == 0)
+                                       &through,
+                                       gossip_digest_size_hook(NULL)) == 0)
                     peer_set_known_version(digest_ids[i], through);
             }
         }
@@ -1560,6 +1569,15 @@ static int watch_event_log_cap_hook(void *ctx) {
     return pulse_event_log_cap(&g_event_log);
 }
 
+/* Gossip digest size (0.41.0): how many members one gossip round's
+ * digest covers — the --gossip-digest-size the node started with,
+ * 16 by default — so METRICS / JSON / PROMETHEUS can report it. */
+static int gossip_digest_size_hook(void *ctx) {
+    (void)ctx;
+    return g_cfg.gossip_digest_size > 0 ? g_cfg.gossip_digest_size
+                                        : PULSE_GOSSIP_ENTRIES;
+}
+
 /* Set one annotation on this node itself (control plane META): update
  * the self entry, stamp it changed so the next digest gossips it, and
  * persist the set to the data dir so it survives a restart. Returns
@@ -1656,6 +1674,7 @@ static void usage(const char *prog) {
             "       [--sync-interval-ms N]\n"
             "       [--control-port PORT]\n"
             "       [--event-log-cap N]\n"
+            "       [--gossip-digest-size N]\n"
             "       [--secret SECRET | --shared-secret SECRET]\n"
             "       [--meta KEY=VALUE]... (repeatable, at most 8)\n"
             "       [--ipv6] [--bind HOST]\n",
@@ -1676,6 +1695,7 @@ int main(int argc, char **argv) {
     g_cfg.sync_interval_ms = 10000; /* anti-entropy full-table exchange */
     g_cfg.slow_peer_rtt_ms = 0; /* slow-peer warning disabled */
     g_cfg.event_log_cap = 0; /* default WATCH event ring (128 events) */
+    g_cfg.gossip_digest_size = 0; /* default gossip digest (16 entries) */
     g_cfg.control_port = -1; /* disabled unless --control-port is given */
 
     for (int i = 1; i < argc; i++) {
@@ -1754,6 +1774,23 @@ int main(int argc, char **argv) {
             if (g_cfg.event_log_cap < 1 || g_cfg.event_log_cap > 100000) {
                 fprintf(stderr,
                         "--event-log-cap must be between 1 and 100000\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--gossip-digest-size") == 0 &&
+                   i + 1 < argc) {
+            /* Configurable gossip digest size (0.41.0): how many
+             * members one gossip round's digest covers. A large
+             * cluster trades convergence speed for bandwidth by
+             * shrinking it; a small one can grow it to the whole
+             * table. 1 is the floor (a digest of 0 would gossip
+             * nothing at all), 64 the ceiling (the table holds at
+             * most 64 members, so a bigger digest buys nothing). */
+            g_cfg.gossip_digest_size = atoi(argv[++i]);
+            if (g_cfg.gossip_digest_size < 1 ||
+                g_cfg.gossip_digest_size > PULSE_GOSSIP_ENTRIES_MAX) {
+                fprintf(stderr,
+                        "--gossip-digest-size must be between 1 and %d\n",
+                        PULSE_GOSSIP_ENTRIES_MAX);
                 return 2;
             }
         } else if ((strcmp(argv[i], "--secret") == 0 ||
@@ -2173,6 +2210,7 @@ int main(int argc, char **argv) {
         g_hooks.watch_latest_seq = watch_latest_seq_hook;
         g_hooks.watch_oldest_seq = watch_oldest_seq_hook;
         g_hooks.event_log_cap = watch_event_log_cap_hook;
+        g_hooks.gossip_digest_size = gossip_digest_size_hook;
         g_hooks.set_meta = set_meta_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
         g_hooks.peer_source = peer_source_hook;
@@ -2216,7 +2254,8 @@ int main(int argc, char **argv) {
             if (m->state == MEMBER_DEAD) continue;
             if (gossip_send_digest(g_send_sock, &m->addr, g_self_id,
                                    g_incarnation, &leave_copy,
-                                   0, NULL) == 0)
+                                   0, NULL,
+                                   gossip_digest_size_hook(NULL)) == 0)
                 n_notified++;
         }
     }

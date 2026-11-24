@@ -73,7 +73,7 @@
  *           pf_dropped=<N|'-'> pf_kept=<N|'-'> pf_bad=<N|'-'>
  *           watch_subscribers=<N> watch_sessions=<N>
  *           watch_delivered=<N> watch_filtered=<N> watch_dropped=<N>
- *           watch_event_log_cap=<N>
+ *           watch_event_log_cap=<N> gossip_digest_size=<N>
  *       detect_latency_ms is last-direct-contact -> SUSPECT for
  *       suspicions this node detected itself (mean/max in ms, "-" when
  *       there are no samples); suspect_to_dead_ms is SUSPECT -> DEAD.
@@ -124,6 +124,13 @@
  *       node is running a bigger or smaller ring than the
  *       default. JSON carries the same cap, and PROMETHEUS as
  *       pulse_watch_event_log_cap.
+ *       gossip_digest_size (0.41.0) is how many members one gossip
+ *       round's digest covers — the --gossip-digest-size the node
+ *       started with, 16 by default — so an operator can see
+ *       whether the node is trading convergence speed for
+ *       bandwidth. JSON carries the same size as a top-level
+ *       "gossip_digest_size", and PROMETHEUS as
+ *       pulse_gossip_digest_size.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -155,7 +162,11 @@
  *       holds — the --event-log-cap the node started with, 128 by
  *       default), and a "streams" array with the same three
  *       counts per currently-connected stream, keyed by its
- *       "session" number, plus "paused" per stream.
+ *       "session" number, plus "paused" per stream. A top-level
+ *       "gossip_digest_size" (0.41.0) carries how many members
+ *       one gossip round's digest covers — the
+ *       --gossip-digest-size the node started with, 16 by
+ *       default.
  *   PROMETHEUS
  *       The same values METRICS and JSON report, as Prometheus text
  *       exposition format, then END. Each metric family carries a
@@ -166,7 +177,9 @@
  *       sessions and the watch delivery / drop counts) as counters;
  *       the event ring capacity (pulse_watch_event_log_cap, 0.36.0)
  *       as a gauge; the paused-stream count (pulse_watch_paused,
- *       0.37.0) as a gauge; the three latency groups as mean/max/samples
+ *       0.37.0) as a gauge; the gossip digest size
+ *       (pulse_gossip_digest_size, 0.41.0) as a gauge; the three
+ *       latency groups as mean/max/samples
  *       and max are 0 with no samples — Prometheus has no null —
  *       and the samples gauge says whether the mean is real); the
  *       detection latency also as a real histogram (the same five
@@ -429,6 +442,12 @@ typedef struct {
      * see how far back a replay can reach. NULL when the node
      * does not support watching. */
     int (*event_log_cap)(void *ctx);
+    /* How many members one gossip round's digest covers (0.41.0):
+     * the --gossip-digest-size the node started with, 16 by
+     * default. METRICS / JSON / PROMETHEUS report it so an
+     * operator can see whether the node is trading convergence
+     * speed for bandwidth. NULL reports the default 16. */
+    int (*gossip_digest_size)(void *ctx);
     const char *self_id;
     int64_t start_ms; /* monotonic ms when the node started */
 } control_hooks_t;

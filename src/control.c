@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "phi.h"
+#include "gossip.h"
 
 #define CONTROL_MAX_LINE 1024
 
@@ -232,6 +233,16 @@ static void watch_stream_unregister(int slot) {
 static int event_log_cap_or_default(const control_hooks_t *hooks) {
     if (hooks->event_log_cap) return hooks->event_log_cap(hooks->ctx);
     return PULSE_EVENT_LOG_CAP;
+}
+
+/* The gossip digest size (0.41.0): how many members one gossip
+ * round's digest covers — the --gossip-digest-size the node
+ * started with. A NULL hook reports the default, so METRICS /
+ * JSON / PROMETHEUS never print a nonsense size. */
+static int gossip_digest_size_or_default(const control_hooks_t *hooks) {
+    if (hooks->gossip_digest_size)
+        return hooks->gossip_digest_size(hooks->ctx);
+    return PULSE_GOSSIP_ENTRIES;
 }
 
 int control_listen(int port, int family) {
@@ -492,13 +503,14 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
              " watch_subscribers=%d watch_sessions=%llu "
              "watch_delivered=%llu watch_filtered=%llu "
              "watch_dropped=%llu watch_paused=%d "
-             "watch_event_log_cap=%d",
+             "watch_event_log_cap=%d gossip_digest_size=%d",
              ws.current, (unsigned long long)ws.sessions,
              (unsigned long long)ws.delivered,
              (unsigned long long)ws.filtered,
              (unsigned long long)ws.dropped,
              ws.paused,
-             event_log_cap_or_default(hooks));
+             event_log_cap_or_default(hooks),
+             gossip_digest_size_or_default(hooks));
     if (send_all(fd, line) != 0) return;
     send_all(fd, "\nEND\n");
 }
@@ -668,7 +680,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"max\":%lld,\"samples\":%lld}},\"peer_file\":%s,"
         "\"watch\":{\"subscribers\":%d,\"sessions\":%llu,"
         "\"delivered\":%llu,\"filtered\":%llu,\"dropped\":%llu,"
-        "\"paused\":%d,\"event_log_cap\":%d,\"streams\":%s}}\nEND\n",
+        "\"paused\":%d,\"event_log_cap\":%d,\"streams\":%s},"
+        "\"gossip_digest_size\":%d}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
         (long long)m.joins, (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
@@ -684,7 +697,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (unsigned long long)ws.filtered,
         (unsigned long long)ws.dropped,
         ws.paused,
-        event_log_cap_or_default(hooks), streams_json);
+        event_log_cap_or_default(hooks), streams_json,
+        gossip_digest_size_or_default(hooks));
     if (w < 0 || (size_t)w >= sizeof buf - used) return;
     send_all(fd, buf);
 }
@@ -946,6 +960,17 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         "# TYPE pulse_watch_event_log_cap gauge\n"
         "pulse_watch_event_log_cap %d\n",
         event_log_cap_or_default(hooks)) == 0;
+    /* The gossip digest size (0.41.0): how many members one gossip
+     * round's digest covers — the --gossip-digest-size the node
+     * started with, 16 by default — as a gauge, so a scraper can
+     * see whether the node is trading convergence speed for
+     * bandwidth. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_gossip_digest_size Members one gossip round's "
+        "digest covers.\n"
+        "# TYPE pulse_gossip_digest_size gauge\n"
+        "pulse_gossip_digest_size %d\n",
+        gossip_digest_size_or_default(hooks)) == 0;
     /* One info gauge per member, labelled by member, state and
      * source — the Prometheus way of exposing per-member state
      * without a separate metric per peer. */

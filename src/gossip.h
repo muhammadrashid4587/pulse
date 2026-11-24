@@ -5,7 +5,14 @@
 #include <sys/socket.h>
 
 #define PULSE_MAX_MSG 1400
+/* Default digest size (0.41.0): how many table entries one gossip
+ * round's digest covers. The table holds up to PULSE_MAX_MEMBERS
+ * (64) members, so the digest is a window, not the whole table —
+ * but a cluster can now trade convergence speed for bandwidth with
+ * --gossip-digest-size (1..PULSE_GOSSIP_ENTRIES_MAX), and the size
+ * rides in METRICS / JSON / PROMETHEUS. */
 #define PULSE_GOSSIP_ENTRIES 16
+#define PULSE_GOSSIP_ENTRIES_MAX 64
 /* Leading slots of a digest reserved for the most urgent news: members
  * that recently turned SUSPECT or DEAD go first (most recently changed
  * first, DEAD before SUSPECT on a tie), so failure news is never stuck
@@ -116,7 +123,13 @@ int gossip_send_ping_req(int sock, const struct sockaddr_storage *to, uint32_t s
                          const char *target_id, const char *from_id);
 int gossip_send_join(int sock, const struct sockaddr_storage *to,
                      const char *from_id, uint32_t inc);
-/* Send a digest of up to PULSE_GOSSIP_ENTRIES table entries to a peer.
+/* Send a digest of up to max_entries table entries to a peer.
+ * max_entries is the configured gossip digest size (1 to
+ * PULSE_GOSSIP_ENTRIES_MAX, PULSE_GOSSIP_ENTRIES by default): a
+ * large cluster trades convergence speed for bandwidth by shrinking
+ * it, a small one can grow it to the whole table. The urgent
+ * leading slots (up to PULSE_GOSSIP_URGENT) are clamped to it, so
+ * a digest of 1 still leads with the single most urgent entry.
  * Delta encoding: when since_version > 0, only entries (members and
  * tombstones) that changed after that version are sent, oldest change
  * first, and nothing is sent at all when nothing changed — so
@@ -124,7 +137,7 @@ int gossip_send_join(int sock, const struct sockaddr_storage *to,
  * since_version is 0 (the peer's version is unknown), the old digest
  * goes out: recently-changed SUSPECT/DEAD entries first (up to
  * PULSE_GOSSIP_URGENT of them, most recently changed first): a digest
- * is only 16 entries and the table holds up to 64 members, so a purely
+ * is only max_entries entries and the table holds up to 64 members, so a purely
  * random window can miss a fresh SUSPECT for several rounds and delay
  * the news that matters most. The remaining slots are the usual random
  * contiguous window, skipping entries already sent as urgent, so the
@@ -140,7 +153,8 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                        const char *from_id, uint32_t inc,
                        const member_table_t *t,
                        uint64_t since_version,
-                       uint64_t *sent_through_version);
+                       uint64_t *sent_through_version,
+                       int max_entries);
 /* Send the sender's whole membership table (anti-entropy SYNC): every
  * table entry, then tombstones as DEAD while there is room, in table
  * order — no 16-entry cap, no prioritization, no random window. One

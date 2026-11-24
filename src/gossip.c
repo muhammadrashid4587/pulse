@@ -105,7 +105,16 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
                        const char *from_id, uint32_t inc,
                        const member_table_t *t,
                        uint64_t since_version,
-                       uint64_t *sent_through_version) {
+                       uint64_t *sent_through_version,
+                       int max_entries) {
+    /* Clamp the configured size into range: a caller passing 0 or a
+     * value past the table size gets the nearest sane digest instead
+     * of an empty or over-long one. The node validates the flag at
+     * startup, so this is a belt-and-braces guard for direct
+     * callers (and the unit tests). */
+    if (max_entries < 1) max_entries = 1;
+    if (max_entries > PULSE_GOSSIP_ENTRIES_MAX)
+        max_entries = PULSE_GOSSIP_ENTRIES_MAX;
     /* Entry text is built first so the header count can cover both the
      * member window and the tombstones appended after it. */
     char entries[1280];
@@ -172,7 +181,7 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
             }
             items[j + 1] = key;
         }
-        for (int k = 0; k < n_items && total < PULSE_GOSSIP_ENTRIES; k++) {
+        for (int k = 0; k < n_items && total < max_entries; k++) {
             if (items[k].is_tombstone) {
                 const tombstone_t *ts = &t->tombstones[items[k].idx];
                 if (append_entry(entries, sizeof entries, &off, ts->id,
@@ -228,7 +237,7 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
     }
     int n_first = n_urgent < PULSE_GOSSIP_URGENT ? n_urgent
                                                  : PULSE_GOSSIP_URGENT;
-    if (n_first > PULSE_GOSSIP_ENTRIES) n_first = PULSE_GOSSIP_ENTRIES;
+    if (n_first > max_entries) n_first = max_entries;
     for (int k = 0; k < n_first; k++) {
         const member_t *m = &t->members[urgent[k]];
         char meta[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
@@ -246,7 +255,7 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
      * skipping entries already sent as urgent, so the remainder of the
      * table still rotates through instead of starving. */
     int start = rand() % n;
-    for (int k = 0; k < n && total < PULSE_GOSSIP_ENTRIES; k++) {
+    for (int k = 0; k < n && total < max_entries; k++) {
         int idx = (start + k) % n;
         int already = 0;
         for (int j = 0; j < n_first; j++) {
@@ -272,7 +281,7 @@ int gossip_send_digest(int sock, const struct sockaddr_storage *to,
      * the member DEAD and GC it on their own retention timer. A live
      * member that hears itself DEAD refutes by bumping its incarnation,
      * exactly as for a DEAD entry already in the table. */
-    for (int k = 0; k < t->tombstone_count && total < PULSE_GOSSIP_ENTRIES; k++) {
+    for (int k = 0; k < t->tombstone_count && total < max_entries; k++) {
         const tombstone_t *ts = &t->tombstones[k];
         if (append_entry(entries, sizeof entries, &off, ts->id,
                          ts->incarnation, MEMBER_DEAD, "") != 0)

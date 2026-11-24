@@ -73,7 +73,7 @@ static int msg_roundtrip_digest(const member_table_t *t, gmsg_t *out) {
         return -1;
     }
     int rc = gossip_send_digest(send_sock, &dest, "127.0.0.1:17101", 3,
-                                t, 0, NULL);
+                                t, 0, NULL, PULSE_GOSSIP_ENTRIES);
     if (rc != 0) {
         close(send_sock);
         close(recv_sock);
