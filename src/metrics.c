@@ -48,7 +48,8 @@ void metrics_note_suspect_refuted(pulse_metrics_t *m, int64_t duration_ms) {
 void metrics_note_join(pulse_metrics_t *m) { m->joins++; }
 
 void metrics_note_seed_rejoin(pulse_metrics_t *m, const char *seed_id,
-                              int64_t now_unix_ms) {
+                              int64_t now_unix_ms, int64_t next_delay_ms,
+                              int64_t next_due_ms) {
     m->seed_rejoins++;
     if (seed_id == NULL) return;
     /* Per-seed breakdown (0.54.0, last rejoin 0.55.0): find the
@@ -57,11 +58,18 @@ void metrics_note_seed_rejoin(pulse_metrics_t *m, const char *seed_id,
      * overflow; if it somehow did, the total still counts and the
      * breakdown just misses one. Either way the entry records
      * when this attempt happened, so the breakdown also says
-     * when each seed was last retried. */
+     * when each seed was last retried. Backoff (0.56.0): the
+     * attempt is one more consecutive failure, and the caller
+     * passes the delay it scheduled for the next retry (already
+     * jittered) and when it is due, so the entry also says how
+     * long the node will wait before trying this seed again. */
     for (int i = 0; i < m->seed_rejoin_seed_count; i++) {
         if (strcmp(m->seed_rejoins_by_seed[i].id, seed_id) == 0) {
             m->seed_rejoins_by_seed[i].count++;
             m->seed_rejoins_by_seed[i].last_rejoin_unix_ms = now_unix_ms;
+            m->seed_rejoins_by_seed[i].failures++;
+            m->seed_rejoins_by_seed[i].next_delay_ms = next_delay_ms;
+            m->seed_rejoins_by_seed[i].next_due_ms = next_due_ms;
             return;
         }
     }
@@ -71,6 +79,31 @@ void metrics_note_seed_rejoin(pulse_metrics_t *m, const char *seed_id,
         snprintf(e->id, sizeof e->id, "%s", seed_id);
         e->count = 1;
         e->last_rejoin_unix_ms = now_unix_ms;
+        e->failures = 1;
+        e->next_delay_ms = next_delay_ms;
+        e->next_due_ms = next_due_ms;
+    }
+}
+
+const pulse_seed_rejoin_entry_t *metrics_seed_rejoin_entry(
+    const pulse_metrics_t *m, const char *seed_id) {
+    if (seed_id == NULL) return NULL;
+    for (int i = 0; i < m->seed_rejoin_seed_count; i++) {
+        if (strcmp(m->seed_rejoins_by_seed[i].id, seed_id) == 0)
+            return &m->seed_rejoins_by_seed[i];
+    }
+    return NULL;
+}
+
+void metrics_reset_seed_backoff(pulse_metrics_t *m, const char *seed_id) {
+    if (seed_id == NULL) return;
+    for (int i = 0; i < m->seed_rejoin_seed_count; i++) {
+        if (strcmp(m->seed_rejoins_by_seed[i].id, seed_id) == 0) {
+            m->seed_rejoins_by_seed[i].failures = 0;
+            m->seed_rejoins_by_seed[i].next_delay_ms = 0;
+            m->seed_rejoins_by_seed[i].next_due_ms = 0;
+            return;
+        }
     }
 }
 
@@ -194,6 +227,42 @@ void metrics_seed_last_rejoin_json(const pulse_metrics_t *m, char *buf,
     snprintf(buf + used, len - used, "}");
 }
 
+void metrics_seed_rejoin_backoff_text(const pulse_metrics_t *m, char *buf,
+                                      size_t len) {
+    if (m->seed_rejoin_seed_count <= 0) {
+        snprintf(buf, len, "-");
+        return;
+    }
+    size_t used = 0;
+    for (int i = 0; i < m->seed_rejoin_seed_count; i++) {
+        int w = snprintf(buf + used, len - used, "%s%s=%lld",
+                         i == 0 ? "" : ",",
+                         m->seed_rejoins_by_seed[i].id,
+                         (long long)m->seed_rejoins_by_seed[i]
+                             .next_delay_ms);
+        if (w < 0 || (size_t)w >= len - used) return;
+        used += (size_t)w;
+    }
+}
+
+void metrics_seed_rejoin_backoff_json(const pulse_metrics_t *m, char *buf,
+                                      size_t len) {
+    size_t used = 0;
+    int w = snprintf(buf, len, "{");
+    if (w < 0 || (size_t)w >= len) return;
+    used += (size_t)w;
+    for (int i = 0; i < m->seed_rejoin_seed_count; i++) {
+        w = snprintf(buf + used, len - used, "%s\"%s\":%lld",
+                     i == 0 ? "" : ",",
+                     m->seed_rejoins_by_seed[i].id,
+                     (long long)m->seed_rejoins_by_seed[i]
+                         .next_delay_ms);
+        if (w < 0 || (size_t)w >= len - used) return;
+        used += (size_t)w;
+    }
+    snprintf(buf + used, len - used, "}");
+}
+
 void metrics_format(const pulse_metrics_t *m, char *buf, size_t len) {
     char detect[96], suspect_dead[96], refute[96], rtt[96];
     char hist[64], rtthist[64];
@@ -204,6 +273,10 @@ void metrics_format(const pulse_metrics_t *m, char *buf, size_t len) {
      * "host:port=<13-digit unix ms>" — a 64-char id plus a
      * timestamp — fits in ~1.3 KB worst case, like by_seed. */
     char last_rejoin[1408];
+    /* Per-seed rejoin backoff (0.56.0): 16 seeds at most, each
+     * "host:port=<delay ms>" — the same shape and bound as the
+     * last-rejoin field, so the same 1.4 KB buffer holds it. */
+    char backoff[1408];
     format_group(detect, sizeof detect, m->detect_samples, m->detect_sum_ms,
                  m->detect_max_ms);
     format_group(suspect_dead, sizeof suspect_dead, m->suspect_dead_samples,
@@ -216,16 +289,18 @@ void metrics_format(const pulse_metrics_t *m, char *buf, size_t len) {
     metrics_rtt_hist_json(m, rtthist, sizeof rtthist);
     metrics_seed_rejoins_text(m, by_seed, sizeof by_seed);
     metrics_seed_last_rejoin_text(m, last_rejoin, sizeof last_rejoin);
+    metrics_seed_rejoin_backoff_text(m, backoff, sizeof backoff);
     snprintf(buf, len,
              "METRICS suspected=%lld dead=%lld refutes=%lld joins=%lld "
              "seed_rejoins=%lld seed_rejoins_by_seed=%s "
              "seed_last_rejoin_ms_by_seed=%s "
+             "seed_rejoin_backoff_ms_by_seed=%s "
              "adaptive_fast_cycles=%lld suspect_refuted=%lld "
              "detect_latency_ms %s hist=[%s] suspect_to_dead_ms %s "
              "refute_latency_ms %s probe_rtt_ms %s hist=[%s]",
              (long long)m->suspected, (long long)m->dead,
              (long long)m->refutes, (long long)m->joins,
-             (long long)m->seed_rejoins, by_seed, last_rejoin,
+             (long long)m->seed_rejoins, by_seed, last_rejoin, backoff,
              (long long)m->adaptive_fast_cycles,
              (long long)m->suspect_refuted, detect, hist,
              suspect_dead, refute, rtt, rtthist);

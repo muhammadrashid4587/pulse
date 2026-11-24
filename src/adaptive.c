@@ -46,3 +46,16 @@ int pulse_jittered_interval_ms(int base_ms, double jitter_frac,
     if (jittered < floor_ms) jittered = floor_ms;
     return jittered;
 }
+
+int pulse_rejoin_backoff_ms(int failures) {
+    if (failures <= 0) return PULSE_REJOIN_BASE_MS;
+    /* Doubling in int64_t: the cap is hit at 3 failures (40 s),
+     * so the loop is short, but a caller passing a huge count
+     * must not overflow the shift — the cap stops it first. */
+    int64_t delay = PULSE_REJOIN_BASE_MS;
+    for (int i = 0; i < failures; i++) {
+        delay *= 2;
+        if (delay >= PULSE_REJOIN_CAP_MS) return PULSE_REJOIN_CAP_MS;
+    }
+    return (int)delay;
+}

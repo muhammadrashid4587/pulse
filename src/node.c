@@ -1022,8 +1022,12 @@ static void reload_peer_file(pulse_reload_result_t *out) {
 
 /* One probe cycle: ping a random peer, escalate timed-out probes to
  * indirect probes, suspect peers whose indirect probes also fail, sweep
- * stale suspects to dead, gossip a digest, and log a STATUS line. */
-static void probe_cycle(int cycle) {
+ * stale suspects to dead, gossip a digest, and log a STATUS line.
+ * jitter_state is the prober thread's xorshift32 state (see
+ * prober_thread): probe_cycle draws from it for the seed-rejoin
+ * backoff, so the backoff jitter shares the node's one draw
+ * sequence instead of running a second PRNG. */
+static void probe_cycle(int cycle, uint32_t *jitter_state) {
     int64_t now = pulse_now_ms();
 
     /* 0. Live peer-file reload (0.24.0): SIGHUP sets a flag (the
@@ -1117,15 +1121,27 @@ static void probe_cycle(int cycle) {
     /* 1b. Re-JOIN seeds that are not ALIVE. A node that starts while its
      * seed is down sends JOIN once at startup and would otherwise stay
      * isolated forever: it suspects, deads and GCs the seed, and the
-     * seed, once up, has no reason to contact it. Every ~5 s, re-send
-     * JOIN to each seed that is not currently ALIVE, so the cluster
-     * heals when the seed comes up. The seed is deliberately NOT
-     * re-added to the table here: it comes back through the normal
-     * path (the seed answers the JOIN with a full-table SYNC, and direct
-     * contact re-adds it), so a seed that never answers — wrong
-     * secret, wrong family, genuinely dead — stays GC'd instead of
-     * cycling back into the table. A seed of the other address
-     * family is skipped: it can never be reached from this socket. */
+     * seed, once up, has no reason to contact it. The first retry
+     * fires on the ~5 s tick, as before — then the retry backs off
+     * (0.56.0): each consecutive unanswered re-JOIN doubles the wait
+     * (10 s, 20 s, capped at 30 s, jittered with the probe jitter),
+     * so a permanently dead seed is probed less and less often
+     * instead of every 5 s forever, while a seed that comes back is
+     * still re-joined within 30 s at worst — and promptly when the
+     * outage is fresh, since the backoff resets the moment the seed
+     * is ALIVE again. The seed is deliberately NOT re-added to the
+     * table here: it comes back through the normal path (the seed
+     * answers the JOIN with a full-table SYNC, and direct contact
+     * re-adds it), so a seed that never answers — wrong secret,
+     * wrong family, genuinely dead — stays GC'd instead of cycling
+     * back into the table. A seed of the other address family is
+     * skipped: it can never be reached from this socket. The due
+     * time lives on the seed's metrics entry, in the monotonic
+     * clock: a seed never re-joined has no entry and fires on the
+     * legacy ~5 s tick; a seed whose backoff was reset (it was
+     * ALIVE since the last failure) is due at once, so a fresh
+     * outage is re-joined promptly; a seed mid-backoff waits out
+     * its scheduled delay. */
     typedef struct {
         char id[PULSE_ID_LEN];
         struct sockaddr_storage addr;
@@ -1136,36 +1152,65 @@ static void probe_cycle(int cycle) {
     {
         int retry_every = 5000 / g_cfg.probe_interval_ms;
         if (retry_every < 1) retry_every = 1;
-        if (cycle % retry_every == 0 && g_cfg.seed_count > 0) {
-            pthread_mutex_lock(&g_lock);
-            for (int i = 0; i < g_cfg.seed_count && n_rejoins < 16; i++) {
-                member_t *m = member_find(&g_table, g_cfg.seeds[i]);
-                if (m && m->state == MEMBER_ALIVE) continue;
-                struct sockaddr_storage saddr;
-                if (member_parse_addr(g_cfg.seeds[i], &saddr) != 0) continue;
-                if (saddr.ss_family != g_family) continue;
-                int was_absent = (m == NULL);
-                snprintf(rejoins[n_rejoins].id, PULSE_ID_LEN, "%s",
-                         g_cfg.seeds[i]);
-                rejoins[n_rejoins].addr = saddr;
-                rejoins[n_rejoins].was_absent = was_absent;
-                n_rejoins++;
-                /* Seed-rejoin count (0.53.0, per-seed 0.54.0,
-                 * last rejoin 0.55.0): counted here, under the
-                 * lock, because the send loop below sends exactly
-                 * this list — one count per re-JOIN that goes out,
-                 * whether the seed was SUSPECT/DEAD in the table
-                 * or already GC'd — and the per-seed breakdown
-                 * takes the seed's id, so the total and the
-                 * breakdown always agree. The attempt's
-                 * wall-clock time (unix ms) is recorded too, so
-                 * the breakdown also says when each seed was
-                 * last retried. */
-                metrics_note_seed_rejoin(&g_metrics, g_cfg.seeds[i],
-                                         (int64_t)time(NULL) * 1000);
+        pthread_mutex_lock(&g_lock);
+        for (int i = 0; i < g_cfg.seed_count && n_rejoins < 16; i++) {
+            member_t *m = member_find(&g_table, g_cfg.seeds[i]);
+            if (m && m->state == MEMBER_ALIVE) {
+                /* Seed is up: its backoff resets, so the next
+                 * outage starts again at the base interval instead
+                 * of resuming at the cap — and a seed that was
+                 * never re-joined has no entry, so the reset is
+                 * a no-op for it. */
+                metrics_reset_seed_backoff(&g_metrics, g_cfg.seeds[i]);
+                continue;
             }
-            pthread_mutex_unlock(&g_lock);
+            struct sockaddr_storage saddr;
+            if (member_parse_addr(g_cfg.seeds[i], &saddr) != 0) continue;
+            if (saddr.ss_family != g_family) continue;
+            const pulse_seed_rejoin_entry_t *e =
+                metrics_seed_rejoin_entry(&g_metrics, g_cfg.seeds[i]);
+            if (e == NULL) {
+                /* Never re-joined: the first retry fires on the
+                 * legacy ~5 s tick, as before. */
+                if (cycle % retry_every != 0) continue;
+            } else if (e->failures > 0 && now < e->next_due_ms) {
+                /* Mid-backoff: not due yet. A reset entry
+                 * (failures == 0, the seed was ALIVE since the
+                 * last failure) is due at once — see above. */
+                continue;
+            }
+            int was_absent = (m == NULL);
+            snprintf(rejoins[n_rejoins].id, PULSE_ID_LEN, "%s",
+                     g_cfg.seeds[i]);
+            rejoins[n_rejoins].addr = saddr;
+            rejoins[n_rejoins].was_absent = was_absent;
+            n_rejoins++;
+            /* Seed-rejoin count (0.53.0, per-seed 0.54.0,
+             * last rejoin 0.55.0, backoff 0.56.0): counted here,
+             * under the lock, because the send loop below sends
+             * exactly this list — one count per re-JOIN that goes
+             * out, whether the seed was SUSPECT/DEAD in the table
+             * or already GC'd — and the per-seed breakdown takes
+             * the seed's id, so the total and the breakdown always
+             * agree. The attempt's wall-clock time (unix ms) is
+             * recorded too, so the breakdown also says when each
+             * seed was last retried. The next retry's delay is
+             * the backoff for the failure count this attempt
+             * leaves behind — doubled from the last, capped at
+             * 30 s — jittered with the probe jitter, so nodes
+             * waiting on the same dead seed do not retry in
+             * lockstep; the scheduled delay and its due time are
+             * recorded on the entry, so the current backoff state
+             * is visible in METRICS / JSON / PROMETHEUS. */
+            int failures_after = e ? (int)e->failures + 1 : 1;
+            int delay_ms = pulse_jittered_interval_ms(
+                pulse_rejoin_backoff_ms(failures_after),
+                g_cfg.probe_jitter_frac, jitter_state);
+            metrics_note_seed_rejoin(&g_metrics, g_cfg.seeds[i],
+                                     (int64_t)time(NULL) * 1000,
+                                     delay_ms, now + delay_ms);
         }
+        pthread_mutex_unlock(&g_lock);
     }
 
     /* 2. Decide who to suspect this cycle. Fixed-timeout mode
@@ -1430,8 +1475,26 @@ static void probe_cycle(int cycle) {
         }
     }
     for (int i = 0; i < n_rejoins; i++) {
-        gossip_send_join(g_send_sock, &rejoins[i].addr, g_self_id,
-                         g_incarnation);
+        /* The send socket is connect()ed to the first seed, so when
+         * that seed is down the kernel reports the ICMP
+         * port-unreachable as ECONNREFUSED on the next sendto — and
+         * the call fails even though the datagram would have gone
+         * out fine a moment later: the error is consumed by the
+         * failed call, so failures strictly alternate with successes
+         * (a strace shows every other send to a dead seed failing).
+         * A re-JOIN is the one message whose delivery matters for
+         * merging — a lost probe is just a lost probe, but a lost
+         * re-JOIN leaves the cluster unmerged until the next retry,
+         * which the backoff may have pushed seconds away — so a
+         * failed send is retried once, immediately: the retry
+         * succeeds, and the rejoin is not silently lost to a stale
+         * ICMP error. The count and the backoff schedule stay
+         * honest: the re-JOIN did go out, just on the second
+         * syscall. */
+        if (gossip_send_join(g_send_sock, &rejoins[i].addr, g_self_id,
+                             g_incarnation) != 0)
+            gossip_send_join(g_send_sock, &rejoins[i].addr, g_self_id,
+                             g_incarnation);
         /* Logged only when the seed had been GC'd: a re-JOIN to a
          * SUSPECT/DEAD seed still in the table is routine. */
         if (rejoins[i].was_absent)
@@ -1694,15 +1757,20 @@ static void *prober_thread(void *arg) {
      * PING_REQ, the suspect-to-dead sweep and gossip rounds all run
      * faster, and it goes back to base the moment the table is
      * suspect-free. The cycle-based cadences inside probe_cycle (the
-     * ~5 s seed rejoin, the anti-entropy SYNC, the gossip round every
-     * other cycle) are counted in cycles, so they speed up in wall
-     * time along with the loop while the cluster is unstable — that
-     * is the point. */
+     * anti-entropy SYNC, the gossip round every other cycle) are
+     * counted in cycles, so they speed up in wall time along with
+     * the loop while the cluster is unstable — that is the point.
+     * The seed rejoin is wall-clock based since 0.56.0 (only its
+     * first retry still fires on the ~5 s cycle tick), so its
+     * backoff delays stay in real milliseconds whatever the
+     * probe interval is doing. */
     int current_interval_ms = g_cfg.probe_interval_ms;
     /* Jitter state (0.50.0): seeded once from time, pid and port, so
      * nodes that start together still draw different sequences and
      * drift out of lockstep within a few cycles. The state is local
-     * to this thread: nothing else draws from it. */
+     * to this thread: nothing else draws from it — probe_cycle
+     * takes a pointer to it for the seed-rejoin backoff draws
+     * (0.56.0), since it runs on this thread too. */
     uint32_t jitter_state =
         (uint32_t)(time(NULL) ^ ((uint32_t)getpid() << 16) ^
                    (uint32_t)g_cfg.port);
@@ -1740,7 +1808,7 @@ static void *prober_thread(void *arg) {
         ts.tv_nsec = (long)(sleep_ms % 1000) * 1000000L;
         nanosleep(&ts, NULL);
         if (g_stop) break;
-        probe_cycle(++cycle);
+        probe_cycle(++cycle, &jitter_state);
     }
     return NULL;
 }

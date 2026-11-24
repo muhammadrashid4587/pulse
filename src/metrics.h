@@ -70,6 +70,20 @@ typedef struct {
      * by the first re-JOIN, which sets this to that attempt's
      * time. */
     int64_t last_rejoin_unix_ms;
+    /* Seed-rejoin backoff (0.56.0): consecutive unanswered
+     * re-JOINs to this seed, the delay (ms) the node will wait
+     * before the next re-JOIN, and the monotonic-clock time that
+     * next retry is due (pulse_now_ms clock). The delay is the
+     * jittered value actually scheduled, so the operator sees
+     * the real wait, not the unjittered policy value. failures
+     * and next_delay_ms are 0 while the seed is ALIVE (the
+     * backoff is reset, not pending); next_due_ms is 0 then too.
+     * next_due_ms is scheduling state only — it is never
+     * printed, since a monotonic timestamp means nothing
+     * outside this process. */
+    int64_t failures;
+    int64_t next_delay_ms;
+    int64_t next_due_ms;
 } pulse_seed_rejoin_entry_t;
 
 typedef struct {
@@ -141,16 +155,35 @@ void metrics_note_dead(pulse_metrics_t *m, int64_t duration_ms);
 void metrics_note_refute(pulse_metrics_t *m);
 void metrics_note_join(pulse_metrics_t *m);
 /* A re-JOIN was sent to the seed seed_id, which was not ALIVE (the
- * ~5 s seed rejoin retry). Counted once per re-JOIN sent, whether
- * the seed was SUSPECT/DEAD in the table or already GC'd — and in
- * the per-seed breakdown too, so the total and the breakdown always
- * agree. seed_id must be a seed id ("host:port"); a NULL id counts
- * only the total. now_unix_ms is the wall-clock time of this
- * attempt, as unix milliseconds; it becomes the seed's
- * last_rejoin_unix_ms (0.55.0), so the breakdown also says when
- * each seed was last retried. */
+ * ~5 s seed rejoin retry, backing off per 0.56.0). Counted once per
+ * re-JOIN sent, whether the seed was SUSPECT/DEAD in the table or
+ * already GC'd — and in the per-seed breakdown too, so the total and
+ * the breakdown always agree. seed_id must be a seed id
+ * ("host:port"); a NULL id counts only the total. now_unix_ms is
+ * the wall-clock time of this attempt, as unix milliseconds; it
+ * becomes the seed's last_rejoin_unix_ms (0.55.0), so the breakdown
+ * also says when each seed was last retried. next_delay_ms is the
+ * delay (ms) the node will wait before the next re-JOIN to this
+ * seed — the backoff for the consecutive-failure count this attempt
+ * leaves behind, jittered by the caller — and next_due_ms is the
+ * monotonic-clock time that next retry is due (pulse_now_ms clock);
+ * both are recorded on the seed's entry, so the current backoff
+ * state is visible in METRICS / JSON / PROMETHEUS. */
 void metrics_note_seed_rejoin(pulse_metrics_t *m, const char *seed_id,
-                              int64_t now_unix_ms);
+                              int64_t now_unix_ms, int64_t next_delay_ms,
+                              int64_t next_due_ms);
+/* Find a seed's per-seed rejoin entry, or NULL when the seed was
+ * never re-joined (no entry is created by looking). The caller
+ * holds the metrics lock while it uses the pointer. */
+const pulse_seed_rejoin_entry_t *metrics_seed_rejoin_entry(
+    const pulse_metrics_t *m, const char *seed_id);
+/* The seed is ALIVE again: its backoff resets — failures,
+ * next_delay_ms and next_due_ms all go to 0, so the next outage
+ * starts again at the base interval instead of resuming at the
+ * cap. The count and last-rejoin timestamp are lifetime totals
+ * and are untouched. A seed with no entry is a no-op: the reset
+ * never creates one. */
+void metrics_reset_seed_backoff(pulse_metrics_t *m, const char *seed_id);
 /* A suspicion was refuted: a peer marked SUSPECT came back ALIVE.
  * duration_ms is how long it sat SUSPECT, or -1 when it was learned
  * from gossip and there is nothing local to measure. */
@@ -166,6 +199,7 @@ void metrics_note_rtt(pulse_metrics_t *m, int64_t rtt_ms);
  *   METRICS suspected=N dead=N refutes=N joins=N seed_rejoins=N
  *           seed_rejoins_by_seed=<id>=N,<id>=N|->
  *           seed_last_rejoin_ms_by_seed=<id>=N,<id>=N|->
+ *           seed_rejoin_backoff_ms_by_seed=<id>=N,<id>=N|->
  *           adaptive_fast_cycles=N suspect_refuted=N
  *           detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e]
  *           suspect_to_dead_ms mean=X max=Y samples=N
@@ -205,6 +239,22 @@ void metrics_seed_rejoins_json(const pulse_metrics_t *m, char *buf,
  * time of the seed's most recent re-JOIN, as unix milliseconds. */
 void metrics_seed_last_rejoin_json(const pulse_metrics_t *m, char *buf,
                                    size_t len);
+
+/* Format the per-seed seed-rejoin backoff as a bare comma list
+ * "id=N,id=N" (no spaces) for the METRICS line, or "-" when no
+ * seed has been re-joined yet. N is the delay (ms) the node will
+ * wait before the next re-JOIN to that seed — the current backoff
+ * (0.56.0): 0 while the seed is ALIVE (no backoff pending), the
+ * scheduled delay while it is down and being backed off. */
+void metrics_seed_rejoin_backoff_text(const pulse_metrics_t *m, char *buf,
+                                      size_t len);
+
+/* Format the per-seed seed-rejoin backoff as a JSON object
+ * "{\"id\":N,...}" for embedding in the JSON metrics object, or
+ * "{}" when no seed has been re-joined yet. N is the same delay
+ * in ms as the text form. */
+void metrics_seed_rejoin_backoff_json(const pulse_metrics_t *m, char *buf,
+                                      size_t len);
 
 /* Format the detection-latency histogram as a bare comma list
  * "a,b,c,d,e" (no brackets) for embedding in a JSON array. */

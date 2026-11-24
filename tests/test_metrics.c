@@ -19,7 +19,11 @@ int main(void) {
      * the latency groups that have no samples yet. */
     pulse_metrics_t m;
     metrics_init(&m);
-    char buf[512];
+    /* 1 KB, not 512: the METRICS line grows a per-seed field at a
+     * time (0.56.0's backoff breakdown pushed the two-seed line
+     * past 512), and a truncated line drops the latency groups at
+     * the end. */
+    char buf[1024];
     metrics_format(&m, buf, sizeof buf);
     CHECK(m.suspected == 0 && m.dead == 0 && m.refutes == 0 && m.joins == 0);
     CHECK(m.seed_rejoins == 0);
@@ -149,30 +153,61 @@ int main(void) {
     metrics_format(&m, buf, sizeof buf);
     CHECK(strstr(buf, "seed_rejoins_by_seed=-") != NULL);
     CHECK(strstr(buf, "seed_last_rejoin_ms_by_seed=-") != NULL);
+    CHECK(strstr(buf, "seed_rejoin_backoff_ms_by_seed=-") != NULL);
+    CHECK(metrics_seed_rejoin_entry(&m, "127.0.0.1:17101") == NULL);
     {
         char sbuf[128];
         metrics_seed_rejoins_json(&m, sbuf, sizeof sbuf);
         CHECK(strcmp(sbuf, "{}") == 0);
         metrics_seed_last_rejoin_json(&m, sbuf, sizeof sbuf);
         CHECK(strcmp(sbuf, "{}") == 0);
+        metrics_seed_rejoin_backoff_json(&m, sbuf, sizeof sbuf);
+        CHECK(strcmp(sbuf, "{}") == 0);
+        metrics_seed_rejoin_backoff_text(&m, sbuf, sizeof sbuf);
+        CHECK(strcmp(sbuf, "-") == 0);
     }
-    metrics_note_seed_rejoin(&m, "127.0.0.1:17101", 1700000100000LL);
-    metrics_note_seed_rejoin(&m, "127.0.0.1:17101", 1700000200000LL);
-    metrics_note_seed_rejoin(&m, "127.0.0.1:17103", 1700000150000LL);
+    /* The delay/due args are the backoff (0.56.0) the caller
+     * scheduled for the next retry: the first attempt leaves one
+     * consecutive failure behind and a 10 s wait, the second two
+     * failures and a 20 s wait. The due times are monotonic ms,
+     * opaque here — the test only checks they are recorded. */
+    metrics_note_seed_rejoin(&m, "127.0.0.1:17101", 1700000100000LL,
+                             10000, 15000);
+    metrics_note_seed_rejoin(&m, "127.0.0.1:17101", 1700000200000LL,
+                             20000, 35000);
+    metrics_note_seed_rejoin(&m, "127.0.0.1:17103", 1700000150000LL,
+                             10000, 12000);
     CHECK(m.seed_rejoins == 3);
     CHECK(m.seed_rejoin_seed_count == 2);
     CHECK(m.seed_rejoins_by_seed[0].count == 2);
     CHECK(strcmp(m.seed_rejoins_by_seed[0].id, "127.0.0.1:17101") == 0);
     CHECK(m.seed_rejoins_by_seed[0].last_rejoin_unix_ms == 1700000200000LL);
+    CHECK(m.seed_rejoins_by_seed[0].failures == 2);
+    CHECK(m.seed_rejoins_by_seed[0].next_delay_ms == 20000);
+    CHECK(m.seed_rejoins_by_seed[0].next_due_ms == 35000);
     CHECK(m.seed_rejoins_by_seed[1].count == 1);
     CHECK(strcmp(m.seed_rejoins_by_seed[1].id, "127.0.0.1:17103") == 0);
     CHECK(m.seed_rejoins_by_seed[1].last_rejoin_unix_ms == 1700000150000LL);
+    CHECK(m.seed_rejoins_by_seed[1].failures == 1);
+    CHECK(m.seed_rejoins_by_seed[1].next_delay_ms == 10000);
+    CHECK(m.seed_rejoins_by_seed[1].next_due_ms == 12000);
+    /* The lookup finds an entry by id and misses a seed that was
+     * never re-joined — it never creates one. */
+    CHECK(metrics_seed_rejoin_entry(&m, "127.0.0.1:17101") ==
+          &m.seed_rejoins_by_seed[0]);
+    CHECK(metrics_seed_rejoin_entry(&m, "127.0.0.1:17103") ==
+          &m.seed_rejoins_by_seed[1]);
+    CHECK(metrics_seed_rejoin_entry(&m, "127.0.0.1:17109") == NULL);
+    CHECK(metrics_seed_rejoin_entry(&m, NULL) == NULL);
+    CHECK(m.seed_rejoin_seed_count == 2);
     metrics_format(&m, buf, sizeof buf);
     CHECK(strstr(buf, "joins=1 seed_rejoins=3") != NULL);
     CHECK(strstr(buf, "seed_rejoins_by_seed=127.0.0.1:17101=2,"
                       "127.0.0.1:17103=1") != NULL);
     CHECK(strstr(buf, "seed_last_rejoin_ms_by_seed=127.0.0.1:17101="
                       "1700000200000,127.0.0.1:17103=1700000150000") != NULL);
+    CHECK(strstr(buf, "seed_rejoin_backoff_ms_by_seed=127.0.0.1:17101="
+                      "20000,127.0.0.1:17103=10000") != NULL);
     {
         char sbuf[128];
         metrics_seed_rejoins_json(&m, sbuf, sizeof sbuf);
@@ -186,13 +221,39 @@ int main(void) {
         metrics_seed_last_rejoin_text(&m, sbuf, sizeof sbuf);
         CHECK(strcmp(sbuf, "127.0.0.1:17101=1700000200000,"
                            "127.0.0.1:17103=1700000150000") == 0);
+        metrics_seed_rejoin_backoff_json(&m, sbuf, sizeof sbuf);
+        CHECK(strcmp(sbuf, "{\"127.0.0.1:17101\":20000,"
+                           "\"127.0.0.1:17103\":10000}") == 0);
+        metrics_seed_rejoin_backoff_text(&m, sbuf, sizeof sbuf);
+        CHECK(strcmp(sbuf, "127.0.0.1:17101=20000,127.0.0.1:17103=10000") == 0);
     }
     /* A NULL seed id counts only the total: the breakdown keeps
      * agreeing with it (the total can run ahead if a caller ever
      * has no id to give, but the node always passes one). */
-    metrics_note_seed_rejoin(&m, NULL, 1700000300000LL);
+    metrics_note_seed_rejoin(&m, NULL, 1700000300000LL, 0, 0);
     CHECK(m.seed_rejoins == 4);
     CHECK(m.seed_rejoin_seed_count == 2);
+    /* Backoff reset (0.56.0): the seed is ALIVE again, so its
+     * consecutive failures, scheduled delay and due time all go
+     * to 0 — the next outage starts again at the base interval —
+     * while the lifetime count and last-rejoin timestamp are
+     * untouched. A reset for a seed with no entry is a no-op
+     * and never creates one. */
+    metrics_reset_seed_backoff(&m, "127.0.0.1:17101");
+    CHECK(m.seed_rejoins_by_seed[0].failures == 0);
+    CHECK(m.seed_rejoins_by_seed[0].next_delay_ms == 0);
+    CHECK(m.seed_rejoins_by_seed[0].next_due_ms == 0);
+    CHECK(m.seed_rejoins_by_seed[0].count == 2);
+    CHECK(m.seed_rejoins_by_seed[0].last_rejoin_unix_ms == 1700000200000LL);
+    CHECK(m.seed_rejoins_by_seed[1].failures == 1);
+    CHECK(m.seed_rejoins_by_seed[1].next_delay_ms == 10000);
+    metrics_reset_seed_backoff(&m, "127.0.0.1:17109");
+    CHECK(m.seed_rejoin_seed_count == 2);
+    metrics_reset_seed_backoff(&m, NULL);
+    CHECK(m.seed_rejoin_seed_count == 2);
+    metrics_format(&m, buf, sizeof buf);
+    CHECK(strstr(buf, "seed_rejoin_backoff_ms_by_seed=127.0.0.1:17101=0,"
+                      "127.0.0.1:17103=10000") != NULL);
 
     /* A refuted suspicion: a peer that sat SUSPECT came back ALIVE.
      * Locally revived peers record how long the suspicion lasted;

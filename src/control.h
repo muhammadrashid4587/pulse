@@ -153,7 +153,14 @@
  *       most recent re-JOIN, as unix milliseconds, "-" under the
  *       same rule — so an operator can also tell when each seed
  *       was last retried; a seed that was never re-joined has no
- *       entry in either, never a fabricated zero.
+ *       entry in either, never a fabricated zero. Per-seed
+ *       rejoin backoff (0.56.0):
+ *       "seed_rejoin_backoff_ms_by_seed=<id>=N,<id>=N" rides
+ *       right after the last-rejoin timestamps — the delay in ms
+ *       the node will wait before the next re-JOIN to each seed,
+ *       "-" under the same rule; 0 while the seed is ALIVE (no
+ *       backoff pending), the scheduled delay while it is down
+ *       and being backed off.
  *       Per-member phi (0.44.0): after the METRICS line, one
  *       "PHI <id> <value>" line per member that has a phi — phi
  *       mode on, not self, heartbeat history with at least
@@ -189,7 +196,12 @@
  *       milliseconds — {"127.0.0.1:17101":1700000100000} — or {}
  *       when no seed has been re-joined yet, so a JSON consumer
  *       can tell when each seed was last retried; a seed that was
- *       never re-joined has no key in either. A top-level "peer_file" object carries the --peer-file
+ *       never re-joined has no key in either. The metrics object
+ *       also carries "seed_rejoin_backoff_ms" (0.56.0): the same
+ *       shape, but the delay in ms the node will wait before the
+ *       next re-JOIN to each seed — {"127.0.0.1:17101":10000} —
+ *       or {} when no seed has been re-joined yet; 0 while the
+ *       seed is ALIVE, the scheduled delay while it is down. A top-level "peer_file" object carries the --peer-file
  *       state (path, last_reload / last_mtime as unix seconds, and
  *       the counts from the last load), or null when the node runs
  *       without --peer-file. A top-level "watch" object (0.33.0)
@@ -238,7 +250,12 @@
  *       milliseconds — a seed never re-joined has no line, never
  *       a fabricated zero — so a scraper can tell a retry that is
  *       still firing from one that stopped when the cluster
- *       merged; the event ring capacity (pulse_watch_event_log_cap, 0.36.0)
+ *       merged; the delay before the next re-JOIN to each seed
+ *       rides as "pulse_seed_rejoin_backoff_ms" (0.56.0), one
+ *       labelled gauge sample per re-joined seed, in ms — 0
+ *       while the seed is ALIVE, the scheduled delay while it is
+ *       down — so a scraper can tell a seed still at the 5 s base
+ *       from one backed off to the 30 s cap; the event ring capacity (pulse_watch_event_log_cap, 0.36.0)
  *       as a gauge; the paused-stream count (pulse_watch_paused,
  *       0.37.0) as a gauge; the gossip digest size
  *       (pulse_gossip_digest_size, 0.41.0) as a gauge; the phi

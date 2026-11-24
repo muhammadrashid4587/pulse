@@ -236,6 +236,18 @@ static void metrics_hook(void *ctx, pulse_metrics_t *out) {
          * values, so the checks prove each seed carries its own
          * timestamp, not a shared one. */
         out->seed_rejoins_by_seed[0].last_rejoin_unix_ms = 1700000100000LL;
+        /* Per-seed rejoin backoff (0.56.0): the delay in ms before
+         * the next re-JOIN to each seed — 17101 is mid-backoff at
+         * 10 s after one failure, 17103 came back so its backoff
+         * reset to 0, so the checks prove each seed carries its
+         * own delay, not a shared one, and that 0 means healthy
+         * rather than missing. */
+        out->seed_rejoins_by_seed[0].failures = 1;
+        out->seed_rejoins_by_seed[0].next_delay_ms = 10000;
+        out->seed_rejoins_by_seed[0].next_due_ms = 60000;
+        out->seed_rejoins_by_seed[1].failures = 0;
+        out->seed_rejoins_by_seed[1].next_delay_ms = 0;
+        out->seed_rejoins_by_seed[1].next_due_ms = 0;
         snprintf(out->seed_rejoins_by_seed[1].id, PULSE_ID_LEN,
                  "127.0.0.1:17103");
         out->seed_rejoins_by_seed[1].count = 1;
@@ -769,6 +781,7 @@ int main(void) {
                  "METRICS suspected=0 dead=0 refutes=0 joins=0 "
                  "seed_rejoins=0 seed_rejoins_by_seed=- "
                  "seed_last_rejoin_ms_by_seed=- "
+                 "seed_rejoin_backoff_ms_by_seed=- "
                  "adaptive_fast_cycles=0 suspect_refuted=0 "
                  "detect_latency_ms mean=- max=- samples=0 "
                  "hist=[0,0,0,0,0] suspect_to_dead_ms mean=- max=- "
@@ -819,6 +832,10 @@ int main(void) {
      * breakdown, but unix-ms timestamps — {} here, since the
      * canned metrics are all zeros. */
     CHECK(strstr(reply, "\"seed_last_rejoin_ms\":{}") != NULL);
+    /* Per-seed rejoin backoff (0.56.0): the same shape again,
+     * but the delay in ms before the next re-JOIN to each seed
+     * — {} here, since the canned metrics are all zeros. */
+    CHECK(strstr(reply, "\"seed_rejoin_backoff_ms\":{}") != NULL);
     /* The event ring capacity (0.36.0) rides in the "watch"
      * object: no hook is set in this harness, so it reports the
      * default 128. */
@@ -890,6 +907,13 @@ int main(void) {
     CHECK(strstr(reply,
                  "\"seed_last_rejoin_ms\":{\"127.0.0.1:17101\":"
                  "1700000100000,\"127.0.0.1:17103\":1700000200000}") != NULL);
+    /* Per-seed rejoin backoff in JSON (0.56.0): the canned
+     * delays ride as an object keyed by seed, right after the
+     * last-rejoin timestamps — 17101 is mid-backoff at 10 s,
+     * 17103 reset to 0 when it came back. */
+    CHECK(strstr(reply,
+                 "\"seed_rejoin_backoff_ms\":{\"127.0.0.1:17101\":"
+                 "10000,\"127.0.0.1:17103\":0}") != NULL);
     {
         /* 16 KB, not 8 KB: the reply grows a family at a time
          * (0.55.0's pulse_seed_last_rejoin_ms pushed it past 8 KB
@@ -921,6 +945,16 @@ int main(void) {
         CHECK(strstr(preply,
                      "pulse_seed_last_rejoin_ms{seed=\"127.0.0.1:17103\"} "
                      "1700000200000\n") != NULL);
+        /* Per-seed rejoin backoff (0.56.0): the canned delays
+         * ride as one labelled gauge sample per seed, right after
+         * the last-rejoin gauge — 17101 is mid-backoff at 10 s,
+         * 17103 reset to 0 when it came back. */
+        CHECK(strstr(preply,
+                     "pulse_seed_rejoin_backoff_ms{seed=\"127.0.0.1:17101\"} "
+                     "10000\n") != NULL);
+        CHECK(strstr(preply,
+                     "pulse_seed_rejoin_backoff_ms{seed=\"127.0.0.1:17103\"} "
+                     "0\n") != NULL);
         CHECK(strstr(preply, "pulse_adaptive_fast_cycles_total 5\n") != NULL);
         CHECK(strstr(preply, "pulse_suspect_refuted_total 1\n") != NULL);
         /* Membership gauges from the canned table: 3 alive, 1 dead. */

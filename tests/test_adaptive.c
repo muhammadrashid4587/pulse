@@ -145,6 +145,19 @@ int main(void) {
         CHECK(pulse_jittered_interval_ms(100, 0.1, NULL) == 100);
     }
 
+    /* Seed-rejoin backoff (0.56.0): the delay before the next
+     * re-JOIN after N consecutive unanswered attempts — the base
+     * 5 s, doubling each time, capped at 30 s. */
+    CHECK(pulse_rejoin_backoff_ms(0) == 5000);
+    CHECK(pulse_rejoin_backoff_ms(-1) == 5000);
+    CHECK(pulse_rejoin_backoff_ms(-100) == 5000);
+    CHECK(pulse_rejoin_backoff_ms(1) == 10000);
+    CHECK(pulse_rejoin_backoff_ms(2) == 20000);
+    CHECK(pulse_rejoin_backoff_ms(3) == 30000); /* 40 s -> cap */
+    CHECK(pulse_rejoin_backoff_ms(4) == 30000);
+    CHECK(pulse_rejoin_backoff_ms(100) == 30000);
+    CHECK(pulse_rejoin_backoff_ms(1000000) == 30000);
+
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

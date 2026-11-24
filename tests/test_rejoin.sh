@@ -9,6 +9,9 @@
 #     leaving node 2 isolated forever.
 # Without the rejoin retry, step 3 never happens: node 1 has no reason
 # to contact node 2 and node 2 never contacts node 1 again.
+#  7. Backoff (0.56.0): a third node whose seed never comes up at all
+#     retries on a doubling schedule — 10 s, then 20 s — instead of
+#     every 5 s forever, and reports the scheduled delay per seed.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -149,6 +152,100 @@ if echo "$prom" | grep -qE 'pulse_seed_last_rejoin_ms\{seed="127\.0\.0\.1:17401"
 else
     note fail "PROMETHEUS gauges when the seed was last rejoined"
     echo "--- prom"; echo "$prom"
+fi
+
+# 6b. Backoff reset (0.56.0): node 2's seed is ALIVE now, so its
+# backoff reset — the delay reads 0 (no backoff pending), not the
+# 10 s it was scheduled at while the seed was down. A 0 here is a
+# healthy seed, not a missing one: the entry still exists, with
+# its count and last-rejoin timestamp intact.
+if echo "$metrics" | grep -q "seed_rejoin_backoff_ms_by_seed=127.0.0.1:17401=0"; then
+    note ok "METRICS resets the backoff to 0 once the seed is ALIVE"
+else
+    note fail "METRICS resets the backoff to 0 once the seed is ALIVE"
+    echo "--- metrics"; echo "$metrics"
+fi
+if echo "$json" | grep -q '"seed_rejoin_backoff_ms":{"127.0.0.1:17401":0}'; then
+    note ok "JSON resets the backoff to 0 once the seed is ALIVE"
+else
+    note fail "JSON resets the backoff to 0 once the seed is ALIVE"
+    echo "--- json"; echo "$json"
+fi
+if echo "$prom" | grep -q 'pulse_seed_rejoin_backoff_ms{seed="127.0.0.1:17401"} 0'; then
+    note ok "PROMETHEUS resets the backoff to 0 once the seed is ALIVE"
+else
+    note fail "PROMETHEUS resets the backoff to 0 once the seed is ALIVE"
+    echo "--- prom"; echo "$prom"
+fi
+
+# 7. Seed-rejoin backoff (0.56.0): node 3's seed (127.0.0.1:17409)
+# never comes up at all — nothing ever listens there. Its first
+# re-JOIN still fires on the ~5 s tick, but the next waits 10 s
+# and the one after that 20 s, instead of every 5 s forever.
+# Two observations prove the interval grows: after the first retry
+# the count is 1 and the scheduled delay is ~10 s (9–11 s with
+# jitter), and after the second the count is 2 and the delay is
+# ~20 s (18–22 s). Under the old fixed cadence the count would
+# already be 2 by the first observation and 5 by the second.
+# wait_backoff <timeout-s> <want-count> <want-lo-ms> <want-hi-ms>:
+# poll node 3 METRICS until seed_rejoins == want-count and the
+# dead seed's backoff delay is inside [lo, hi]. The window each
+# state holds is ~9 s (first retry to second) and ~18 s (second
+# to third), so the timeouts have ample margin either way.
+wait_backoff() {
+    local timeout="$1" want_n="$2" lo="$3" hi="$4" i m n b
+    for i in $(seq 1 $((timeout * 2))); do
+        m="$("$CTL" 127.0.0.1:18403 METRICS 2>/dev/null)"
+        n="$(echo "$m" | sed -n 's/.* seed_rejoins=\([0-9]*\) .*/\1/p')"
+        b="$(echo "$m" | sed -n 's/.*seed_rejoin_backoff_ms_by_seed=127\.0\.0\.1:17409=\([0-9]*\).*/\1/p')"
+        if [ "$n" = "$want_n" ] && [ -n "$b" ] && [ "$b" -ge "$lo" ] && [ "$b" -le "$hi" ]; then return 0; fi
+        sleep 0.5
+    done
+    return 1
+}
+
+mkdir -p "$TMP/n3"
+(cd "$TMP/n3" && exec "$BIN" --port 17403 --seed 127.0.0.1:17409 --control-port 18403 --dead-retention 2 > "$TMP/n3.log" 2>&1 & echo $! > "$TMP/n3.pid")
+
+if wait_backoff 20 1 9000 11000; then
+    note ok "dead seed: first retry schedules a ~10 s backoff (count 1)"
+else
+    note fail "dead seed: first retry schedules a ~10 s backoff (count 1)"
+    echo "--- n3 metrics"; "$CTL" 127.0.0.1:18403 METRICS 2>/dev/null
+fi
+
+if wait_backoff 40 2 18000 22000; then
+    note ok "dead seed: second retry schedules a ~20 s backoff (count 2)"
+else
+    note fail "dead seed: second retry schedules a ~20 s backoff (count 2)"
+    echo "--- n3 metrics"; "$CTL" 127.0.0.1:18403 METRICS 2>/dev/null
+fi
+
+# The backoff rides in all three views, under the same seed key,
+# at the ~20 s value the second observation just proved.
+n3metrics="$("$CTL" 127.0.0.1:18403 METRICS 2>/dev/null)"
+n3b="$(echo "$n3metrics" | sed -n 's/.*seed_rejoin_backoff_ms_by_seed=127\.0\.0\.1:17409=\([0-9]*\).*/\1/p')"
+if [ -n "$n3b" ] && [ "$n3b" -ge 18000 ] && [ "$n3b" -le 22000 ]; then
+    note ok "METRICS reports the dead seed's backoff delay"
+else
+    note fail "METRICS reports the dead seed's backoff delay"
+    echo "--- n3 metrics"; echo "$n3metrics"
+fi
+n3json="$("$CTL" 127.0.0.1:18403 JSON 2>/dev/null)"
+n3jb="$(echo "$n3json" | sed -n 's/.*"seed_rejoin_backoff_ms":{"127\.0\.0\.1:17409":\([0-9]*\)}.*/\1/p')"
+if [ -n "$n3jb" ] && [ "$n3jb" -ge 18000 ] && [ "$n3jb" -le 22000 ]; then
+    note ok "JSON reports the dead seed's backoff delay"
+else
+    note fail "JSON reports the dead seed's backoff delay"
+    echo "--- n3 json"; echo "$n3json"
+fi
+n3prom="$("$CTL" 127.0.0.1:18403 PROMETHEUS 2>/dev/null)"
+n3pb="$(echo "$n3prom" | sed -n 's/.*pulse_seed_rejoin_backoff_ms{seed="127\.0\.0\.1:17409"} \([0-9]*\).*/\1/p')"
+if [ -n "$n3pb" ] && [ "$n3pb" -ge 18000 ] && [ "$n3pb" -le 22000 ]; then
+    note ok "PROMETHEUS gauges the dead seed's backoff delay"
+else
+    note fail "PROMETHEUS gauges the dead seed's backoff delay"
+    echo "--- n3 prom"; echo "$n3prom"
 fi
 
 echo "test_rejoin: $PASS passed, $FAIL failed"

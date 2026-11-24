@@ -53,9 +53,12 @@ building block, not a production service mesh.
   `pulse-ctl` accepting `[::1]:port`. See "IPv6" below. IPv4 remains
   the default and is unchanged.
 - Seed rejoin: a node that starts while its seed is down re-sends
-  `JOIN` to the seed every ~5 s (logged as `REJOIN`) until the seed
+  `JOIN` to the seed (logged as `REJOIN`) until the seed
   answers, so a late-starting seed still merges the cluster instead
-  of leaving the node isolated forever. The retry is counted as
+  of leaving the node isolated forever. The first retry fires on
+  the ~5 s tick, then the retry backs off (0.56.0) — each
+  consecutive unanswered re-JOIN doubles the wait, up to a 30 s
+  cap. The retry is counted as
   `seed_rejoins` in `METRICS` and `JSON` and as
   `pulse_seed_rejoin_total` in `PROMETHEUS` (0.53.0), broken down
   per seed as `seed_rejoins_by_seed` in `METRICS` and `JSON` and
@@ -67,7 +70,14 @@ building block, not a production service mesh.
   `pulse_seed_last_rejoin_ms` gauge in `PROMETHEUS` (0.55.0), so
   an operator can see when each seed was last retried — a seed
   that was never re-joined has no entry anywhere, never a
-  fabricated zero. See "Seed rejoin" below.
+  fabricated zero. The retry backs off (0.56.0): each consecutive
+  unanswered re-JOIN doubles the wait — 10 s, 20 s, capped at
+  30 s, jittered — so a permanently dead seed is probed less and
+  less often, and the current wait rides per seed as
+  `seed_rejoin_backoff_ms_by_seed` in `METRICS`,
+  `"seed_rejoin_backoff_ms"` in `JSON`, and a labelled
+  `pulse_seed_rejoin_backoff_ms` gauge in `PROMETHEUS`, 0 while
+  the seed is ALIVE. See "Seed rejoin" below.
 - Membership persistence: a node saves the peers it knows to
   `<data-dir>/members` every ~5 s and on clean shutdown, and reloads
   them on startup, so a restarted node re-discovers its old peers
@@ -412,9 +422,9 @@ Commands:
 | `META <key=value>` | Set one annotation on this node itself: `OK <key=value>`. The change is gossiped with the next digest and persisted to the data dir, so it survives a restart. Bad syntax: `ERR invalid meta <arg>`; a ninth distinct key: `ERR meta full (max 8)`; missing argument: `ERR usage: META <key=value>`. |
 | `LEAVE <member-id>` | `OK <id>`: the member is dropped from the table and a tombstone is recorded, which is gossiped as DEAD so peers mark it DEAD and GC it on their own retention. A live member comes back — direct contact is proof of life, and gossip refutation bumps its incarnation — so `LEAVE` cannot declare a healthy node dead. Unknown member: `ERR unknown member <id>`; self: `ERR cannot leave self`; missing id: `ERR usage: LEAVE <member-id>`. |
 | `RELOAD` | Re-read `--peer-file` and merge it into the seed list — the same reload SIGHUP triggers, for an operator who cannot send the node a signal: `OK peers=N added=A dropped=D kept=K bad=B`. `peers` is how many peers the file lists; `added`/`dropped`/`kept` are the merge outcome (a still-ALIVE peer removed from the file is kept, never dropped on a file edit alone); `bad` is how many lines were skipped as malformed. No `--peer-file`: `ERR no peer file`. Unreadable file: `ERR cannot read peer file <path>: <reason>`, and the old list is kept. |
-| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N seed_rejoins=N seed_rejoins_by_seed=<id>=N,...|-> seed_last_rejoin_ms_by_seed=<id>=N,...|-> adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N probe_rtt_ms mean=X max=Y samples=N hist=[a,b,c,d,e] slow_peers=N peer_file=<path\|-> last_reload=<unix\|-> last_mtime=<unix\|-> pf_peers=<N\|-> pf_added=<N\|-> pf_dropped=<N\|-> pf_kept=<N\|-> pf_bad=<N\|-> watch_subscribers=<N> watch_sessions=<N> watch_delivered=<N> watch_filtered=<N> watch_dropped=<N> watch_event_log_cap=<N> gossip_digest_size=<N> phi_threshold=<N.NN>` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `seed_rejoins` (0.53.0) is how many re-JOINs this node has sent to seeds that were not ALIVE — the ~5 s retry while a seed is down, SUSPECT/DEAD in the table, or already GC'd; see "Seed-rejoin count" below. `seed_rejoins_by_seed` (0.54.0) is the same count broken down per seed — `127.0.0.1:17101=2,127.0.0.1:17103=1`, in first-rejoin order, `-` when no seed has been re-joined yet — so an operator can see which seed a node keeps rejoining instead of only how often the retry fires; the counts sum to `seed_rejoins`. `seed_last_rejoin_ms_by_seed` (0.55.0) is the wall-clock time of each seed's most recent re-JOIN, as unix milliseconds, in the same per-seed shape and order — `127.0.0.1:17101=1700000100000`, `-` when no seed has been re-joined yet — so an operator can tell when each seed was last retried, and whether a climbing count is still firing or stopped when the cluster merged; a seed that was never re-joined has no entry in either field, never a fabricated zero. `probe_rtt_ms` (0.48.0) is the round-trip time of every answered direct probe — mean/max/samples plus `hist`, counts in the buckets <1 ms, 1–4, 5–9, 10–49, ≥50 ms — so the mean cannot hide a slow tail; a probe never answered adds no sample, like the per-peer RTT it feeds; see "Probe RTT histogram" below. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. The peer-file fields (0.28.0) are the `--peer-file` state — the path, the wall-clock time of the last successful load or reload, the file's mtime at that load, and the counts from that load (the same numbers as the `PEERFILE RELOAD` log line) — and are all `-` when the node runs without `--peer-file`; see "Peer-file state in METRICS and JSON". `watch_subscribers` / `watch_sessions` (0.33.0) are how many `WATCH` streams are connected right now and how many sessions the node has served since startup; see "WATCH subscriber count in METRICS and JSON". `watch_delivered` / `watch_filtered` / `watch_dropped` (0.34.0) are the lifetime totals of EVENT lines streams sent, events streams consumed but skipped because their filter excluded them, and events streams lost to a gap in the bounded event ring; see "WATCH drop and delivery counts in METRICS and JSON". `watch_paused` (0.37.0) is how many `WATCH` streams are paused right now — a paused stream is still connected and still counts as a subscriber, it just is not consuming events; see "WATCH backpressure: pausing a stream". `watch_event_log_cap` (0.36.0) is how many events the `WATCH` event ring holds — the `--event-log-cap` the node started with, 128 by default — so an operator can see how far back a replay can reach. `gossip_digest_size` (0.41.0) is how many members one gossip round's digest covers — the `--gossip-digest-size` the node started with, 16 by default — so an operator can see whether the node is trading convergence speed for bandwidth. Per-member phi (0.44.0): after the `METRICS` line, one `PHI <id> <value>` line per member that has a phi — phi mode on, not self, heartbeat history with at least two intervals — the live phi at reply time, two decimals like `JSON` and `PROMETHEUS`, so the phi trio is complete; a node without `--phi-accrual` emits no `PHI` line at all, and a peer never heard from has none. `phi_threshold` (0.45.0) is the phi value at which a peer is suspected — the `--phi-threshold` the node started with, 8.0 by default, two decimals like `PROMETHEUS` — emitted always, whether or not `--phi-accrual` is on, so a text-protocol consumer can judge a rising `PHI` line against the threshold that actually fires the suspicion; see \"Phi suspicion threshold in METRICS\". |
-| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Each member also carries a `phi_history` (0.47.0) — the last 16 sampled phi values as `[[age_ms, phi], ...]` pairs, oldest first, `age_ms` the ms since this node started, `null` under the same rule as `phi` itself (`[]` when the peer has history but no probe cycle has sampled it yet), so a JSON consumer can see how a peer's suspicion evolved instead of only its live phi; a DEAD peer's history is frozen at the value it reached at suspicion. Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. The probe-RTT histogram (0.48.0) is `probe_rtt_ms` in the metrics object — `{"mean":...,"max":...,"samples":...,"hist":[...]}` over the buckets <1, 1–4, 5–9, 10–49, ≥50 ms, mean `null` with no samples; see "Probe RTT histogram" below. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning") — and `source`, where the peer came from (`seed`, `peer-file`, `discovered`, or `self`, the same provenance `PEERS` reports). The metrics object also carries `slow_peers`, the count of currently slow members. The metrics object also carries `seed_rejoins` (0.53.0), how many re-JOINs this node has sent to seeds that were not ALIVE — the ~5 s seed-rejoin retry; see "Seed-rejoin count" below. The metrics object also carries `seed_rejoins_by_seed` (0.54.0), the same count broken down per seed as an object — `{"127.0.0.1:17101":2}` — or `{}` when no seed has been re-joined yet, so a JSON consumer can see which seed a node keeps rejoining; the values sum to `seed_rejoins`. The metrics object also carries `seed_last_rejoin_ms` (0.55.0), the same shape but the wall-clock time of each seed's most recent re-JOIN as unix milliseconds — `{"127.0.0.1:17101":1700000100000}` — or `{}` when no seed has been re-joined yet, so a JSON consumer can tell when each seed was last retried; a seed that was never re-joined has no key in either object. A top-level `peer_file` object carries the `--peer-file` state (path, `last_reload` / `last_mtime` as unix seconds, and the counts from the last load), or `null` when the node runs without `--peer-file` (0.28.0). A top-level `watch` object carries `subscribers` (how many `WATCH` streams are connected right now) and `sessions` (how many `WATCH` sessions the node has served since startup) (0.33.0), plus the delivery / drop counts (0.34.0): `delivered` (EVENT lines sent in total), `filtered` (events skipped by a stream's filter), `dropped` (events lost to a gap in the event ring), `paused` (0.37.0, how many `WATCH` streams are paused right now), `event_log_cap` (0.36.0, how many events the `WATCH` ring holds — the `--event-log-cap` the node started with, 128 by default), and a `streams` array with the same three counts per currently-connected stream, keyed by its `session` number, plus `paused` per stream. A top-level `gossip_digest_size` (0.41.0) carries how many members one gossip round's digest covers — the `--gossip-digest-size` the node started with, 16 by default. A top-level `phi_threshold` (0.46.0) carries the phi value at which a peer is suspected — the `--phi-threshold` the node started with, 8.0 by default, two decimals like `METRICS` and `PROMETHEUS` — emitted always, whether or not `--phi-accrual` is on, so a JSON consumer can judge a rising per-member `phi` against the threshold that actually fires the suspicion; see "Phi suspicion threshold in JSON". See "WATCH subscriber count in METRICS and JSON", "WATCH drop and delivery counts in METRICS and JSON", and "WATCH backpressure: pausing a stream". Built for tooling that polls cluster state without scraping the text protocol. |
-| `PROMETHEUS` | The same values `METRICS` and `JSON` report, as Prometheus text exposition format, then `END`. Each metric family carries a `# HELP` and a `# TYPE` line: membership counts (`pulse_members_alive`, `pulse_members_suspect`, `pulse_members_dead`, `pulse_members_total`), `pulse_slow_peers`, `pulse_uptime_seconds` and `pulse_watch_subscribers` as gauges; the lifetime transition totals (`pulse_suspected_total`, `pulse_dead_total`, `pulse_refutes_total`, `pulse_joins_total`, `pulse_seed_rejoin_total` — one labelled sample per seed that has been re-joined, `pulse_seed_rejoin_total{seed="<id>"} N` (0.54.0), a seed never re-joined has no line and a node that re-joined nothing emits the HELP/TYPE pair with no samples — and the wall-clock time of each seed's most recent re-JOIN as a labelled gauge, `pulse_seed_last_rejoin_ms{seed="<id>"} <unix ms>` (0.55.0), under the same rule — a seed never re-joined has no line, never a fabricated zero, and a node that re-joined nothing emits the HELP/TYPE pair with no samples — so a scraper can alert on a seed whose last retry is getting stale, or tell a retry that is still firing from one that stopped when the cluster merged — `pulse_adaptive_fast_cycles_total`, `pulse_suspect_refuted_total`, `pulse_watch_sessions_total`, `pulse_watch_delivered_total`, `pulse_watch_filtered_total`, `pulse_watch_dropped_total`) as counters; the event ring capacity (`pulse_watch_event_log_cap`, 0.36.0) and the paused-stream count (`pulse_watch_paused`, 0.37.0) as gauges; the gossip digest size (`pulse_gossip_digest_size`, 0.41.0) as a gauge; the four latency groups as `mean` / `max` / `samples` gauges (`pulse_detect_latency_ms_mean`, `pulse_suspect_to_dead_ms_mean`, `pulse_refute_latency_ms_mean`, `pulse_probe_rtt_ms_mean`, and the matching `max` and `samples` — mean and max are 0 with no samples, since Prometheus has no null, and the `samples` gauge says whether the mean is real); the detection latency also as a real histogram (`pulse_detect_latency_ms_bucket{le="100"|"250"|"500"|"1000"|"+Inf"}`, plus `_sum` and `_count`, the same five buckets `METRICS` reports as `hist`), and the probe RTT also as a real histogram (`pulse_probe_rtt_ms_bucket{le="1"|"5"|"10"|"50"|"+Inf"}`, plus `_sum` and `_count`, the same five buckets `METRICS` reports as `probe_rtt_ms hist`) (0.48.0). Each member rides as a `pulse_member_info{member="<id>",state="<ALIVE\|SUSPECT\|DEAD>",source="<seed\|peer-file\|discovered\|self>"} 1` gauge, so a scraper can alert on a member's state without polling `JSON`. The last and mean direct-probe round-trip time per member ride as `pulse_member_rtt_ms{member="<id>"}` and `pulse_member_rtt_mean_ms{member="<id>"}` gauges (0.40.0), one line per member that has answered a probe — self and a never-heard-from peer have no line, and a dead member keeps its last RTT. The phi failure-detector value per member rides as a `pulse_member_phi{member=\"<id>\"}` gauge (0.42.0), one line per member that has a phi — phi mode on, not self, heartbeat history with at least two intervals — two decimals like `JSON`, so a scraper can alert on a rising phi before the threshold suspicion fires; a node without `--phi-accrual` emits no such line, and a dead member keeps its last-known phi until GC. The last 16 sampled phi values `JSON` reports as `phi_history` ride as `pulse_member_phi_history_latest{member=\"<id>\"}`, `pulse_member_phi_history_max{member=\"<id>\"}` and `pulse_member_phi_history_samples{member=\"<id>\"}` gauges (0.51.0), one line per member that has a phi — the latest is the most recent probe-cycle sample, not the live value recomputed at scrape time, the max is over the whole window, and the samples gauge says how many of the 16 slots are filled; a node without `--phi-accrual` emits no such lines, and a dead member keeps its frozen history gauges until GC. The same 16 sampled values also ride as a real histogram per member, `pulse_member_phi_history` (0.52.0) — cumulative buckets at `le="0.5"`, `"1"`, `"2"`, `"4"`, `"8"` and `"+Inf"`, plus `_sum` and `_count` — under the same rule as the gauges, so a scraper can compute quantiles of a peer's phi history instead of trusting the latest and max alone, and a dead member keeps its frozen histogram until GC. The suspicion threshold itself rides as a `pulse_phi_threshold` gauge (0.43.0) — the `--phi-threshold` the node started with, 8.0 by default — emitted always, so a scraper can alert on a rising phi against the threshold that actually fires the suspicion instead of hard-coding 8.0. The peer-file gauges (`pulse_peer_file_peers`, `pulse_peer_file_added`, `pulse_peer_file_dropped`, `pulse_peer_file_kept`, `pulse_peer_file_bad`, `pulse_peer_file_last_reload_seconds`, `pulse_peer_file_last_mtime_seconds`) are only emitted when the node runs with `--peer-file`: an absent metric is how Prometheus says "not applicable". This is the exposition format, not an HTTP endpoint — scrape it with `pulse-ctl`, or point a scraper at a tiny exporter that forwards the command. See "Prometheus exposition format (PROMETHEUS)" below. |
+| `METRICS` | One `METRICS suspected=N dead=N refutes=N joins=N seed_rejoins=N seed_rejoins_by_seed=<id>=N,...|-> seed_last_rejoin_ms_by_seed=<id>=N,...|-> seed_rejoin_backoff_ms_by_seed=<id>=N,...|-> adaptive_fast_cycles=N suspect_refuted=N detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e] suspect_to_dead_ms mean=X max=Y samples=N refute_latency_ms mean=X max=Y samples=N probe_rtt_ms mean=X max=Y samples=N hist=[a,b,c,d,e] slow_peers=N peer_file=<path\|-> last_reload=<unix\|-> last_mtime=<unix\|-> pf_peers=<N\|-> pf_added=<N\|-> pf_dropped=<N\|-> pf_kept=<N\|-> pf_bad=<N\|-> watch_subscribers=<N> watch_sessions=<N> watch_delivered=<N> watch_filtered=<N> watch_dropped=<N> watch_event_log_cap=<N> gossip_digest_size=<N> phi_threshold=<N.NN>` line, then `END`. `detect_latency_ms` is last-direct-contact to SUSPECT for suspicions this node detected itself; `suspect_to_dead_ms` is SUSPECT to DEAD. Mean/max are `-` when there are no samples. `hist` is the detection-latency histogram: counts of locally measured detection latencies in the buckets <100 ms, 100–249, 250–499, 500–999, ≥1000 ms, so the mean cannot hide a slow tail. Transitions learned from gossip bump the counts but add no latency sample, so samples can be smaller than the counts. `suspect_refuted` is SUSPECT to ALIVE transitions — suspicions that turned out wrong — and `refute_latency_ms` is how long those peers sat SUSPECT before coming back (mean/max/samples, `-` with no samples); a refutation learned from gossip bumps the count without a sample, and a DEAD peer coming back is a restart, not a refutation. `seed_rejoins` (0.53.0) is how many re-JOINs this node has sent to seeds that were not ALIVE — the ~5 s retry while a seed is down, SUSPECT/DEAD in the table, or already GC'd; see "Seed-rejoin count" below. `seed_rejoins_by_seed` (0.54.0) is the same count broken down per seed — `127.0.0.1:17101=2,127.0.0.1:17103=1`, in first-rejoin order, `-` when no seed has been re-joined yet — so an operator can see which seed a node keeps rejoining instead of only how often the retry fires; the counts sum to `seed_rejoins`. `seed_last_rejoin_ms_by_seed` (0.55.0) is the wall-clock time of each seed's most recent re-JOIN, as unix milliseconds, in the same per-seed shape and order — `127.0.0.1:17101=1700000100000`, `-` when no seed has been re-joined yet — so an operator can tell when each seed was last retried, and whether a climbing count is still firing or stopped when the cluster merged; a seed that was never re-joined has no entry in either field, never a fabricated zero. `seed_rejoin_backoff_ms_by_seed` (0.56.0) is the delay in ms the node will wait before the next re-JOIN to each seed, in the same per-seed shape and order — `127.0.0.1:17101=10000`, `-` when no seed has been re-joined yet — so an operator can tell a seed still at the 5 s base from one whose retry has backed off to the 30 s cap; 0 while the seed is ALIVE (no backoff pending, the retry resets when the seed comes back), the scheduled delay while it is down and being backed off. `probe_rtt_ms` (0.48.0) is the round-trip time of every answered direct probe — mean/max/samples plus `hist`, counts in the buckets <1 ms, 1–4, 5–9, 10–49, ≥50 ms — so the mean cannot hide a slow tail; a probe never answered adds no sample, like the per-peer RTT it feeds; see "Probe RTT histogram" below. `slow_peers` is how many members currently count as slow — mean probe RTT above `--slow-peer-rtt-ms` (see "Slow-peer warning"); 0 when the warning is disabled. The peer-file fields (0.28.0) are the `--peer-file` state — the path, the wall-clock time of the last successful load or reload, the file's mtime at that load, and the counts from that load (the same numbers as the `PEERFILE RELOAD` log line) — and are all `-` when the node runs without `--peer-file`; see "Peer-file state in METRICS and JSON". `watch_subscribers` / `watch_sessions` (0.33.0) are how many `WATCH` streams are connected right now and how many sessions the node has served since startup; see "WATCH subscriber count in METRICS and JSON". `watch_delivered` / `watch_filtered` / `watch_dropped` (0.34.0) are the lifetime totals of EVENT lines streams sent, events streams consumed but skipped because their filter excluded them, and events streams lost to a gap in the bounded event ring; see "WATCH drop and delivery counts in METRICS and JSON". `watch_paused` (0.37.0) is how many `WATCH` streams are paused right now — a paused stream is still connected and still counts as a subscriber, it just is not consuming events; see "WATCH backpressure: pausing a stream". `watch_event_log_cap` (0.36.0) is how many events the `WATCH` event ring holds — the `--event-log-cap` the node started with, 128 by default — so an operator can see how far back a replay can reach. `gossip_digest_size` (0.41.0) is how many members one gossip round's digest covers — the `--gossip-digest-size` the node started with, 16 by default — so an operator can see whether the node is trading convergence speed for bandwidth. Per-member phi (0.44.0): after the `METRICS` line, one `PHI <id> <value>` line per member that has a phi — phi mode on, not self, heartbeat history with at least two intervals — the live phi at reply time, two decimals like `JSON` and `PROMETHEUS`, so the phi trio is complete; a node without `--phi-accrual` emits no `PHI` line at all, and a peer never heard from has none. `phi_threshold` (0.45.0) is the phi value at which a peer is suspected — the `--phi-threshold` the node started with, 8.0 by default, two decimals like `PROMETHEUS` — emitted always, whether or not `--phi-accrual` is on, so a text-protocol consumer can judge a rising `PHI` line against the threshold that actually fires the suspicion; see \"Phi suspicion threshold in METRICS\". |
+| `JSON` | `STATUS`, `MEMBERS`, and `METRICS` combined into one machine-readable JSON object on a single line, then `END`. Member phi is a number when phi-accrual is on and the peer has heartbeat history, `null` otherwise (including self). Each member also carries a `phi_history` (0.47.0) — the last 16 sampled phi values as `[[age_ms, phi], ...]` pairs, oldest first, `age_ms` the ms since this node started, `null` under the same rule as `phi` itself (`[]` when the peer has history but no probe cycle has sampled it yet), so a JSON consumer can see how a peer's suspicion evolved instead of only its live phi; a DEAD peer's history is frozen at the value it reached at suspicion. Latency means are `null` when there are no samples; max is `0` then. The detection-latency histogram is `detect_latency_ms.hist`, an array of the same five bucket counts. The probe-RTT histogram (0.48.0) is `probe_rtt_ms` in the metrics object — `{"mean":...,"max":...,"samples":...,"hist":[...]}` over the buckets <1, 1–4, 5–9, 10–49, ≥50 ms, mean `null` with no samples; see "Probe RTT histogram" below. Each member also carries a `meta` object with its annotations (`{}` when it has none), and `rtt_ms` / `rtt_mean_ms` with its probe round-trip times (see "Probe RTT" below; both `null` until a probe has been answered, and always `null` for self), plus `slow` — `true` when the peer's mean RTT is above `--slow-peer-rtt-ms`, `false` otherwise (see "Slow-peer warning") — and `source`, where the peer came from (`seed`, `peer-file`, `discovered`, or `self`, the same provenance `PEERS` reports). The metrics object also carries `slow_peers`, the count of currently slow members. The metrics object also carries `seed_rejoins` (0.53.0), how many re-JOINs this node has sent to seeds that were not ALIVE — the ~5 s seed-rejoin retry; see "Seed-rejoin count" below. The metrics object also carries `seed_rejoins_by_seed` (0.54.0), the same count broken down per seed as an object — `{"127.0.0.1:17101":2}` — or `{}` when no seed has been re-joined yet, so a JSON consumer can see which seed a node keeps rejoining; the values sum to `seed_rejoins`. The metrics object also carries `seed_last_rejoin_ms` (0.55.0), the same shape but the wall-clock time of each seed's most recent re-JOIN as unix milliseconds — `{"127.0.0.1:17101":1700000100000}` — or `{}` when no seed has been re-joined yet, so a JSON consumer can tell when each seed was last retried; a seed that was never re-joined has no key in either object. The metrics object also carries `seed_rejoin_backoff_ms` (0.56.0), the same shape but the delay in ms the node will wait before the next re-JOIN to each seed — `{"127.0.0.1:17101":10000}` — or `{}` when no seed has been re-joined yet, so a JSON consumer can tell a seed still at the 5 s base from one backed off to the 30 s cap; 0 while the seed is ALIVE (no backoff pending), the scheduled delay while it is down. A top-level `peer_file` object carries the `--peer-file` state (path, `last_reload` / `last_mtime` as unix seconds, and the counts from the last load), or `null` when the node runs without `--peer-file` (0.28.0). A top-level `watch` object carries `subscribers` (how many `WATCH` streams are connected right now) and `sessions` (how many `WATCH` sessions the node has served since startup) (0.33.0), plus the delivery / drop counts (0.34.0): `delivered` (EVENT lines sent in total), `filtered` (events skipped by a stream's filter), `dropped` (events lost to a gap in the event ring), `paused` (0.37.0, how many `WATCH` streams are paused right now), `event_log_cap` (0.36.0, how many events the `WATCH` ring holds — the `--event-log-cap` the node started with, 128 by default), and a `streams` array with the same three counts per currently-connected stream, keyed by its `session` number, plus `paused` per stream. A top-level `gossip_digest_size` (0.41.0) carries how many members one gossip round's digest covers — the `--gossip-digest-size` the node started with, 16 by default. A top-level `phi_threshold` (0.46.0) carries the phi value at which a peer is suspected — the `--phi-threshold` the node started with, 8.0 by default, two decimals like `METRICS` and `PROMETHEUS` — emitted always, whether or not `--phi-accrual` is on, so a JSON consumer can judge a rising per-member `phi` against the threshold that actually fires the suspicion; see "Phi suspicion threshold in JSON". See "WATCH subscriber count in METRICS and JSON", "WATCH drop and delivery counts in METRICS and JSON", and "WATCH backpressure: pausing a stream". Built for tooling that polls cluster state without scraping the text protocol. |
+| `PROMETHEUS` | The same values `METRICS` and `JSON` report, as Prometheus text exposition format, then `END`. Each metric family carries a `# HELP` and a `# TYPE` line: membership counts (`pulse_members_alive`, `pulse_members_suspect`, `pulse_members_dead`, `pulse_members_total`), `pulse_slow_peers`, `pulse_uptime_seconds` and `pulse_watch_subscribers` as gauges; the lifetime transition totals (`pulse_suspected_total`, `pulse_dead_total`, `pulse_refutes_total`, `pulse_joins_total`, `pulse_seed_rejoin_total` — one labelled sample per seed that has been re-joined, `pulse_seed_rejoin_total{seed="<id>"} N` (0.54.0), a seed never re-joined has no line and a node that re-joined nothing emits the HELP/TYPE pair with no samples — and the wall-clock time of each seed's most recent re-JOIN as a labelled gauge, `pulse_seed_last_rejoin_ms{seed="<id>"} <unix ms>` (0.55.0), under the same rule — a seed never re-joined has no line, never a fabricated zero, and a node that re-joined nothing emits the HELP/TYPE pair with no samples — so a scraper can alert on a seed whose last retry is getting stale, or tell a retry that is still firing from one that stopped when the cluster merged — and the delay before the next re-JOIN to each seed as a labelled gauge, `pulse_seed_rejoin_backoff_ms{seed="<id>"} <ms>` (0.56.0), under the same rule, 0 while the seed is ALIVE — so a scraper can tell a seed still at the 5 s base from one backed off to the 30 s cap — `pulse_adaptive_fast_cycles_total`, `pulse_suspect_refuted_total`, `pulse_watch_sessions_total`, `pulse_watch_delivered_total`, `pulse_watch_filtered_total`, `pulse_watch_dropped_total`) as counters; the event ring capacity (`pulse_watch_event_log_cap`, 0.36.0) and the paused-stream count (`pulse_watch_paused`, 0.37.0) as gauges; the gossip digest size (`pulse_gossip_digest_size`, 0.41.0) as a gauge; the four latency groups as `mean` / `max` / `samples` gauges (`pulse_detect_latency_ms_mean`, `pulse_suspect_to_dead_ms_mean`, `pulse_refute_latency_ms_mean`, `pulse_probe_rtt_ms_mean`, and the matching `max` and `samples` — mean and max are 0 with no samples, since Prometheus has no null, and the `samples` gauge says whether the mean is real); the detection latency also as a real histogram (`pulse_detect_latency_ms_bucket{le="100"|"250"|"500"|"1000"|"+Inf"}`, plus `_sum` and `_count`, the same five buckets `METRICS` reports as `hist`), and the probe RTT also as a real histogram (`pulse_probe_rtt_ms_bucket{le="1"|"5"|"10"|"50"|"+Inf"}`, plus `_sum` and `_count`, the same five buckets `METRICS` reports as `probe_rtt_ms hist`) (0.48.0). Each member rides as a `pulse_member_info{member="<id>",state="<ALIVE\|SUSPECT\|DEAD>",source="<seed\|peer-file\|discovered\|self>"} 1` gauge, so a scraper can alert on a member's state without polling `JSON`. The last and mean direct-probe round-trip time per member ride as `pulse_member_rtt_ms{member="<id>"}` and `pulse_member_rtt_mean_ms{member="<id>"}` gauges (0.40.0), one line per member that has answered a probe — self and a never-heard-from peer have no line, and a dead member keeps its last RTT. The phi failure-detector value per member rides as a `pulse_member_phi{member=\"<id>\"}` gauge (0.42.0), one line per member that has a phi — phi mode on, not self, heartbeat history with at least two intervals — two decimals like `JSON`, so a scraper can alert on a rising phi before the threshold suspicion fires; a node without `--phi-accrual` emits no such line, and a dead member keeps its last-known phi until GC. The last 16 sampled phi values `JSON` reports as `phi_history` ride as `pulse_member_phi_history_latest{member=\"<id>\"}`, `pulse_member_phi_history_max{member=\"<id>\"}` and `pulse_member_phi_history_samples{member=\"<id>\"}` gauges (0.51.0), one line per member that has a phi — the latest is the most recent probe-cycle sample, not the live value recomputed at scrape time, the max is over the whole window, and the samples gauge says how many of the 16 slots are filled; a node without `--phi-accrual` emits no such lines, and a dead member keeps its frozen history gauges until GC. The same 16 sampled values also ride as a real histogram per member, `pulse_member_phi_history` (0.52.0) — cumulative buckets at `le="0.5"`, `"1"`, `"2"`, `"4"`, `"8"` and `"+Inf"`, plus `_sum` and `_count` — under the same rule as the gauges, so a scraper can compute quantiles of a peer's phi history instead of trusting the latest and max alone, and a dead member keeps its frozen histogram until GC. The suspicion threshold itself rides as a `pulse_phi_threshold` gauge (0.43.0) — the `--phi-threshold` the node started with, 8.0 by default — emitted always, so a scraper can alert on a rising phi against the threshold that actually fires the suspicion instead of hard-coding 8.0. The peer-file gauges (`pulse_peer_file_peers`, `pulse_peer_file_added`, `pulse_peer_file_dropped`, `pulse_peer_file_kept`, `pulse_peer_file_bad`, `pulse_peer_file_last_reload_seconds`, `pulse_peer_file_last_mtime_seconds`) are only emitted when the node runs with `--peer-file`: an absent metric is how Prometheus says "not applicable". This is the exposition format, not an HTTP endpoint — scrape it with `pulse-ctl`, or point a scraper at a tiny exporter that forwards the command. See "Prometheus exposition format (PROMETHEUS)" below. |
 | `WATCH [types] [ids] [STATE <list>] [FROM <seq>]` | A long-lived stream: `OK watching`, then one `SNAPSHOT <id> <incarnation> <ALIVE\|SUSPECT\|DEAD> <last-seen-ms\|-> <seed\|peer-file\|discovered\|self>` line per member (the `PEERS` shape), then `END`, then one `EVENT <seq> <JOINED\|SUSPECTED\|DEAD\|REVIVED\|DROPPED\|REFUTED> <id> <incarnation> <unix-seconds>` line per membership event as it happens, until the client closes the connection. Sequence numbers are 1-based and monotonic for the node's life; a slow consumer that falls more than the event log holds gets `ERR gap: events lost, reconnect` and must reconnect and re-read the snapshot. Runs on its own thread, so other commands keep answering while a client watches. An optional filter (0.30.0) narrows the stream server-side: a comma-separated type list (`WATCH JOINED,DEAD`), a comma-separated peer-id list (`WATCH 127.0.0.1:17102`), or both, in any order — the snapshot is narrowed by the id list too, a filtered-out event still consumes its sequence number so a filtered stream's numbers jump by design, and a bad filter is refused up front with `ERR invalid watch filter <reason>`. A state filter (0.39.0) narrows the stream by the member state an event leaves its member in (`WATCH STATE SUSPECT,DEAD`): JOINED, REVIVED and REFUTED land on ALIVE, SUSPECTED on SUSPECT, DEAD on DEAD, and DROPPED lands on no state at all so it never matches a state filter — the snapshot is narrowed by the member's current state too, and `STATE` composes with the type/id filters and `FROM`, in any order; a bad state is refused up front with `ERR invalid watch filter unknown member state <name>`. Replay / resume (0.31.0): `WATCH FROM <seq>` replays the buffered events from that seq, in order, after the snapshot and `END` and before live events, so a reconnecting client catches up instead of starting from now — `FROM 0` replays from the oldest buffered event, a `FROM` past the latest starts live, and a `FROM` below the oldest buffered event replays from the oldest instead, after a `GAP <requested> <oldest>` line; `FROM` composes with the type/id filters, in any order, and a bad `FROM` is refused up front. Heartbeat (0.32.0): a stream that has sent nothing for 5 s sends `HEARTBEAT <unix-seconds>`, so a client on a quiet cluster can tell "nothing happened" from "the connection died silently" — it carries no sequence number and is sent regardless of the filter, and any line sent resets the 5 s clock. Backpressure / pause (0.37.0): a slow consumer can stop the flow without closing the connection — `WATCH PAUSE <session>` on a separate connection pauses the stream with that session number (the number `JSON` reports per stream), and `WATCH RESUME <session>` resumes it; a paused stream stops consuming events, and on resume it replays what the ring still holds, or ends with `ERR gap` when the ring has scrolled past the resume point. Both are idempotent; a session that is not a live stream answers `ERR unknown watch session <n>`. Event-log persistence (0.38.0): the event log is saved to `<data-dir>/events` as events are recorded and loaded back on startup, so sequence numbers continue across a restart instead of resetting to 1 and a `WATCH FROM <seq>` after a restart can still replay pre-restart events. See "WATCH backpressure: pausing a stream" and "Event-log persistence across restarts" below. |
 | anything else | `ERR unknown command` |
 
@@ -501,18 +511,36 @@ it probes the seed, suspects it, marks it DEAD, garbage-collects it,
 and the seed — once it comes up — has no reason to contact the node
 at all. Two 1-node clusters, permanently.
 
-So every ~5 s the node re-sends `JOIN` to each seed that is not
-currently ALIVE in its membership table (logged as `REJOIN <id>`
-when the seed had already been garbage-collected). When the seed
-comes up it answers the `JOIN` with a full-table SYNC, both sides
-learn about each other, and the cluster merges. The seed is
-deliberately not re-added to the table by the retry itself: it comes
-back through the normal path (direct contact re-adds it), so a seed
-that never answers — wrong secret, wrong family, genuinely dead —
-stays garbage-collected instead of cycling back into the table.
-A seed that never comes up costs one UDP datagram per retry interval
-and nothing else; a seed of the other address family is skipped, and
-a seed that is already ALIVE is never re-joined.
+So the node re-sends `JOIN` to each seed that is not currently
+ALIVE in its membership table (logged as `REJOIN <id>` when the
+seed had already been garbage-collected). The first retry fires on
+the ~5 s tick, as before — then the retry backs off (0.56.0): each
+consecutive unanswered re-JOIN doubles the wait — 10 s, 20 s —
+up to a 30 s cap, jittered ±10% with the probe jitter, so a
+permanently dead seed is probed less and less often instead of
+every 5 s forever, while a seed that comes back is still re-joined
+within 30 s at worst, and within ~5 s when the outage is fresh:
+the backoff resets the moment the seed is ALIVE again, so the next
+outage starts again at the base interval instead of resuming at
+the cap. A failed re-JOIN send is retried once, immediately
+(0.56.0): the send socket is `connect()`ed to the first seed, so
+when that seed is down the kernel reports the ICMP
+port-unreachable as `ECONNREFUSED` on the next `sendto`, and the
+call fails even though the datagram would have gone out fine a
+moment later — the error is consumed by the failed call, so the
+immediate retry succeeds. Without the retry, a re-JOIN lost to
+that stale error would leave the cluster unmerged until the next
+retry, which the backoff may have pushed seconds away. When the
+seed comes up it answers the `JOIN` with a
+full-table SYNC, both sides learn about each other, and the
+cluster merges. The seed is deliberately not re-added to the
+table by the retry itself: it comes back through the normal path
+(direct contact re-adds it), so a seed that never answers — wrong
+secret, wrong family, genuinely dead — stays garbage-collected
+instead of cycling back into the table. A seed that never comes
+up costs one UDP datagram per retry interval and nothing else; a
+seed of the other address family is skipped, and a seed that is
+already ALIVE is never re-joined.
 
 Every re-JOIN the retry sends is counted as `seed_rejoins` in
 `METRICS` and `JSON` and as `pulse_seed_rejoin_total` in `PROMETHEUS`
@@ -528,9 +556,16 @@ labelled `pulse_seed_last_rejoin_ms` gauge in `PROMETHEUS` — so
 an operator can tell when each seed was last retried, and whether
 a climbing count is still firing or stopped when the cluster
 merged; a seed that was never re-joined has no entry anywhere,
-never a fabricated zero. A node whose seeds were up
-at startup reports 0, exactly like a node with no seeds at all.
-See "Seed-rejoin count" below.
+never a fabricated zero. Each seed also carries the delay the node
+will wait before its next re-JOIN, in milliseconds (0.56.0) —
+`seed_rejoin_backoff_ms_by_seed` in `METRICS`,
+`"seed_rejoin_backoff_ms"` in the `JSON` metrics object, and a
+labelled `pulse_seed_rejoin_backoff_ms` gauge in `PROMETHEUS` —
+so an operator can tell a seed still at the 5 s base from one
+whose retry has backed off to the 30 s cap, and a seed that came
+back (0, no backoff pending) from one still being retried. A node
+whose seeds were up at startup reports 0, exactly like a node
+with no seeds at all. See "Seed-rejoin count" below.
 
 ```sh
 # Terminal 1: start node 2 first — its seed is not up yet
@@ -564,8 +599,9 @@ that every node in the cluster can share:
 ```
 
 Each entry behaves exactly like a `--seed` flag: the node sends it
-a `JOIN` at startup, probes it, and re-sends `JOIN` every ~5 s
-while it is not ALIVE, so a peer that starts late still merges.
+a `JOIN` at startup, probes it, and re-sends `JOIN` while it is
+not ALIVE — first on the ~5 s tick, then backing off to 30 s
+(0.56.0) — so a peer that starts late still merges.
 The file can list every member including the node itself — joining
 yourself is harmless — and a node can combine `--seed` flags with a
 peer file; both feed the same seed list (at most 16 entries total).
@@ -601,7 +637,7 @@ kill -HUP $(pgrep -f 'pulse-node --port 17101')
 ```
 
 A peer newly listed in the file gets exactly the `--seed` treatment:
-it joins the seed list (so the ~5 s rejoin retry covers it while it
+it joins the seed list (so the seed-rejoin retry covers it while it
 is down), is added to the membership table, and gets a `JOIN` at
 once, so it merges as soon as it starts answering.
 
@@ -1666,9 +1702,9 @@ the fast cycles are counted as `adaptive_fast_cycles` in the
 `METRICS` text line and in `JSON` — the only trace that the prober
 ever sped up, since the current interval itself is not stored.
 
-The cycle-based cadences inside the probe cycle — the ~5 s seed
-rejoin, the anti-entropy SYNC, the gossip round every other cycle —
-are counted in cycles, so they speed up in wall time along with the
+The cycle-based cadences inside the probe cycle — the anti-entropy
+SYNC, the gossip round every other cycle — are counted in cycles,
+so they speed up in wall time along with the
 loop while the cluster is unstable. That is the point: a node that
 missed many digests heals faster, and a suspect is swept to DEAD
 sooner, exactly when the cluster needs it. The timeouts themselves
@@ -1696,8 +1732,8 @@ intervals are both jittered, and the `ADAPTIVE` log lines and the
 `adaptive_fast_cycles` count still see the unjittered interval: a
 jittered cycle never looks like a switch, and a stable cluster still
 logs nothing. The cycle-based cadences inside the probe cycle — the
-~5 s seed rejoin, the anti-entropy SYNC, the gossip round every
-other cycle — are counted in cycles, so they inherit the jitter too:
+anti-entropy SYNC, the gossip round every other cycle — are counted
+in cycles, so they inherit the jitter too:
 the whole cycle drifts, not just the sleep. The timeouts are
 untouched — `--ack-timeout-ms` and `--suspect-timeout-ms` are still
 wall-clock durations — and suspicion still comes from the fixed ack
@@ -1947,8 +1983,8 @@ The seed-rejoin retry is silent unless you read the log: a node
 waiting on a down seed logs one `REJOIN` line per retry only when
 the seed had already been garbage-collected, and nothing at all for
 a retry to a seed still SUSPECT/DEAD in the table. The count makes
-the retry visible without the log: every re-JOIN the ~5 s retry
-sends bumps `seed_rejoins` in `METRICS` and in the `JSON` metrics
+the retry visible without the log: every re-JOIN the seed-rejoin
+retry sends bumps `seed_rejoins` in `METRICS` and in the `JSON` metrics
 object, and `pulse_seed_rejoin_total` in `PROMETHEUS` — one count
 per re-JOIN, whether the seed was SUSPECT/DEAD in the table or
 already GC'd, so the count can run ahead of the `REJOIN` lines in
@@ -1991,7 +2027,7 @@ when empty), and `PROMETHEUS` carries one labelled gauge sample
 per re-joined seed — `pulse_seed_last_rejoin_ms{seed="<id>"} N`
 — where N is the wall-clock time of that seed's most recent
 re-JOIN, as unix milliseconds. Unix ms, not seconds: the retry
-fires every ~5 s, and second resolution would hide whether the
+fires every 5–30 s, and second resolution would hide whether the
 last attempt was this interval or the one before. A seed that was
 never re-joined has no entry anywhere — there is no time to
 report, so none is fabricated — entries appear in first-rejoin
@@ -2019,6 +2055,51 @@ one per retry interval, which is exactly the signal — a climbing
 count with no `JOIN` from the seed is a seed that is still down,
 while a count that stops climbing once the cluster merges is a
 seed that came up.
+
+Per-seed rejoin backoff (0.56.0): the count says how often each seed
+was retried and the timestamp says when, but neither says how long
+the node will wait before trying again — a seed retried every 5 s
+looks the same as one retried every 30 s until the next attempt
+lands. `METRICS` carries
+`seed_rejoin_backoff_ms_by_seed=<id>=N,<id>=N` right after the
+last-rejoin timestamps (`-` when no seed has been re-joined yet),
+`JSON` carries the same delays as
+`"seed_rejoin_backoff_ms":{"<id>":N}` in the metrics object (`{}`
+when empty), and `PROMETHEUS` carries one labelled gauge sample
+per re-joined seed — `pulse_seed_rejoin_backoff_ms{seed="<id>"} N`
+— where N is the delay in milliseconds the node will wait before
+the next re-JOIN to that seed: the backoff for its consecutive
+failures — 10 s after the first unanswered attempt, 20 s after
+the second, 30 s from the third on — jittered ±10%, so the value
+is the delay actually scheduled, not the unjittered policy value.
+0 while the seed is ALIVE: the backoff resets the moment the seed
+comes back, so a seed that merged reads 0 instead of the delay it
+was last scheduled at, and a later outage starts again at the
+base. A seed that was never re-joined has no entry anywhere,
+entries appear in first-rejoin order like the counts, and the
+delays are local measurement like the counts: never gossiped,
+never persisted, reset on restart.
+
+```sh
+./pulse-ctl 127.0.0.1:18402 METRICS
+# ... seed_rejoins=2 seed_rejoins_by_seed=127.0.0.1:17101=2 seed_last_rejoin_ms_by_seed=127.0.0.1:17101=1700000100000 seed_rejoin_backoff_ms_by_seed=127.0.0.1:17101=10000 ...
+./pulse-ctl 127.0.0.1:18402 JSON
+# ..."seed_rejoins":2,"seed_rejoins_by_seed":{"127.0.0.1:17101":2},"seed_last_rejoin_ms":{"127.0.0.1:17101":1700000100000},"seed_rejoin_backoff_ms":{"127.0.0.1:17101":10000}...
+./pulse-ctl 127.0.0.1:18402 PROMETHEUS
+# pulse_seed_rejoin_backoff_ms{seed="127.0.0.1:17101"} 10000
+```
+
+Two honest caveats. The delay is the scheduled wait, not a promise
+about the wall clock: the retry fires on the prober's cycle, so a
+loaded node can slip a cycle past the due time, and the jitter
+moves each scheduled delay by up to 10% either way — the value
+says which backoff step the seed is on, not the exact millisecond
+the next JOIN goes out. And a seed that comes back after a long
+outage can take up to the 30 s cap to be noticed: the backoff
+trades merge latency for a quieter retry, so a ward that needs a
+returning device noticed within seconds should keep the seed's
+outage short or restart the waiting node, which resets every
+backoff to the base.
 
 ## Tests
 
@@ -2069,7 +2150,14 @@ make test
   Answered probes feed a second histogram the same way (0.48.0) —
   mean/max probe RTT and buckets <1, 1–4, 5–9, 10–49, ≥50 ms, with
   boundary samples landing in the higher bucket and a `-1` adding
-  nothing.
+  nothing. Seed rejoins (0.53.0–0.55.0) count per re-JOIN sent and
+  break down per seed with a last-rejoin timestamp, and the backoff
+  (0.56.0) records the consecutive failures, the scheduled delay
+  and its due time on each entry — the formatters render the delay
+  as text and JSON (`-` / `{}` when nothing was ever re-joined) —
+  and a reset clears the failures, delay and due time while leaving
+  the lifetime count and timestamp untouched, never creating an
+  entry for a seed that was never re-joined.
 - `tests/test_adaptive.c`: unit tests for the adaptive probe interval
   — the default fast interval is half the base floored at 25 ms, no
   suspects means the base interval whatever the fast setting, suspects
@@ -2083,7 +2171,10 @@ make test
   same seed replays the same sequence and a different seed draws a
   different one, the fraction clamps at 0.9, a base at the floor never
   sleeps below 25 ms, a nonsense base falls back to the floor, and a
-  NULL state returns the base unchanged.
+  NULL state returns the base unchanged. Seed-rejoin backoff
+  (0.56.0): no failures means the 5 s base, one failure 10 s, two
+  20 s, three and beyond the 30 s cap, and a huge count never
+  overflows past the cap.
 - `tests/test_jitter.sh`: integration test for probe-interval jitter —
   a 2-node cluster converges with jitter on (one node at
   `--probe-jitter-frac 0.2`, the other at the 0.1 default), both
@@ -2175,6 +2266,11 @@ make test
   `"seed_last_rejoin_ms"` in `JSON`, and a labelled
   `pulse_seed_last_rejoin_ms` gauge in `PROMETHEUS`, each a
   13-digit unix-ms timestamp for the one seed that was re-joined.
+  The backoff (0.56.0) is checked the same way too: once the seed
+  is ALIVE its delay resets to 0 in all three views, and a third
+  node whose seed never comes up at all retries on the doubling
+  schedule — count 1 with a ~10 s delay, then count 2 with a
+  ~20 s delay — in `METRICS`, `JSON` and `PROMETHEUS` alike.
 - `tests/test_sync.sh`: integration test for anti-entropy — a 2-node
   cluster with `--sync-interval-ms 2000` converges, both nodes log a
   periodic `SYNC` line to each other within a few seconds, and both
@@ -2600,3 +2696,4 @@ Done in 0.50.0.
 - ~~Seed-rejoin count: every re-JOIN the ~5 s seed-rejoin retry sends is counted — one count per re-JOIN, whether the seed was SUSPECT/DEAD in the table or already garbage-collected — as `seed_rejoins` in `METRICS` and in the `JSON` metrics object (right after `joins`) and as `pulse_seed_rejoin_total` in `PROMETHEUS`, so an operator can see the retry firing, and how often, without reading the log; a node whose seeds were up at startup, or with no seeds, reports 0, and the count is local lifetime measurement for this process, never gossiped and reset on restart, like the other transition totals.~~ Done in 0.53.0.
 - ~~Per-seed seed-rejoin breakdown: the `seed_rejoins` total is broken down per seed — one entry per seed that has been re-joined, in first-rejoin order, the counts always summing to the total — as `seed_rejoins_by_seed=<id>=N,<id>=N` in `METRICS` (right after `seed_rejoins`, `-` when no seed has been re-joined yet), as `"seed_rejoins_by_seed":{"<id>":N}` in the `JSON` metrics object (`{}` when empty), and as one labelled sample per re-joined seed in `PROMETHEUS` — `pulse_seed_rejoin_total{seed="<id>"} N`, a seed never re-joined has no line and a node that re-joined nothing emits the HELP/TYPE pair with no samples — so an operator can see which seed a node keeps rejoining instead of only how often the retry fires; a seed that was never re-joined has no entry anywhere, and the breakdown is local lifetime measurement for this process, never gossiped and reset on restart, like the total.~~ Done in 0.54.0.
 - ~~Per-seed last rejoin timestamp: each seed that has been re-joined also carries the wall-clock time of its most recent re-JOIN, as unix milliseconds — `seed_last_rejoin_ms_by_seed=<id>=N,<id>=N` in `METRICS` (right after the breakdown, `-` when no seed has been re-joined yet), `"seed_last_rejoin_ms":{"<id>":N}` in the `JSON` metrics object (`{}` when empty), and one labelled gauge sample per re-joined seed in `PROMETHEUS` — `pulse_seed_last_rejoin_ms{seed="<id>"} N`, a seed never re-joined has no line and a node that re-joined nothing emits the HELP/TYPE pair with no samples — so an operator can tell when each seed was last retried, and whether a climbing count is still firing or stopped when the cluster merged; a seed that was never re-joined has no entry anywhere, never a fabricated zero, entries appear in first-rejoin order like the counts, and a later re-JOIN to the same seed moves only its timestamp; the timestamps are local lifetime measurement for this process, never gossiped and reset on restart, like the counts.~~ Done in 0.55.0.
+- ~~Seed-rejoin backoff: a seed that keeps not answering is re-JOINed on a doubling schedule instead of every ~5 s forever — the first retry still fires on the ~5 s tick, then each consecutive unanswered attempt doubles the wait (10 s, 20 s, capped at 30 s, jittered with the probe jitter), so a permanently dead seed is probed less and less often while a seed that comes back is still re-joined within 30 s at worst, and the backoff resets the moment the seed is ALIVE again, so the next outage starts again at the base interval; the current wait rides per seed as `seed_rejoin_backoff_ms_by_seed=<id>=N,<id>=N` in `METRICS` (right after the last-rejoin timestamps, `-` when no seed has been re-joined yet), as `"seed_rejoin_backoff_ms":{"<id>":N}` in the `JSON` metrics object (`{}` when empty), and as one labelled gauge sample per re-joined seed in `PROMETHEUS` — `pulse_seed_rejoin_backoff_ms{seed="<id>"} N`, a seed never re-joined has no line and a node that re-joined nothing emits the HELP/TYPE pair with no samples — 0 while the seed is ALIVE (no backoff pending), the scheduled delay while it is down; a seed that was never re-joined has no entry anywhere, and the backoff state is local lifetime measurement for this process, never gossiped and reset on restart, like the counts.~~ Done in 0.56.0.

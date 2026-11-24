@@ -718,11 +718,21 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
      * milliseconds — {"127.0.0.1:17101":1700000100000} — or {}
      * when no seed has been re-joined yet, so a JSON consumer can
      * tell when each seed was last retried, not just how often;
-     * a seed that was never re-joined has no key in either. */
+     * a seed that was never re-joined has no key in either.
+     * Per-seed rejoin backoff (0.56.0): the same shape again,
+     * but the delay in ms the node will wait before the next
+     * re-JOIN to each seed — {"127.0.0.1:17101":10000} — or {}
+     * when no seed has been re-joined yet; 0 while the seed is
+     * ALIVE (no backoff pending), the scheduled delay while it
+     * is down and being backed off, so a JSON consumer can tell
+     * a seed that is merely quiet from one whose retry has
+     * backed off to the 30 s cap. */
     char srjson[1408];
     metrics_seed_rejoins_json(&m, srjson, sizeof srjson);
     char srljson[1408];
     metrics_seed_last_rejoin_json(&m, srljson, sizeof srljson);
+    char srbjson[1408];
+    metrics_seed_rejoin_backoff_json(&m, srbjson, sizeof srbjson);
     /* WATCH subscribers (0.33.0): the same counts METRICS reports,
      * as a top-level "watch" object — how many WATCH streams are
      * connected right now, and how many sessions since startup —
@@ -770,7 +780,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
     w = snprintf(buf + used, sizeof buf - used,
         "],\"metrics\":{\"suspected\":%lld,\"dead\":%lld,\"refutes\":%lld,"
         "\"joins\":%lld,\"seed_rejoins\":%lld,\"seed_rejoins_by_seed\":%s,"
-        "\"seed_last_rejoin_ms\":%s,"
+        "\"seed_last_rejoin_ms\":%s,\"seed_rejoin_backoff_ms\":%s,"
         "\"adaptive_fast_cycles\":%lld,"
         "\"suspect_refuted\":%lld,\"slow_peers\":%d,"
         "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
@@ -784,6 +794,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"gossip_digest_size\":%d,\"phi_threshold\":%.2f}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
         (long long)m.joins, (long long)m.seed_rejoins, srjson, srljson,
+        srbjson,
         (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
         member_count_slow(&t, hooks->slow_rtt_threshold_ms),
@@ -957,6 +968,27 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             "pulse_seed_last_rejoin_ms{seed=\"%s\"} %lld\n",
             m.seed_rejoins_by_seed[i].id,
             (long long)m.seed_rejoins_by_seed[i].last_rejoin_unix_ms) == 0;
+    }
+    /* Per-seed rejoin backoff (0.56.0): the delay in ms this node
+     * will wait before the next re-JOIN to each seed, one labelled
+     * gauge sample per re-joined seed — so a scraper can tell a
+     * seed whose retry is still at the 5 s base from one whose
+     * retry has backed off to the 30 s cap, and a seed that came
+     * back (backoff reset, 0) from one still being retried. A
+     * seed never re-joined has no line, never a fabricated zero,
+     * and a node that re-joined nothing emits the HELP/TYPE pair
+     * with no samples, like the counter and the last-rejoin
+     * gauge above. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_seed_rejoin_backoff_ms Delay in ms before the "
+        "next re-JOIN to each seed: the current exponential "
+        "backoff, 0 while the seed is ALIVE.\n"
+        "# TYPE pulse_seed_rejoin_backoff_ms gauge\n") == 0;
+    for (int i = 0; i < m.seed_rejoin_seed_count; i++) {
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_seed_rejoin_backoff_ms{seed=\"%s\"} %lld\n",
+            m.seed_rejoins_by_seed[i].id,
+            (long long)m.seed_rejoins_by_seed[i].next_delay_ms) == 0;
     }
     ok &= prom_add(buf, sizeof buf, &used,
         "# HELP pulse_adaptive_fast_cycles_total Probe cycles that "

@@ -74,6 +74,30 @@ int pulse_adaptive_interval_ms(int base_ms, int fast_ms, int n_suspect);
  * semantics are untouched: the ack and suspect timeouts are still
  * wall-clock durations, and suspicion still comes from the fixed
  * timeout or from phi alone. */
+
+/* Seed-rejoin backoff (0.56.0): the delay before the next re-JOIN to
+ * a seed that keeps not answering. A permanently dead seed was
+ * re-JOINed every ~5 s forever — one UDP datagram per retry interval
+ * and nothing else, but a node waiting on three dead seeds still
+ * burns a steady trickle of pointless traffic, and a seed that
+ * comes back is noticed no faster for it. So the retry backs off:
+ * the first re-JOIN still fires on the ~5 s tick, then each
+ * consecutive unanswered attempt doubles the wait — 10 s, 20 s —
+ * up to a 30 s cap, so a dead seed is probed less and less often
+ * while a seed that comes back is still re-joined within 30 s at
+ * worst, and within ~5 s when the outage is fresh (the backoff
+ * resets the moment the seed is ALIVE again). The caller jitters
+ * the returned delay with pulse_jittered_interval_ms, so two nodes
+ * waiting on the same dead seed do not retry in lockstep either.
+ *
+ * pulse_rejoin_backoff_ms(failures):
+ *   failures  consecutive unanswered re-JOINs to this seed
+ *               (0 or negative = none yet: the base interval)
+ * Returns PULSE_REJOIN_BASE_MS * 2^failures, capped at
+ * PULSE_REJOIN_CAP_MS — 5 s, 10 s, 20 s, then 30 s forever. */
+#define PULSE_REJOIN_BASE_MS 5000
+#define PULSE_REJOIN_CAP_MS 30000
+int pulse_rejoin_backoff_ms(int failures);
 uint32_t pulse_jitter_next(uint32_t *state);
 int pulse_jittered_interval_ms(int base_ms, double jitter_frac,
                                uint32_t *state);
