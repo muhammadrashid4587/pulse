@@ -523,6 +523,11 @@ int member_count_slow(const member_table_t *t, int64_t slow_threshold_ms) {
     return n;
 }
 
+int64_t member_suspect_age_ms(const member_t *m, int64_t now) {
+    if (!m || m->state != MEMBER_SUSPECT) return -1;
+    return now - m->state_since_ms;
+}
+
 int member_mark_suspect(member_table_t *t, const char *id, int64_t now) {
     member_t *m = member_find(t, id);
     if (!m || m->state != MEMBER_ALIVE) return 0;

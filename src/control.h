@@ -172,6 +172,14 @@
  *       A node without --phi-accrual emits no PHI line at all,
  *       and a peer never heard from has none either; a dead
  *       member keeps its last-known phi until GC.
+ *       Suspicion age per member (0.58.0): after the PHI lines,
+ *       one "SUSPECT <id> <ms>" line per SUSPECT member — how
+ *       long the member has been suspected, in ms, the same
+ *       value JSON reports as "suspect_ms" and PROMETHEUS as
+ *       pulse_member_suspect_ms. The age grows while the member
+ *       sits SUSPECT and the member drops off the list the
+ *       moment it revives or goes DEAD; ALIVE and DEAD members
+ *       have no line, so an absent line says "not suspected".
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -181,7 +189,10 @@
  *       "meta": its annotations as a JSON object ({} when it has
  *       none), "rtt_ms" / "rtt_mean_ms" (null until a probe has been
  *       answered), "slow" (true when the peer's mean probe RTT is
- *       above --slow-peer-rtt-ms, false otherwise), "source" (where
+ *       above --slow-peer-rtt-ms, false otherwise), "suspect_ms"
+ *       (0.58.0: how long the member has been SUSPECT, in ms — null
+ *       unless the member is SUSPECT — so a consumer can judge how
+ *       close it is to the suspect timeout), "source" (where
  *       the peer came from: "seed", "peer-file", "discovered" or
  *       "self" — the same provenance PEERS reports, so a peer-file
  *       peer is distinguishable from a discovered one), and the
@@ -273,7 +284,14 @@
  *       (1, labelled by member, state and source). The last and
  *       mean probe RTT per member ride as "pulse_member_rtt_ms"
  *       and "pulse_member_rtt_mean_ms" gauges (0.40.0), one line
- *       per member that has answered a probe. The phi
+ *       per member that has answered a probe. How long each
+ *       SUSPECT member has been suspected rides as a
+ *       "pulse_member_suspect_ms" gauge (0.58.0), one line per
+ *       SUSPECT member — the same value JSON reports as
+ *       "suspect_ms" and METRICS as a SUSPECT line — so a scraper
+ *       can alert on a suspicion nearing the suspect timeout
+ *       instead of only on the DEAD transition; ALIVE and DEAD
+ *       members have no line. The phi
  *       failure-detector value per member rides as a
  *       "pulse_member_phi" gauge (0.42.0), one line per member
  *       that has a phi — phi mode on, not self, heartbeat history

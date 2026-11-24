@@ -236,6 +236,14 @@ int member_is_slow(const member_t *m, int64_t slow_threshold_ms);
 /* How many members in the table currently count as slow (see
  * member_is_slow). */
 int member_count_slow(const member_table_t *t, int64_t slow_threshold_ms);
+/* How long a member has been SUSPECT, in ms (0.58.0): now minus the
+ * time its current state started. -1 when the member is not
+ * SUSPECT — an ALIVE member has no suspicion to age, and a DEAD
+ * member's suspicion is over, so its age is not a suspicion age.
+ * The value is local measurement: for a suspicion learned from
+ * gossip it is the time since this node learned of it, not since
+ * the detecting node suspected it. */
+int64_t member_suspect_age_ms(const member_t *m, int64_t now);
 
 int member_count_state(const member_table_t *t, member_state_t state);
 /* Force-remove a member (operator action, e.g. the control plane's

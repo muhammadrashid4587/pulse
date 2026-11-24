@@ -235,6 +235,18 @@ int main(void) {
     CHECK(member_rtt_mean_ms(m3) == -1);
     CHECK(member_is_slow(m3, 1) == 0);
 
+    /* suspicion age (0.58.0): -1 unless the member is SUSPECT, then
+     * now minus when it went SUSPECT; the age resets when the member
+     * revives, and a DEAD member reports -1 — its suspicion is over. */
+    CHECK(member_suspect_age_ms(m3, now) == -1); /* ALIVE */
+    CHECK(member_mark_suspect(&t, "127.0.0.1:17103", now + 500) == 1);
+    CHECK(member_suspect_age_ms(m3, now + 500) == 0);
+    CHECK(member_suspect_age_ms(m3, now + 800) == 300);
+    CHECK(member_mark_alive(&t, "127.0.0.1:17103", &a3, 1, now + 800) == 1);
+    CHECK(member_suspect_age_ms(m3, now + 800) == -1); /* revived */
+    CHECK(member_suspect_age_ms(m2, now) == -1); /* DEAD */
+    CHECK(member_suspect_age_ms(NULL, now) == -1);
+
     /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
     CHECK(member_gossip_fanout(0) == 1);
     CHECK(member_gossip_fanout(1) == 1);

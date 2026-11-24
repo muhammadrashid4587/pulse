@@ -560,6 +560,29 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
             if (send_all(fd, philine) != 0) return;
         }
     }
+    /* Suspicion age per member (0.58.0): how long each SUSPECT
+     * member has been suspected, in ms, as one "SUSPECT <id> <ms>"
+     * line per SUSPECT member, under the same rule as JSON's
+     * "suspect_ms" — the age is now minus when the member's
+     * current state started, so it grows while the member sits
+     * SUSPECT and the member drops off the list the moment it
+     * revives or goes DEAD. ALIVE and DEAD members have no line:
+     * an absent line is how the text protocol says "not
+     * suspected". A text-protocol consumer judges the age against
+     * the suspect timeout the same way a JSON consumer judges
+     * "suspect_ms". */
+    {
+        int64_t now = pulse_now_ms();
+        for (int i = 0; i < t.count; i++) {
+            const member_t *mem = &t.members[i];
+            int64_t age = member_suspect_age_ms(mem, now);
+            if (age < 0) continue;
+            char susline[128];
+            snprintf(susline, sizeof susline, "\nSUSPECT %s %lld",
+                     mem->id, (long long)age);
+            if (send_all(fd, susline) != 0) return;
+        }
+    }
     send_all(fd, "\nEND\n");
 }
 
@@ -638,6 +661,20 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
             snprintf(rttmeanbuf, sizeof rttmeanbuf, "%lld",
                      (long long)(mem->rtt_sum_ms / mem->rtt_samples));
         }
+        /* Suspicion age (0.58.0): how long this member has been
+         * SUSPECT, in ms — now minus when its current state started.
+         * Null unless the member is SUSPECT: an ALIVE member has no
+         * suspicion to age, and a DEAD member's suspicion is over.
+         * A consumer judges it against the suspect timeout
+         * (--suspect-timeout-ms, 300 by default) to see how close
+         * the member is to being marked DEAD. */
+        char suspectbuf[32];
+        int64_t age = member_suspect_age_ms(mem, now);
+        if (age < 0)
+            snprintf(suspectbuf, sizeof suspectbuf, "null");
+        else
+            snprintf(suspectbuf, sizeof suspectbuf, "%lld",
+                     (long long)age);
         /* "source" (0.28.0) is where this node got the peer from —
          * "seed", "peer-file", "discovered" or "self" — the same
          * provenance PEERS reports, so a peer-file peer is
@@ -645,13 +682,15 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
-                     "\"rtt_mean_ms\":%s,\"slow\":%s,\"source\":\"%s\"}",
+                     "\"rtt_mean_ms\":%s,\"slow\":%s,\"suspect_ms\":%s,"
+                     "\"source\":\"%s\"}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
                      rttbuf, rttmeanbuf,
                      member_is_slow(mem, hooks->slow_rtt_threshold_ms)
                          ? "true"
                          : "false",
+                     suspectbuf,
                      peer_source_str(hooks, mem->id));
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
@@ -1270,6 +1309,28 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             "pulse_member_rtt_mean_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)member_rtt_mean_ms(&t.members[i])) == 0;
+    }
+    /* Suspicion age per member (0.58.0): how long each SUSPECT
+     * member has been suspected, in ms — the same value JSON
+     * reports as "suspect_ms" and METRICS as a SUSPECT line — as
+     * a gauge a scraper can alert on, one line per SUSPECT
+     * member. ALIVE and DEAD members have no line: an absent
+     * series is how Prometheus says "not suspected", the same as
+     * the RTT gauges say "never probed". The gauge grows while
+     * the member sits SUSPECT and disappears the moment it
+     * revives or goes DEAD, so a scraper can alert on a suspicion
+     * nearing the suspect timeout instead of only on the DEAD
+     * transition. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_suspect_ms How long a member has been "
+        "suspected, in ms, per member.\n"
+        "# TYPE pulse_member_suspect_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        int64_t age = member_suspect_age_ms(&t.members[i], now);
+        if (age < 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_suspect_ms{member=\"%s\"} %lld\n",
+            t.members[i].id, (long long)age) == 0;
     }
     /* Phi per member (0.42.0): the failure-detector value JSON
      * reports as "phi" per member, as a gauge a scraper can alert
