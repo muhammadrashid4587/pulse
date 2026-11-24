@@ -75,6 +75,26 @@ int gossip_send_join(int sock, const struct sockaddr_storage *to,
     return send_str(sock, to, buf);
 }
 
+/* Send a JOIN, retrying once immediately on failure (0.57.0). A JOIN
+ * is the one message whose delivery matters for merging: a lost probe
+ * is just a lost probe, but a lost JOIN leaves the peer unmerged until
+ * the next attempt, which the seed-rejoin backoff may have pushed
+ * seconds away. And the loss is not hypothetical: the send socket is
+ * connect()ed to the first seed, so when that seed is down the kernel
+ * reports the ICMP port-unreachable as ECONNREFUSED on the next
+ * sendto — and the call fails even though the datagram would have gone
+ * out fine a moment later. The error is consumed by the failed call,
+ * so failures strictly alternate with successes, and the immediate
+ * retry succeeds. A JOIN sent twice on the happy path is impossible:
+ * the retry only runs when the first send failed, so the datagram
+ * goes out exactly once either way. Returns 0 when a send succeeded,
+ * -1 when both attempts failed. */
+int gossip_send_join_retry(int sock, const struct sockaddr_storage *to,
+                           const char *from_id, uint32_t inc) {
+    if (gossip_send_join(sock, to, from_id, inc) == 0) return 0;
+    return gossip_send_join(sock, to, from_id, inc);
+}
+
 /* Append one " id:inc:state" entry to the digest buffer, with the
  * member's annotations when it has any: ";k=v,k=v" after the state
  * code. Returns 0 on success, -1 when the buffer is full. */

@@ -948,9 +948,19 @@ static void reload_peer_file_locked(pulse_reload_result_t *r) {
     }
     pthread_mutex_unlock(&g_lock);
 
+    /* A reload JOIN is a one-shot merge message like a re-JOIN, so
+     * it goes through the same one-retry send: the node has been
+     * running and sending for a while, so a stale ICMP
+     * port-unreachable from a dead first seed can be pending on the
+     * send socket and fail the first attempt even though the
+     * datagram would go out fine a moment later (see
+     * gossip_send_join_retry). Without the retry the peer still
+     * merges — it is in the seed list, so the rejoin retry covers
+     * it — but the backoff may have pushed that retry seconds away.
+     */
     for (int i = 0; i < n_joins; i++)
-        gossip_send_join(g_send_sock, &joins[i].addr, g_self_id,
-                         g_incarnation);
+        gossip_send_join_retry(g_send_sock, &joins[i].addr, g_self_id,
+                               g_incarnation);
     for (int i = 0; i < n_added; i++) {
         /* An added peer with no room never joined the seed list; the
          * summary line counts it as skipped, not added. */
@@ -1475,26 +1485,16 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
         }
     }
     for (int i = 0; i < n_rejoins; i++) {
-        /* The send socket is connect()ed to the first seed, so when
-         * that seed is down the kernel reports the ICMP
-         * port-unreachable as ECONNREFUSED on the next sendto — and
-         * the call fails even though the datagram would have gone
-         * out fine a moment later: the error is consumed by the
-         * failed call, so failures strictly alternate with successes
-         * (a strace shows every other send to a dead seed failing).
-         * A re-JOIN is the one message whose delivery matters for
-         * merging — a lost probe is just a lost probe, but a lost
-         * re-JOIN leaves the cluster unmerged until the next retry,
-         * which the backoff may have pushed seconds away — so a
-         * failed send is retried once, immediately: the retry
-         * succeeds, and the rejoin is not silently lost to a stale
-         * ICMP error. The count and the backoff schedule stay
-         * honest: the re-JOIN did go out, just on the second
-         * syscall. */
-        if (gossip_send_join(g_send_sock, &rejoins[i].addr, g_self_id,
-                             g_incarnation) != 0)
-            gossip_send_join(g_send_sock, &rejoins[i].addr, g_self_id,
-                             g_incarnation);
+        /* A re-JOIN is the one message whose delivery matters for
+         * merging, so it goes through the one-retry send: the send
+         * socket is connect()ed to the first seed, and a stale ICMP
+         * port-unreachable from a dead seed can fail the first
+         * attempt even though the datagram would go out fine a
+         * moment later (see gossip_send_join_retry). The count and
+         * the backoff schedule stay honest: the re-JOIN did go out,
+         * just on the second syscall. */
+        gossip_send_join_retry(g_send_sock, &rejoins[i].addr, g_self_id,
+                               g_incarnation);
         /* Logged only when the seed had been GC'd: a re-JOIN to a
          * SUSPECT/DEAD seed still in the table is routine. */
         if (rejoins[i].was_absent)
@@ -2289,7 +2289,18 @@ int main(int argc, char **argv) {
          * phi-mode no-history guard measures silence from here. */
         member_t *seed = member_find(&g_table, g_cfg.seeds[i]);
         if (seed) seed->state_since_ms = g_start_ms;
-        gossip_send_join(g_send_sock, &seed_addr, g_self_id, g_incarnation);
+        /* A startup JOIN is a one-shot merge message like a re-JOIN,
+         * so it goes through the same one-retry send: the socket is
+         * already connect()ed to the first seed, so when that seed is
+         * down its ICMP port-unreachable is pending by the time the
+         * loop reaches the second seed, and the second seed's JOIN
+         * would be lost to the stale error (see
+         * gossip_send_join_retry). The first seed's own JOIN cannot
+         * fail that way — no send has happened yet, so no ICMP is
+         * pending — but the retry is harmless there: it only runs
+         * when the first send failed. */
+        gossip_send_join_retry(g_send_sock, &seed_addr, g_self_id,
+                               g_incarnation);
     }
 
     /* The secret itself is never logged; only that a secret is on. */

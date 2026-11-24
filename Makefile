@@ -7,7 +7,7 @@ HEADERS = src/member.h src/gossip.h src/phi.h src/secret.h src/control.h src/met
 
 .PHONY: all test clean
 
-all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile test_control
+all: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_join_retry test_metrics test_persist test_adaptive test_meta test_peerfile test_control
 
 pulse-node: $(NODE_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $(NODE_SRC) $(LDFLAGS)
@@ -30,6 +30,9 @@ test_ipv6: tests/test_ipv6.c src/member.c src/phi.c src/gossip.c src/secret.c sr
 test_gossip: tests/test_gossip.c src/member.c src/phi.c src/gossip.c src/secret.c src/member.h src/phi.h src/gossip.h src/secret.h
 	$(CC) $(CFLAGS) -o $@ tests/test_gossip.c src/member.c src/phi.c src/gossip.c src/secret.c $(LDFLAGS)
 
+test_join_retry: tests/test_join_retry.c src/member.c src/phi.c src/gossip.c src/secret.c src/member.h src/phi.h src/gossip.h src/secret.h
+	$(CC) $(CFLAGS) -o $@ tests/test_join_retry.c src/member.c src/phi.c src/gossip.c src/secret.c $(LDFLAGS)
+
 test_metrics: tests/test_metrics.c src/metrics.c src/metrics.h
 	$(CC) $(CFLAGS) -o $@ tests/test_metrics.c src/metrics.c $(LDFLAGS)
 
@@ -48,12 +51,13 @@ test_peerfile: tests/test_peerfile.c src/member.c src/phi.c src/peerfile.c src/m
 test_control: tests/test_control.c src/control.c src/events.c src/member.c src/phi.c src/metrics.c src/control.h src/events.h src/member.h src/phi.h src/metrics.h
 	$(CC) $(CFLAGS) -o $@ tests/test_control.c src/control.c src/events.c src/member.c src/phi.c src/metrics.c $(LDFLAGS)
 
-test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile test_control
+test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_join_retry test_metrics test_persist test_adaptive test_meta test_peerfile test_control
 	./test_member
 	./test_phi
 	./test_secret
 	./test_ipv6
 	./test_gossip
+	./test_join_retry
 	./test_metrics
 	./test_persist
 	./test_adaptive
@@ -100,4 +104,4 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_prometheus.sh
 
 clean:
-	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_metrics test_persist test_adaptive test_meta test_peerfile test_control
+	rm -f pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossip test_join_retry test_metrics test_persist test_adaptive test_meta test_peerfile test_control

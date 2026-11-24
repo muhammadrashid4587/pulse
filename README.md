@@ -77,7 +77,14 @@ building block, not a production service mesh.
   `seed_rejoin_backoff_ms_by_seed` in `METRICS`,
   `"seed_rejoin_backoff_ms"` in `JSON`, and a labelled
   `pulse_seed_rejoin_backoff_ms` gauge in `PROMETHEUS`, 0 while
-  the seed is ALIVE. See "Seed rejoin" below.
+  the seed is ALIVE. A failed `JOIN` send is retried once,
+  immediately (0.56.0) — the send socket is `connect()`ed to the
+  first seed, so a stale ICMP port-unreachable from a dead seed
+  can fail a send that would have gone out fine a moment later —
+  and the same one-retry send covers the startup `JOIN` and a
+  peer-file reload's `JOIN`s too (0.57.0), so a one-shot merge
+  message is never lost to that stale error. See "Seed rejoin"
+  below.
 - Membership persistence: a node saves the peers it knows to
   `<data-dir>/members` every ~5 s and on clean shutdown, and reloads
   them on startup, so a restarted node re-discovers its old peers
@@ -530,7 +537,24 @@ call fails even though the datagram would have gone out fine a
 moment later — the error is consumed by the failed call, so the
 immediate retry succeeds. Without the retry, a re-JOIN lost to
 that stale error would leave the cluster unmerged until the next
-retry, which the backoff may have pushed seconds away. When the
+retry, which the backoff may have pushed seconds away. The same
+one-retry send covers the other two one-shot `JOIN`s (0.57.0):
+the startup `JOIN` to each seed — the socket is already
+`connect()`ed to the first seed when the loop runs, so when that
+seed is down its ICMP is pending by the time the loop reaches
+the second seed, and the second seed's `JOIN` would be lost to
+the stale error (the first seed's own `JOIN` cannot fail that
+way: no send has happened yet, so no ICMP is pending) — and a
+peer-file reload's `JOIN` to each newly listed peer, where the
+hazard is worse: the node has been running and sending for a
+while, so with a dead first seed a stale error is pending about
+half the time, and a lost reload `JOIN` would leave the new peer
+to the rejoin retry, which the backoff may have pushed up to
+30 s away. The retry is one shared send now, not three copies
+of the pattern: a `JOIN` still goes out exactly once on the
+happy path — the retry only runs when the first send failed —
+and a lost probe or gossip message is still just a lost probe,
+retried by the next round instead of a second syscall. When the
 seed comes up it answers the `JOIN` with a
 full-table SYNC, both sides learn about each other, and the
 cluster merges. The seed is deliberately not re-added to the
@@ -639,7 +663,14 @@ kill -HUP $(pgrep -f 'pulse-node --port 17101')
 A peer newly listed in the file gets exactly the `--seed` treatment:
 it joins the seed list (so the seed-rejoin retry covers it while it
 is down), is added to the membership table, and gets a `JOIN` at
-once, so it merges as soon as it starts answering.
+once, so it merges as soon as it starts answering. That `JOIN`
+goes through the same one-retry send as a re-JOIN (0.57.0): the
+node has been running and sending for a while, so a stale ICMP
+port-unreachable from a dead first seed can be pending on the
+send socket and fail the first attempt even though the datagram
+would go out fine a moment later — the immediate retry succeeds,
+so the new peer is not left to the rejoin retry, which the
+backoff may have pushed seconds away.
 
 A peer removed from the file is dropped from the seed list — but
 from the membership table only if it is currently unreachable. A
@@ -2697,3 +2728,4 @@ Done in 0.50.0.
 - ~~Per-seed seed-rejoin breakdown: the `seed_rejoins` total is broken down per seed — one entry per seed that has been re-joined, in first-rejoin order, the counts always summing to the total — as `seed_rejoins_by_seed=<id>=N,<id>=N` in `METRICS` (right after `seed_rejoins`, `-` when no seed has been re-joined yet), as `"seed_rejoins_by_seed":{"<id>":N}` in the `JSON` metrics object (`{}` when empty), and as one labelled sample per re-joined seed in `PROMETHEUS` — `pulse_seed_rejoin_total{seed="<id>"} N`, a seed never re-joined has no line and a node that re-joined nothing emits the HELP/TYPE pair with no samples — so an operator can see which seed a node keeps rejoining instead of only how often the retry fires; a seed that was never re-joined has no entry anywhere, and the breakdown is local lifetime measurement for this process, never gossiped and reset on restart, like the total.~~ Done in 0.54.0.
 - ~~Per-seed last rejoin timestamp: each seed that has been re-joined also carries the wall-clock time of its most recent re-JOIN, as unix milliseconds — `seed_last_rejoin_ms_by_seed=<id>=N,<id>=N` in `METRICS` (right after the breakdown, `-` when no seed has been re-joined yet), `"seed_last_rejoin_ms":{"<id>":N}` in the `JSON` metrics object (`{}` when empty), and one labelled gauge sample per re-joined seed in `PROMETHEUS` — `pulse_seed_last_rejoin_ms{seed="<id>"} N`, a seed never re-joined has no line and a node that re-joined nothing emits the HELP/TYPE pair with no samples — so an operator can tell when each seed was last retried, and whether a climbing count is still firing or stopped when the cluster merged; a seed that was never re-joined has no entry anywhere, never a fabricated zero, entries appear in first-rejoin order like the counts, and a later re-JOIN to the same seed moves only its timestamp; the timestamps are local lifetime measurement for this process, never gossiped and reset on restart, like the counts.~~ Done in 0.55.0.
 - ~~Seed-rejoin backoff: a seed that keeps not answering is re-JOINed on a doubling schedule instead of every ~5 s forever — the first retry still fires on the ~5 s tick, then each consecutive unanswered attempt doubles the wait (10 s, 20 s, capped at 30 s, jittered with the probe jitter), so a permanently dead seed is probed less and less often while a seed that comes back is still re-joined within 30 s at worst, and the backoff resets the moment the seed is ALIVE again, so the next outage starts again at the base interval; the current wait rides per seed as `seed_rejoin_backoff_ms_by_seed=<id>=N,<id>=N` in `METRICS` (right after the last-rejoin timestamps, `-` when no seed has been re-joined yet), as `"seed_rejoin_backoff_ms":{"<id>":N}` in the `JSON` metrics object (`{}` when empty), and as one labelled gauge sample per re-joined seed in `PROMETHEUS` — `pulse_seed_rejoin_backoff_ms{seed="<id>"} N`, a seed never re-joined has no line and a node that re-joined nothing emits the HELP/TYPE pair with no samples — 0 while the seed is ALIVE (no backoff pending), the scheduled delay while it is down; a seed that was never re-joined has no entry anywhere, and the backoff state is local lifetime measurement for this process, never gossiped and reset on restart, like the counts.~~ Done in 0.56.0.
+- ~~One-retry JOIN send on every one-shot `JOIN`: the 0.56.0 immediate retry on a failed re-JOIN send — the send socket is `connect()`ed to the first seed, so a stale ICMP port-unreachable from a dead seed can fail a send that would have gone out fine a moment later, and the error is consumed by the failed call so the retry succeeds — now covers the startup `JOIN` to each seed and a peer-file reload's `JOIN` to each newly listed peer as well, as one shared `gossip_send_join_retry` instead of three copies of the pattern, so a one-shot merge message is never lost to that stale error (the reload case matters most: with a dead first seed a stale error is pending about half the time, and the rejoin retry that would cover a lost reload `JOIN` can be backed off up to 30 s); a `JOIN` still goes out exactly once on the happy path, and the mechanism is covered by a unit test that reproduces the stale error on a connected socket and checks the plain send fails while the retry delivers exactly one datagram.~~ Done in 0.57.0.

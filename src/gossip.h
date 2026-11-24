@@ -123,6 +123,14 @@ int gossip_send_ping_req(int sock, const struct sockaddr_storage *to, uint32_t s
                          const char *target_id, const char *from_id);
 int gossip_send_join(int sock, const struct sockaddr_storage *to,
                      const char *from_id, uint32_t inc);
+/* Send a JOIN, retrying once immediately on failure (0.57.0): the
+ * send socket is connect()ed to the first seed, so a stale ICMP
+ * port-unreachable from a dead seed can fail a one-shot JOIN even
+ * though the datagram would go out fine a moment later — the error
+ * is consumed by the failed call, so the immediate retry succeeds.
+ * Returns 0 when a send succeeded, -1 when both attempts failed. */
+int gossip_send_join_retry(int sock, const struct sockaddr_storage *to,
+                           const char *from_id, uint32_t inc);
 /* Send a digest of up to max_entries table entries to a peer.
  * max_entries is the configured gossip digest size (1 to
  * PULSE_GOSSIP_ENTRIES_MAX, PULSE_GOSSIP_ENTRIES by default): a
