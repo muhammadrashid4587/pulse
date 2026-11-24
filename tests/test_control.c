@@ -83,7 +83,10 @@
  * line rides after the METRICS line for the peer with canned
  * phi history, and no PHI line at all for self, a peer with no
  * history, or a never-heard-from peer — and with phi mode off
- * there is no PHI line for anyone. */
+ * there is no PHI line for anyone. The phi suspicion threshold
+ * in METRICS (0.45.0) is covered here too: the METRICS line
+ * carries phi_threshold from the hook (5.50 in this harness),
+ * and with no hook it reports the default 8.00. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -738,7 +741,20 @@ int main(void) {
                  "pf_bad=0 watch_subscribers=0 watch_sessions=0 "
                  "watch_delivered=0 watch_filtered=0 watch_dropped=0 "
                  "watch_paused=0 watch_event_log_cap=128 "
-                 "gossip_digest_size=16\nEND\n") == 0);
+                 "gossip_digest_size=16 phi_threshold=5.50\nEND\n") == 0);
+
+    /* Phi suspicion threshold in METRICS (0.45.0): the fake hook
+     * reports 5.50, so the exact line above proves the value
+     * comes from the hook, not the default — and with no hook
+     * the line reports the default 8.00 instead of crashing on
+     * a NULL hook. */
+    {
+        double (*saved)(void *) = g_hooks.phi_threshold;
+        g_hooks.phi_threshold = NULL;
+        CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
+        CHECK(strstr(reply, "phi_threshold=8.00\n") != NULL);
+        g_hooks.phi_threshold = saved;
+    }
 
     /* JSON (0.28.0): the same state as a "peer_file" object, and
      * each member carries its "source" — the peer-file peer is

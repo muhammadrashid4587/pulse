@@ -521,6 +521,18 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
              ws.paused,
              event_log_cap_or_default(hooks),
              gossip_digest_size_or_default(hooks));
+    /* Phi suspicion threshold (0.45.0): the phi value at which a
+     * peer is suspected — the --phi-threshold the node started
+     * with, 8.0 by default, two decimals like PROMETHEUS's
+     * pulse_phi_threshold gauge. Emitted always, like the other
+     * config gauges (gossip_digest_size, watch_event_log_cap),
+     * whether or not --phi-accrual is on, so a text-protocol
+     * consumer can judge a rising PHI line against the threshold
+     * that actually fires the suspicion instead of hard-coding
+     * 8.0. */
+    used = strlen(line);
+    snprintf(line + used, sizeof line - used, " phi_threshold=%.2f",
+             phi_threshold_or_default(hooks));
     if (send_all(fd, line) != 0) return;
     /* Per-member phi (0.44.0): the failure-detector value JSON and
      * PROMETHEUS already report per member, as one "PHI <id>

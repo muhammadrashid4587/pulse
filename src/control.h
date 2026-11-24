@@ -74,6 +74,7 @@
  *           watch_subscribers=<N> watch_sessions=<N>
  *           watch_delivered=<N> watch_filtered=<N> watch_dropped=<N>
  *           watch_event_log_cap=<N> gossip_digest_size=<N>
+ *           phi_threshold=<N.NN>
  *       detect_latency_ms is last-direct-contact -> SUSPECT for
  *       suspicions this node detected itself (mean/max in ms, "-" when
  *       there are no samples); suspect_to_dead_ms is SUSPECT -> DEAD.
@@ -131,6 +132,14 @@
  *       bandwidth. JSON carries the same size as a top-level
  *       "gossip_digest_size", and PROMETHEUS as
  *       pulse_gossip_digest_size.
+ *       phi_threshold (0.45.0) is the phi value at which a peer is
+ *       suspected — the --phi-threshold the node started with,
+ *       8.0 by default, two decimals like PROMETHEUS's
+ *       pulse_phi_threshold gauge — so a text-protocol consumer
+ *       can judge a rising PHI line against the threshold that
+ *       actually fires the suspicion instead of hard-coding 8.0.
+ *       It is emitted always, like the other config gauges,
+ *       whether or not --phi-accrual is on.
  *       Per-member phi (0.44.0): after the METRICS line, one
  *       "PHI <id> <value>" line per member that has a phi — phi
  *       mode on, not self, heartbeat history with at least
