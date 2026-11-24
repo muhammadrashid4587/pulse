@@ -1695,6 +1695,11 @@ bump the table version, so a restarted node starts at `null` again
 until its next probe is answered, and two nodes can legitimately
 disagree about a third peer's RTT.
 
+Since 0.49.0 this works in phi-accrual mode too: the phi-mode
+probe records a pending entry marked `rtt_only`, so its ACK is
+matched and timed exactly like a fixed-timeout probe's — see
+"Probe RTT histogram" below.
+
 ## Probe RTT histogram
 
 The per-peer mean RTT hides the tail: a peer that usually answers
@@ -1745,12 +1750,19 @@ all bucket 0; an ACK that arrives via an indirect probe adds a
 sample that is an upper bound on the direct RTT, not a direct
 measurement; and the histogram is local measurement — never
 gossiped, never persisted, and it does not bump the table version
-— so a restarted node starts at zero samples again. And in
-phi-accrual mode the histogram stays empty: the prober sends the
-PING but creates no pending entry (suspicion comes from phi, not
-from a probe timeout, so there is nothing to escalate), so an ACK
-matches no pending probe and no RTT sample is ever recorded — the
-per-member `rtt_ms` is `null` there for the same reason.
+— so a restarted node starts at zero samples again. In
+phi-accrual mode the histogram used to stay empty: the prober sent
+the PING but created no pending entry (suspicion comes from phi,
+not from a probe timeout, so there was nothing to escalate), so an
+ACK matched no pending probe and no RTT sample was ever recorded
+— the per-member `rtt_ms` was `null` there for the same reason.
+Since 0.49.0 the phi-mode probe creates a pending entry marked
+`rtt_only` — it exists only to match the ACK and measure the RTT,
+never to escalate or suspect — so the histogram and the per-member
+RTT are populated in phi mode exactly as in the fixed-timeout mode,
+and suspicion still comes from phi alone. (In phi mode there are
+no indirect probes, so the indirect-ACK caveat above never applies
+there: every phi-mode sample is a direct measurement.)
 
 ## Slow-peer warning
 
@@ -2334,3 +2346,4 @@ make test
 - ~~Phi suspicion threshold in JSON: the phi value at which a peer is suspected now also rides in `JSON` as a top-level `"phi_threshold":N.NN` number, after `"gossip_digest_size"` — the `--phi-threshold` the node started with, 8.0 by default, two decimals like `METRICS` and the `pulse_phi_threshold` gauge in `PROMETHEUS` — emitted always, like the other config fields, whether or not `--phi-accrual` is on, so a JSON consumer can judge a rising per-member `"phi"` against the threshold that actually fires the suspicion instead of hard-coding 8.0.~~ Done in 0.46.0.
 - ~~Phi history in JSON: each member in `JSON` carries a `"phi_history"` — the last 16 phi values sampled for that peer, as `[[age_ms, phi], ...]` pairs oldest first, `age_ms` the ms since the node started — sampled once per probe cycle for ALIVE and SUSPECT peers and frozen when the peer goes DEAD, so an operator can see how a peer's suspicion evolved (near 0 while it answers, climbing past the threshold as it goes quiet) instead of only its live `"phi"`; `null` under the same rule as `"phi"` itself (phi-accrual off, self, or no heartbeat history), `[]` before the first sample, and polling `JSON` never moves the history it reads.~~ Done in 0.47.0.
 - ~~Probe RTT histogram: every answered direct probe adds one sample to a global RTT histogram — mean/max/samples plus five buckets (<1, 1–4, 5–9, 10–49, ≥50 ms), a sample exactly at a bound landing in the higher bucket like the detection-latency histogram — exposed as `probe_rtt_ms` at the end of the `METRICS` line, as a `probe_rtt_ms` object in the `JSON` metrics object, and as a real `pulse_probe_rtt_ms` histogram (cumulative buckets, `_sum`, `_count`) with mean/max/samples gauges in `PROMETHEUS`, so the mean RTT cannot hide a slow tail; a probe never answered adds no sample, and the histogram is local measurement, never gossiped or persisted.~~ Done in 0.48.0.
+- ~~Probe RTT in phi-accrual mode: the phi-mode probe creates a pending entry marked `rtt_only` — it exists only to match the ACK and measure the round-trip time, never to escalate to an indirect probe or suspect on age — so the per-member `rtt_ms` / `rtt_mean_ms` and the probe-RTT histogram are populated in `--phi-accrual` mode exactly as in the fixed-timeout mode, feeding the same `METRICS` / `JSON` / `PROMETHEUS` sample path; unanswered phi-mode probes leave stale entries that the probe cycle sweeps after twice the ack timeout, so the 32 pending slots never fill, and suspicion still comes from phi alone.~~ Done in 0.49.0.

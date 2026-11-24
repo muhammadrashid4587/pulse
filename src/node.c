@@ -107,6 +107,12 @@ typedef struct {
     struct sockaddr_storage target_addr;
     int64_t sent_ms;
     int indirect_tried;
+    /* rtt_only (0.49.0): in phi-accrual mode the pending entry exists
+     * only to match the ACK and measure the probe RTT — suspicion
+     * comes from phi, not from a probe timeout, so the entry is never
+     * escalated to an indirect probe and never suspects on age. The
+     * fixed-timeout path leaves this 0. */
+    int rtt_only;
     int active;
 } pending_probe_t;
 
@@ -1049,9 +1055,14 @@ static void probe_cycle(int cycle) {
     }
 
     /* 1. Probe a random peer. In phi-accrual mode the PING still goes
-     * out (it is the stimulus that produces heartbeats), but no pending
-     * entry is created: suspicion comes from phi, not from a probe
-     * timeout, so there is nothing to escalate. */
+     * out (it is the stimulus that produces heartbeats), and since
+     * 0.49.0 a pending entry is created too — marked rtt_only, so it
+     * exists only to match the ACK and measure the probe RTT. Before
+     * 0.49.0 no entry was created, so ACKs matched nothing and the
+     * per-peer RTT and the RTT histogram stayed empty in phi mode.
+     * The entry is never escalated: step 2's phi branch only sweeps
+     * stale rtt_only entries, it never suspects on them, so the
+     * failure-detection path is unchanged. */
     char peer_id[PULSE_ID_LEN];
     struct sockaddr_storage peer_addr;
     int have_peer = 0;
@@ -1069,25 +1080,27 @@ static void probe_cycle(int cycle) {
         int send = 0;
         pthread_mutex_lock(&g_lock);
         seq = g_seq++;
-        if (g_cfg.phi_accrual) {
+        for (int i = 0; i < MAX_PENDING; i++) {
+            if (!g_pending[i].active) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot >= 0) {
+            g_pending[slot].active = 1;
+            g_pending[slot].seq = seq;
+            snprintf(g_pending[slot].target_id,
+                     sizeof g_pending[slot].target_id, "%s", peer_id);
+            g_pending[slot].target_addr = peer_addr;
+            g_pending[slot].sent_ms = now;
+            g_pending[slot].indirect_tried = 0;
+            g_pending[slot].rtt_only = g_cfg.phi_accrual ? 1 : 0;
             send = 1;
-        } else {
-            for (int i = 0; i < MAX_PENDING; i++) {
-                if (!g_pending[i].active) {
-                    slot = i;
-                    break;
-                }
-            }
-            if (slot >= 0) {
-                g_pending[slot].active = 1;
-                g_pending[slot].seq = seq;
-                snprintf(g_pending[slot].target_id,
-                         sizeof g_pending[slot].target_id, "%s", peer_id);
-                g_pending[slot].target_addr = peer_addr;
-                g_pending[slot].sent_ms = now;
-                g_pending[slot].indirect_tried = 0;
-                send = 1;
-            }
+        } else if (g_cfg.phi_accrual) {
+            /* No free slot: still send the PING — in phi mode it is
+             * the heartbeat stimulus, and losing it would stall
+             * failure detection. Only the RTT sample is lost. */
+            send = 1;
         }
         pthread_mutex_unlock(&g_lock);
         if (send)
@@ -1185,6 +1198,19 @@ static void probe_cycle(int cycle) {
                     n_suspect++;
                 }
             }
+        }
+        /* Sweep stale rtt_only pending entries (0.49.0): an
+         * unanswered phi-mode probe leaves an entry that no ACK will
+         * ever close, and without a sweep the 32 slots would fill
+         * and later probes would lose their RTT sample. The window
+         * is the same 2 x ack timeout the fixed path keeps a pending
+         * entry for a late ACK, so an ACK inside it still counts;
+         * expiring one adds no sample, starts no indirect probe and
+         * suspects nobody — the failure-detection path is untouched. */
+        for (int i = 0; i < MAX_PENDING; i++) {
+            if (g_pending[i].active && g_pending[i].rtt_only &&
+                now - g_pending[i].sent_ms >= 2 * g_cfg.ack_timeout_ms)
+                g_pending[i].active = 0;
         }
     } else {
         for (int i = 0; i < MAX_PENDING; i++) {
