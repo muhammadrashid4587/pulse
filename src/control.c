@@ -1203,6 +1203,68 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             "pulse_member_phi{member=\"%s\"} %.2f\n",
             t.members[i].id, phi_value(&t.members[i].phi, now)) == 0;
     }
+    /* Phi history per member (0.51.0): the last 16 sampled phi
+     * values JSON reports as "phi_history", as gauges a scraper
+     * can alert on — the latest sampled phi (the most recent
+     * probe-cycle sample, not the live value recomputed at scrape
+     * time), the max over the window, and how many samples the
+     * window holds (1-16). Same rule as pulse_member_phi: phi
+     * mode on, not self, heartbeat history with at least
+     * PULSE_PHI_MIN_SAMPLES intervals — and at least one sample
+     * taken, so a peer with history but no sample yet has no
+     * lines; a member that goes DEAD keeps its frozen history,
+     * so its gauges stay at the last-known values until GC, like
+     * the live phi gauge. The samples gauge says whether the
+     * latest/max are real, the same convention as the latency
+     * groups' samples gauges. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_phi_history_latest Latest sampled "
+        "phi in the member's phi history.\n"
+        "# TYPE pulse_member_phi_history_latest gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (!phi_on || strcmp(t.members[i].id, hooks->self_id) == 0 ||
+            !t.members[i].phi.have_last ||
+            t.members[i].phi.count < PULSE_PHI_MIN_SAMPLES) continue;
+        double latest, mx;
+        int n;
+        phi_history_stats(&t.members[i].phi, &latest, &mx, &n);
+        if (n == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_phi_history_latest{member=\"%s\"} %.2f\n",
+            t.members[i].id, latest) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_phi_history_max Max sampled phi in "
+        "the member's phi history.\n"
+        "# TYPE pulse_member_phi_history_max gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (!phi_on || strcmp(t.members[i].id, hooks->self_id) == 0 ||
+            !t.members[i].phi.have_last ||
+            t.members[i].phi.count < PULSE_PHI_MIN_SAMPLES) continue;
+        double latest, mx;
+        int n;
+        phi_history_stats(&t.members[i].phi, &latest, &mx, &n);
+        if (n == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_phi_history_max{member=\"%s\"} %.2f\n",
+            t.members[i].id, mx) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_phi_history_samples Samples in the "
+        "member's phi history (at most 16).\n"
+        "# TYPE pulse_member_phi_history_samples gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (!phi_on || strcmp(t.members[i].id, hooks->self_id) == 0 ||
+            !t.members[i].phi.have_last ||
+            t.members[i].phi.count < PULSE_PHI_MIN_SAMPLES) continue;
+        double latest, mx;
+        int n;
+        phi_history_stats(&t.members[i].phi, &latest, &mx, &n);
+        if (n == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_phi_history_samples{member=\"%s\"} %d\n",
+            t.members[i].id, n) == 0;
+    }
     /* Peer-file state (0.28.0): only when the node runs with
      * --peer-file — an absent metric is how Prometheus says "not
      * applicable", matching METRICS reporting "-" and JSON null. */

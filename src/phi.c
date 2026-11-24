@@ -99,3 +99,21 @@ int phi_history_json(const phi_accrual_t *p, int64_t start_ms, char *buf,
     used += (size_t)w;
     return (int)used;
 }
+
+void phi_history_stats(const phi_accrual_t *p, double *latest, double *max,
+                       int *count) {
+    *latest = 0.0;
+    *max = 0.0;
+    *count = p->hist_count;
+    if (p->hist_count == 0) return;
+    /* Oldest first, the same ring walk as phi_history_json; the
+     * latest is the last one walked. */
+    int start = p->hist_head - p->hist_count;
+    if (start < 0) start += PULSE_PHI_HISTORY;
+    for (int k = 0; k < p->hist_count; k++) {
+        int idx = (start + k) % PULSE_PHI_HISTORY;
+        double v = p->hist_phi[idx];
+        if (v > *max) *max = v;
+        *latest = v;
+    }
+}

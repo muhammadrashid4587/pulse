@@ -143,6 +143,39 @@ int main(void) {
     char tiny[4];
     CHECK(phi_history_json(&h, 1000, tiny, sizeof tiny) == -1);
 
+    /* Phi history stats (0.51.0): latest and max over the sampled
+     * history, and how many samples the ring holds. */
+    phi_accrual_t hs;
+    phi_init(&hs);
+    double latest = 0.0, mx = 0.0;
+    int n = -1;
+    phi_history_stats(&hs, &latest, &mx, &n);
+    CHECK(n == 0); /* no sample yet: latest and max are both 0 */
+    CHECK(latest == 0.0);
+    CHECK(mx == 0.0);
+    feed_regular(&hs, 1000, 11, 100); /* 10 intervals, last at 2000 */
+    phi_sample(&hs, 2100); /* 100 ms after last beat: phi near 0 */
+    phi_sample(&hs, 2600); /* 600 ms after: phi climbing */
+    phi_sample(&hs, 3000); /* 1000 ms after: phi past 8 */
+    phi_history_stats(&hs, &latest, &mx, &n);
+    CHECK(n == 3);
+    CHECK(latest > 8.0);
+    CHECK(mx == latest); /* rising through the silence: max is the latest */
+    /* Heartbeats resume: phi falls, so the latest drops below the max. */
+    phi_heartbeat(&hs, 3100);
+    phi_heartbeat(&hs, 3200);
+    phi_sample(&hs, 3250);
+    phi_history_stats(&hs, &latest, &mx, &n);
+    CHECK(n == 4);
+    CHECK(latest < 1.0);
+    CHECK(mx > 8.0);
+    /* The wrapped ring from above: 16 samples, still rising, so the
+     * latest is the max — and both are pinned at the 30.00 cap. */
+    phi_history_stats(&h, &latest, &mx, &n);
+    CHECK(n == 16);
+    CHECK(latest == 30.0);
+    CHECK(mx == 30.0);
+
     printf("test_phi: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

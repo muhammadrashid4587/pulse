@@ -138,6 +138,9 @@ if [ -n "$P1" ] \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_last_reload_seconds [0-9][0-9]*$' \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_last_mtime_seconds [0-9][0-9]*$' \
    && ! printf '%s' "$P1" | grep -q 'pulse_member_phi{' \
+   && ! printf '%s' "$P1" | grep -q 'pulse_member_phi_history_latest{member=' \
+   && ! printf '%s' "$P1" | grep -q 'pulse_member_phi_history_max{member=' \
+   && ! printf '%s' "$P1" | grep -q 'pulse_member_phi_history_samples{member=' \
    && printf '%s' "$P1" | tail -n 1 | grep -q '^END$'; then
     note ok "PROMETHEUS exposes the converged cluster (gauges, counters, member info, per-member RTT, peer-file gauges, END)"
 else
@@ -252,6 +255,35 @@ else
     printf '%s\n' "$PP" | grep -E 'pulse_phi_threshold' || true
 fi
 
+# 4c. Phi history in PROMETHEUS (0.51.0): the last 16 sampled
+# phi values JSON reports as phi_history ride as latest / max /
+# samples gauges — one line per member that has a phi, none for
+# self — and the latest never exceeds the max, with the sample
+# count between 1 and 16.
+HIST_LATEST="$(printf '%s' "$PP" | grep '^pulse_member_phi_history_latest{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+HIST_MAX="$(printf '%s' "$PP" | grep '^pulse_member_phi_history_max{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+HIST_N="$(printf '%s' "$PP" | grep '^pulse_member_phi_history_samples{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+HIST_OK=0
+if [ -n "$HIST_LATEST" ] && [ -n "$HIST_MAX" ] && [ -n "$HIST_N" ]; then
+    if awk -v latest="$HIST_LATEST" -v mx="$HIST_MAX" -v n="$HIST_N" 'BEGIN { exit (mx + 0.001 >= latest && n >= 1 && n <= 16 ? 0 : 1) }'; then
+        HIST_OK=1
+    fi
+fi
+if [ -n "$PP" ] \
+   && printf '%s' "$PP" | grep -q '^# TYPE pulse_member_phi_history_latest gauge$' \
+   && printf '%s' "$PP" | grep -q '^# TYPE pulse_member_phi_history_max gauge$' \
+   && printf '%s' "$PP" | grep -q '^# TYPE pulse_member_phi_history_samples gauge$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_latest{member="127.0.0.1:17892"} [0-9][0-9]*\.[0-9][0-9]$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_max{member="127.0.0.1:17892"} [0-9][0-9]*\.[0-9][0-9]$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_phi_history_samples{member="127.0.0.1:17892"} [1-9][0-9]*$' \
+   && ! printf '%s' "$PP" | grep -q 'pulse_member_phi_history_latest{member="127.0.0.1:17891"' \
+   && [ "$HIST_OK" = 1 ]; then
+    note ok "PROMETHEUS exposes phi history gauges (latest $HIST_LATEST, max $HIST_MAX, $HIST_N samples; no self gauge)"
+else
+    note fail "PROMETHEUS exposes phi history gauges (latest $HIST_LATEST, max $HIST_MAX, samples $HIST_N)"
+    printf '%s\n' "$PP" | grep -E 'pulse_member_phi_history' || true
+fi
+
 kill -9 "$(cat "$TMP/p2.pid")"
 if wait_for "$TMP/p1.log" "DEAD 127.0.0.1:17892" 10; then
     note ok "phi-mode node 1 marks the killed node DEAD"
@@ -264,6 +296,16 @@ if wait_prom 18891 '^pulse_member_phi\{member="127.0.0.1:17892"\} [0-9][0-9]*\.[
 else
     note fail "dead member keeps its last-known phi gauge until GC"
     prom 18891 | grep -E 'pulse_member_phi' || true
+fi
+# The frozen history stays too: the dead member's history gauges
+# are still there, at the values the rise reached at suspicion.
+if wait_prom 18891 '^pulse_member_phi_history_max\{member="127.0.0.1:17892"\} [0-9][0-9]*\.[0-9][0-9]$' 5 \
+   && wait_prom 18891 '^pulse_member_phi_history_latest\{member="127.0.0.1:17892"\} [0-9][0-9]*\.[0-9][0-9]$' 5 \
+   && wait_prom 18891 '^pulse_member_phi_history_samples\{member="127.0.0.1:17892"\} [1-9][0-9]*$' 5; then
+    note ok "dead member keeps its frozen phi history gauges until GC"
+else
+    note fail "dead member keeps its frozen phi history gauges until GC"
+    prom 18891 | grep -E 'pulse_member_phi_history' || true
 fi
 
 echo "test_prometheus: $PASS passed, $FAIL failed"

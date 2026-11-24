@@ -69,5 +69,14 @@ void phi_sample(phi_accrual_t *p, int64_t now_ms);
  * buffer is too small. */
 int phi_history_json(const phi_accrual_t *p, int64_t start_ms, char *buf,
                      size_t len);
+/* Latest and max of the sampled phi history, and how many samples
+ * the ring holds (0 when no probe cycle has sampled it yet, with
+ * latest and max both 0.0 then). The latest is the most recent
+ * probe-cycle sample — not the live phi recomputed at read time —
+ * and the max is over the whole bounded window, so a reader can
+ * see both where phi is now and how far it climbed while the peer
+ * went quiet. */
+void phi_history_stats(const phi_accrual_t *p, double *latest, double *max,
+                       int *count);
 
 #endif

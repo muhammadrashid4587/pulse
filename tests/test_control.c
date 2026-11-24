@@ -176,6 +176,12 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         phi_heartbeat(&m->phi, now - 10000);
         phi_heartbeat(&m->phi, now - 9900);
         phi_heartbeat(&m->phi, now - 9800);
+        /* Phi history samples (0.51.0): three samples as the peer
+         * went quiet — 0.08, 0.30, 0.80 — so PROMETHEUS has real
+         * history gauges to check for this peer. */
+        phi_sample(&m->phi, now - 9800);
+        phi_sample(&m->phi, now - 9700);
+        phi_sample(&m->phi, now - 9600);
     }
     m = member_add(out, "127.0.0.1:17903", &addr, 2);
     if (m) {
@@ -965,6 +971,13 @@ int main(void) {
          * canned phi history on the seed peer produces no gauge
          * without --phi-accrual. */
         CHECK(strstr(preply, "pulse_member_phi{member=") == NULL);
+        /* Phi history gauges (0.51.0) need phi mode too: the
+         * canned samples produce no gauge without --phi-accrual
+         * either — the HELP/TYPE lines are still there, so the
+         * check is on the member lines, not the family name. */
+        CHECK(strstr(preply, "pulse_member_phi_history_latest{member=") == NULL);
+        CHECK(strstr(preply, "pulse_member_phi_history_max{member=") == NULL);
+        CHECK(strstr(preply, "pulse_member_phi_history_samples{member=") == NULL);
         /* Peer-file gauges from the canned load. */
         CHECK(strstr(preply, "pulse_peer_file_peers 3\n") != NULL);
         CHECK(strstr(preply, "pulse_peer_file_added 1\n") != NULL);
@@ -990,6 +1003,21 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_phi{member=\"127.0.0.1:17999\"}") == NULL);
         CHECK(strstr(preply, "pulse_member_phi{member=\"127.0.0.1:17903\"}") == NULL);
         CHECK(strstr(preply, "pulse_member_phi{member=\"127.0.0.1:17902\"}") == NULL);
+        /* Phi history in PROMETHEUS (0.51.0): the seed peer's
+         * three canned samples ride as latest / max / samples
+         * gauges — latest 0.80, max 0.80, 3 samples — while self
+         * (no phi history), the peer-file peer (no phi history)
+         * and the never-heard-from dead peer have no history
+         * gauge at all. */
+        CHECK(strstr(preply, "# TYPE pulse_member_phi_history_latest gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_phi_history_latest{member=\"127.0.0.1:17901\"} 0.80\n") != NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_phi_history_max gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_phi_history_max{member=\"127.0.0.1:17901\"} 0.80\n") != NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_phi_history_samples gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_phi_history_samples{member=\"127.0.0.1:17901\"} 3\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_phi_history_latest{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_phi_history_latest{member=\"127.0.0.1:17903\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_phi_history_latest{member=\"127.0.0.1:17902\"}") == NULL);
     }
     g_phi_mode = 0;
     /* Per-member phi in METRICS (0.44.0): phi mode on, the seed
