@@ -140,6 +140,14 @@
  *       actually fires the suspicion instead of hard-coding 8.0.
  *       It is emitted always, like the other config gauges,
  *       whether or not --phi-accrual is on.
+ *       Per-seed seed-rejoin breakdown (0.54.0): the seed_rejoins
+ *       total rides with "seed_rejoins_by_seed=<id>=N,<id>=N"
+ *       right after it — one entry per seed that has been
+ *       re-joined, in first-rejoin order, "-" when no seed has
+ *       been re-joined yet — so an operator polling the text
+ *       protocol can see which seed a node keeps rejoining
+ *       instead of only how often the retry fires; the counts
+ *       sum to seed_rejoins.
  *       Per-member phi (0.44.0): after the METRICS line, one
  *       "PHI <id> <value>" line per member that has a phi — phi
  *       mode on, not self, heartbeat history with at least
@@ -165,7 +173,11 @@
  *       "self" — the same provenance PEERS reports, so a peer-file
  *       peer is distinguishable from a discovered one), and the
  *       metrics object carries "slow_peers" (how many members are
- *       slow). A top-level "peer_file" object carries the --peer-file
+ *       slow). The metrics object also carries "seed_rejoins_by_seed"
+ *       (0.54.0): the per-seed breakdown of "seed_rejoins" as an
+ *       object — {"127.0.0.1:17101":2} — or {} when no seed has
+ *       been re-joined yet, so a JSON consumer can see which seed
+ *       a node keeps rejoining. A top-level "peer_file" object carries the --peer-file
  *       state (path, last_reload / last_mtime as unix seconds, and
  *       the counts from the last load), or null when the node runs
  *       without --peer-file. A top-level "watch" object (0.33.0)
@@ -201,6 +213,13 @@
  *       lifetime transition totals (suspected, dead, refutes,
  *       joins, adaptive fast cycles, suspect refuted, watch
  *       sessions and the watch delivery / drop counts) as counters;
+ *       the seed-rejoin counter (0.53.0, per-seed 0.54.0) rides
+ *       as "pulse_seed_rejoin_total" with one labelled sample per
+ *       seed that has been re-joined
+ *       ("pulse_seed_rejoin_total{seed=\"<id>\"} N") — a seed never
+ *       re-joined has no line, and a node that re-joined nothing
+ *       emits the HELP/TYPE pair with no samples — so a scraper
+ *       can alert on a single seed that keeps being rejoined;
  *       the event ring capacity (pulse_watch_event_log_cap, 0.36.0)
  *       as a gauge; the paused-stream count (pulse_watch_paused,
  *       0.37.0) as a gauge; the gossip digest size

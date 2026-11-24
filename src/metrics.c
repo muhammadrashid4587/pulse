@@ -47,7 +47,26 @@ void metrics_note_suspect_refuted(pulse_metrics_t *m, int64_t duration_ms) {
 
 void metrics_note_join(pulse_metrics_t *m) { m->joins++; }
 
-void metrics_note_seed_rejoin(pulse_metrics_t *m) { m->seed_rejoins++; }
+void metrics_note_seed_rejoin(pulse_metrics_t *m, const char *seed_id) {
+    m->seed_rejoins++;
+    if (seed_id == NULL) return;
+    /* Per-seed breakdown (0.54.0): find the seed's entry, or append
+     * one in first-rejoin order. The seed list holds at most 16
+     * entries, so the table can never overflow; if it somehow did,
+     * the total still counts and the breakdown just misses one. */
+    for (int i = 0; i < m->seed_rejoin_seed_count; i++) {
+        if (strcmp(m->seed_rejoins_by_seed[i].id, seed_id) == 0) {
+            m->seed_rejoins_by_seed[i].count++;
+            return;
+        }
+    }
+    if (m->seed_rejoin_seed_count < PULSE_MAX_SEED_REJOINS) {
+        pulse_seed_rejoin_entry_t *e =
+            &m->seed_rejoins_by_seed[m->seed_rejoin_seed_count++];
+        snprintf(e->id, sizeof e->id, "%s", seed_id);
+        e->count = 1;
+    }
+}
 
 void metrics_note_adaptive_fast(pulse_metrics_t *m) {
     m->adaptive_fast_cycles++;
@@ -99,9 +118,46 @@ void metrics_rtt_hist_json(const pulse_metrics_t *m, char *buf,
              (long long)m->rtt_hist[4]);
 }
 
+void metrics_seed_rejoins_text(const pulse_metrics_t *m, char *buf,
+                               size_t len) {
+    if (m->seed_rejoin_seed_count <= 0) {
+        snprintf(buf, len, "-");
+        return;
+    }
+    size_t used = 0;
+    for (int i = 0; i < m->seed_rejoin_seed_count; i++) {
+        int w = snprintf(buf + used, len - used, "%s%s=%lld",
+                         i == 0 ? "" : ",",
+                         m->seed_rejoins_by_seed[i].id,
+                         (long long)m->seed_rejoins_by_seed[i].count);
+        if (w < 0 || (size_t)w >= len - used) return;
+        used += (size_t)w;
+    }
+}
+
+void metrics_seed_rejoins_json(const pulse_metrics_t *m, char *buf,
+                              size_t len) {
+    size_t used = 0;
+    int w = snprintf(buf, len, "{");
+    if (w < 0 || (size_t)w >= len) return;
+    used += (size_t)w;
+    for (int i = 0; i < m->seed_rejoin_seed_count; i++) {
+        w = snprintf(buf + used, len - used, "%s\"%s\":%lld",
+                     i == 0 ? "" : ",",
+                     m->seed_rejoins_by_seed[i].id,
+                     (long long)m->seed_rejoins_by_seed[i].count);
+        if (w < 0 || (size_t)w >= len - used) return;
+        used += (size_t)w;
+    }
+    snprintf(buf + used, len - used, "}");
+}
+
 void metrics_format(const pulse_metrics_t *m, char *buf, size_t len) {
     char detect[96], suspect_dead[96], refute[96], rtt[96];
     char hist[64], rtthist[64];
+    /* Per-seed breakdown: 16 seeds at most, each "host:port=N" —
+     * a 64-char id plus a count — fits in ~1.2 KB worst case. */
+    char by_seed[1408];
     format_group(detect, sizeof detect, m->detect_samples, m->detect_sum_ms,
                  m->detect_max_ms);
     format_group(suspect_dead, sizeof suspect_dead, m->suspect_dead_samples,
@@ -112,15 +168,16 @@ void metrics_format(const pulse_metrics_t *m, char *buf, size_t len) {
                  m->rtt_max_ms);
     metrics_detect_hist_json(m, hist, sizeof hist);
     metrics_rtt_hist_json(m, rtthist, sizeof rtthist);
+    metrics_seed_rejoins_text(m, by_seed, sizeof by_seed);
     snprintf(buf, len,
              "METRICS suspected=%lld dead=%lld refutes=%lld joins=%lld "
-             "seed_rejoins=%lld "
+             "seed_rejoins=%lld seed_rejoins_by_seed=%s "
              "adaptive_fast_cycles=%lld suspect_refuted=%lld "
              "detect_latency_ms %s hist=[%s] suspect_to_dead_ms %s "
              "refute_latency_ms %s probe_rtt_ms %s hist=[%s]",
              (long long)m->suspected, (long long)m->dead,
              (long long)m->refutes, (long long)m->joins,
-             (long long)m->seed_rejoins,
+             (long long)m->seed_rejoins, by_seed,
              (long long)m->adaptive_fast_cycles,
              (long long)m->suspect_refuted, detect, hist,
              suspect_dead, refute, rtt, rtthist);

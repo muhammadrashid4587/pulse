@@ -224,6 +224,16 @@ static void metrics_hook(void *ctx, pulse_metrics_t *out) {
         out->refutes = 1;
         out->joins = 3;
         out->seed_rejoins = 2;
+        /* Per-seed breakdown (0.54.0): the 2 rejoins split across
+         * two seeds, one each, so the labelled counter has two
+         * samples that sum to the total. */
+        out->seed_rejoin_seed_count = 2;
+        snprintf(out->seed_rejoins_by_seed[0].id, PULSE_ID_LEN,
+                 "127.0.0.1:17101");
+        out->seed_rejoins_by_seed[0].count = 1;
+        snprintf(out->seed_rejoins_by_seed[1].id, PULSE_ID_LEN,
+                 "127.0.0.1:17103");
+        out->seed_rejoins_by_seed[1].count = 1;
         out->adaptive_fast_cycles = 5;
         out->suspect_refuted = 1;
         /* Two detection samples, 150 and 300 ms: mean 225, max 300,
@@ -751,7 +761,7 @@ int main(void) {
     CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
     CHECK(strcmp(reply,
                  "METRICS suspected=0 dead=0 refutes=0 joins=0 "
-                 "seed_rejoins=0 "
+                 "seed_rejoins=0 seed_rejoins_by_seed=- "
                  "adaptive_fast_cycles=0 suspect_refuted=0 "
                  "detect_latency_ms mean=- max=- samples=0 "
                  "hist=[0,0,0,0,0] suspect_to_dead_ms mean=- max=- "
@@ -793,8 +803,11 @@ int main(void) {
     CHECK(strstr(reply, "\"source\":\"discovered\"") != NULL);
     /* Seed-rejoin count (0.53.0): the metrics object carries
      * "seed_rejoins" right after "joins" — 0 here, since the
-     * canned metrics are all zeros. */
+     * canned metrics are all zeros — and the per-seed breakdown
+     * (0.54.0) rides right after it as "seed_rejoins_by_seed",
+     * {} when no seed has been re-joined yet. */
     CHECK(strstr(reply, "\"joins\":0,\"seed_rejoins\":0") != NULL);
+    CHECK(strstr(reply, "\"seed_rejoins_by_seed\":{}") != NULL);
     /* The event ring capacity (0.36.0) rides in the "watch"
      * object: no hook is set in this harness, so it reports the
      * default 128. */
@@ -869,9 +882,14 @@ int main(void) {
         CHECK(strstr(preply, "pulse_dead_total 1\n") != NULL);
         CHECK(strstr(preply, "pulse_refutes_total 1\n") != NULL);
         CHECK(strstr(preply, "pulse_joins_total 3\n") != NULL);
-        /* Seed-rejoin count (0.53.0): the canned 2 rejoins ride
-         * as their own counter, right after joins. */
-        CHECK(strstr(preply, "pulse_seed_rejoin_total 2\n") != NULL);
+        /* Seed-rejoin count (0.53.0, per-seed 0.54.0): the canned
+         * 2 rejoins ride as one labelled sample per seed, right
+         * after joins — one each for the two seeds, summing to
+         * the total. */
+        CHECK(strstr(preply,
+                     "pulse_seed_rejoin_total{seed=\"127.0.0.1:17101\"} 1\n") != NULL);
+        CHECK(strstr(preply,
+                     "pulse_seed_rejoin_total{seed=\"127.0.0.1:17103\"} 1\n") != NULL);
         CHECK(strstr(preply, "pulse_adaptive_fast_cycles_total 5\n") != NULL);
         CHECK(strstr(preply, "pulse_suspect_refuted_total 1\n") != NULL);
         /* Membership gauges from the canned table: 3 alive, 1 dead. */

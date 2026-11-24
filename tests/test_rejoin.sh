@@ -101,5 +101,30 @@ else
     echo "--- metrics"; echo "$metrics"
 fi
 
+# 5. Per-seed breakdown (0.54.0): the same count broken down by
+# seed, so an operator can see which seed a node keeps rejoining.
+# Node 2 has exactly one seed, so the breakdown names it and
+# agrees with the total.
+if echo "$metrics" | grep -qE "seed_rejoins_by_seed=127\.0\.0\.1:17401=[1-9][0-9]*"; then
+    note ok "METRICS breaks the rejoins down per seed"
+else
+    note fail "METRICS breaks the rejoins down per seed"
+    echo "--- metrics"; echo "$metrics"
+fi
+json="$("$CTL" 127.0.0.1:18402 JSON 2>/dev/null)"
+if echo "$json" | grep -qE '"seed_rejoins_by_seed":\{"127\.0\.0\.1:17401":[1-9][0-9]*\}'; then
+    note ok "JSON breaks the rejoins down per seed"
+else
+    note fail "JSON breaks the rejoins down per seed"
+    echo "--- json"; echo "$json"
+fi
+prom="$("$CTL" 127.0.0.1:18402 PROMETHEUS 2>/dev/null)"
+if echo "$prom" | grep -qE 'pulse_seed_rejoin_total\{seed="127\.0\.0\.1:17401"\} [1-9][0-9]*'; then
+    note ok "PROMETHEUS labels the rejoin counter per seed"
+else
+    note fail "PROMETHEUS labels the rejoin counter per seed"
+    echo "--- prom"; echo "$prom"
+fi
+
 echo "test_rejoin: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

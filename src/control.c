@@ -464,9 +464,11 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
     member_table_t t;
     hooks->snapshot(hooks->ctx, &t);
     /* The metrics line plus slow_peers plus the peer-file fields
-     * (path up to 512 chars) can run long; 1 KB holds the whole
-     * line for any realistic path. snprintf truncates safely. */
-    char line[1024];
+     * (path up to 512 chars) plus the per-seed rejoin breakdown
+     * (16 seeds at most, each "host:port=N") can run long; 4 KB
+     * holds the whole line for any realistic path. snprintf
+     * truncates safely. */
+    char line[4096];
     metrics_format(&m, line, sizeof line);
     /* Slow-peer warning (0.22.0): how many members currently count
      * as slow — mean probe RTT above the configured threshold. The
@@ -706,6 +708,13 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         snprintf(pmean, sizeof pmean, "null");
     metrics_detect_hist_json(&m, dhist, sizeof dhist);
     metrics_rtt_hist_json(&m, prhist, sizeof prhist);
+    /* Per-seed seed-rejoin breakdown (0.54.0): the same counts
+     * METRICS reports as seed_rejoins_by_seed, as a JSON object —
+     * {"127.0.0.1:17101":2} — or {} when no seed has been
+     * re-joined yet. Member ids carry no quote or backslash, so
+     * no escaping is needed (see metrics_seed_rejoins_json). */
+    char srjson[1408];
+    metrics_seed_rejoins_json(&m, srjson, sizeof srjson);
     /* WATCH subscribers (0.33.0): the same counts METRICS reports,
      * as a top-level "watch" object — how many WATCH streams are
      * connected right now, and how many sessions since startup —
@@ -752,7 +761,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
      * fires the suspicion instead of hard-coding 8.0. */
     w = snprintf(buf + used, sizeof buf - used,
         "],\"metrics\":{\"suspected\":%lld,\"dead\":%lld,\"refutes\":%lld,"
-        "\"joins\":%lld,\"seed_rejoins\":%lld,\"adaptive_fast_cycles\":%lld,"
+        "\"joins\":%lld,\"seed_rejoins\":%lld,\"seed_rejoins_by_seed\":%s,"
+        "\"adaptive_fast_cycles\":%lld,"
         "\"suspect_refuted\":%lld,\"slow_peers\":%d,"
         "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
@@ -764,7 +774,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"paused\":%d,\"event_log_cap\":%d,\"streams\":%s},"
         "\"gossip_digest_size\":%d,\"phi_threshold\":%.2f}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
-        (long long)m.joins, (long long)m.seed_rejoins,
+        (long long)m.joins, (long long)m.seed_rejoins, srjson,
         (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
         member_count_slow(&t, hooks->slow_rtt_threshold_ms),
@@ -898,12 +908,24 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         "# HELP pulse_joins_total First sightings of a member.\n"
         "# TYPE pulse_joins_total counter\n"
         "pulse_joins_total %lld\n", (long long)m.joins) == 0;
+    /* Seed rejoins (0.53.0, per-seed 0.54.0): one labelled sample
+     * per seed that has been re-joined, so a scraper can see which
+     * seed a node keeps rejoining — sum over the labels is the
+     * old total. A seed never re-joined has no line (its count is
+     * implicitly 0), and a node that re-joined nothing emits the
+     * HELP/TYPE pair with no samples: an absent metric is how
+     * Prometheus says "not applicable". Member ids carry no quote
+     * or backslash, so no label escaping is needed. */
     ok &= prom_add(buf, sizeof buf, &used,
         "# HELP pulse_seed_rejoin_total Re-JOINs sent to a seed "
-        "that was not ALIVE.\n"
-        "# TYPE pulse_seed_rejoin_total counter\n"
-        "pulse_seed_rejoin_total %lld\n",
-        (long long)m.seed_rejoins) == 0;
+        "that was not ALIVE, by seed.\n"
+        "# TYPE pulse_seed_rejoin_total counter\n") == 0;
+    for (int i = 0; i < m.seed_rejoin_seed_count; i++) {
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_seed_rejoin_total{seed=\"%s\"} %lld\n",
+            m.seed_rejoins_by_seed[i].id,
+            (long long)m.seed_rejoins_by_seed[i].count) == 0;
+    }
     ok &= prom_add(buf, sizeof buf, &used,
         "# HELP pulse_adaptive_fast_cycles_total Probe cycles that "
         "ran at the fast interval because a peer was SUSPECT.\n"
