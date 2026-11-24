@@ -86,7 +86,10 @@
  * there is no PHI line for anyone. The phi suspicion threshold
  * in METRICS (0.45.0) is covered here too: the METRICS line
  * carries phi_threshold from the hook (5.50 in this harness),
- * and with no hook it reports the default 8.00. */
+ * and with no hook it reports the default 8.00. The same
+ * threshold in JSON (0.46.0) is covered here too: the JSON
+ * object carries a top-level "phi_threshold" number from the
+ * hook, and with no hook it reports the default 8.00. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -776,6 +779,19 @@ int main(void) {
     /* The gossip digest size (0.41.0) rides top-level: no hook is
      * set in this harness, so it reports the default 16. */
     CHECK(strstr(reply, "\"gossip_digest_size\":16") != NULL);
+    /* Phi suspicion threshold (0.46.0): the same threshold rides
+     * top-level in JSON as a number — the fake hook reports 5.50,
+     * so the value proves it comes from the hook, not the
+     * default — and with no hook it falls back to 8.00 instead
+     * of crashing on a NULL hook. */
+    CHECK(strstr(reply, "\"phi_threshold\":5.50") != NULL);
+    {
+        double (*saved)(void *) = g_hooks.phi_threshold;
+        g_hooks.phi_threshold = NULL;
+        CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+        CHECK(strstr(reply, "\"phi_threshold\":8.00") != NULL);
+        g_hooks.phi_threshold = saved;
+    }
     /* The peer_file object sits at the top level, after metrics. */
     {
         const char *metrics = strstr(reply, "\"metrics\":{");

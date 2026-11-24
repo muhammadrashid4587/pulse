@@ -186,7 +186,13 @@
  *       "gossip_digest_size" (0.41.0) carries how many members
  *       one gossip round's digest covers — the
  *       --gossip-digest-size the node started with, 16 by
- *       default.
+ *       default. A top-level "phi_threshold" (0.46.0) carries
+ *       the phi value at which a peer is suspected — the
+ *       --phi-threshold the node started with, 8.0 by default,
+ *       two decimals like METRICS and PROMETHEUS — emitted
+ *       always, whether or not --phi-accrual is on, so a JSON
+ *       consumer can judge a rising per-member "phi" against
+ *       the threshold that actually fires the suspicion.
  *   PROMETHEUS
  *       The same values METRICS and JSON report, as Prometheus text
  *       exposition format, then END. Each metric family carries a

@@ -716,6 +716,13 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
     sw = snprintf(streams_json + s_used, sizeof streams_json - s_used,
                   "]");
     if (sw < 0 || (size_t)sw >= sizeof streams_json - s_used) return;
+    /* Phi suspicion threshold (0.46.0): the same threshold METRICS
+     * and PROMETHEUS report, as a top-level JSON number — the
+     * --phi-threshold the node started with, 8.0 by default, two
+     * decimals like the other two views — emitted always, whether
+     * or not --phi-accrual is on, so a JSON consumer can judge a
+     * rising per-member "phi" against the threshold that actually
+     * fires the suspicion instead of hard-coding 8.0. */
     w = snprintf(buf + used, sizeof buf - used,
         "],\"metrics\":{\"suspected\":%lld,\"dead\":%lld,\"refutes\":%lld,"
         "\"joins\":%lld,\"adaptive_fast_cycles\":%lld,"
@@ -727,7 +734,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"watch\":{\"subscribers\":%d,\"sessions\":%llu,"
         "\"delivered\":%llu,\"filtered\":%llu,\"dropped\":%llu,"
         "\"paused\":%d,\"event_log_cap\":%d,\"streams\":%s},"
-        "\"gossip_digest_size\":%d}\nEND\n",
+        "\"gossip_digest_size\":%d,\"phi_threshold\":%.2f}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
         (long long)m.joins, (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
@@ -744,7 +751,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (unsigned long long)ws.dropped,
         ws.paused,
         event_log_cap_or_default(hooks), streams_json,
-        gossip_digest_size_or_default(hooks));
+        gossip_digest_size_or_default(hooks),
+        phi_threshold_or_default(hooks));
     if (w < 0 || (size_t)w >= sizeof buf - used) return;
     send_all(fd, buf);
 }
