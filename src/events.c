@@ -72,22 +72,113 @@ int pulse_event_type_parse(const char *name, pulse_event_type_t *out) {
     return -1;
 }
 
-void pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
-                        const char *id, uint32_t incarnation,
-                        int64_t unix_ts) {
-    pthread_mutex_lock(&log->lock);
+/* Insert one event into the ring at the given sequence number.
+ * Caller holds the lock. The ring keeps the last <cap> events:
+ * inserting past the capacity scrolls the oldest out, exactly as
+ * a fresh record does. */
+static void log_insert(pulse_event_log_t *log, uint64_t seq,
+                       pulse_event_type_t type, const char *id,
+                       uint32_t incarnation, int64_t unix_ts) {
     pulse_event_t *slot = &log->events[log->head];
-    slot->seq = log->next_seq++;
+    slot->seq = seq;
     slot->type = type;
     snprintf(slot->id, sizeof slot->id, "%s", id);
     slot->incarnation = incarnation;
     slot->unix_ts = unix_ts;
     log->head = (log->head + 1) % log->cap;
     if (log->count < log->cap) log->count++;
+}
+
+uint64_t pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
+                            const char *id, uint32_t incarnation,
+                            int64_t unix_ts) {
+    pthread_mutex_lock(&log->lock);
+    uint64_t seq = log->next_seq++;
+    log_insert(log, seq, type, id, incarnation, unix_ts);
     /* A waiter may be waiting for exactly this event; a broadcast
      * wakes it, and it re-checks under the lock. */
     pthread_cond_broadcast(&log->cond);
     pthread_mutex_unlock(&log->lock);
+    return seq;
+}
+
+/* One line per event in the persisted log (0.38.0):
+ * "<seq> <TYPE> <id> <incarnation> <unix_ts>". Ids carry no spaces
+ * (host:port, bracketed for IPv6), so a plain %s round-trips. */
+#define PULSE_EVENT_LOG_LINE "%llu %s %s %u %lld\n"
+
+int pulse_event_log_save(pulse_event_log_t *log, const char *path) {
+    /* Snapshot the held events in sequence order under the lock,
+     * then write outside it: the ring must not stall recorders
+     * while the file is being written. */
+    pthread_mutex_lock(&log->lock);
+    int count = log->count;
+    pulse_event_t *held = NULL;
+    if (count > 0) {
+        held = malloc((size_t)count * sizeof *held);
+        if (!held) {
+            pthread_mutex_unlock(&log->lock);
+            return -1;
+        }
+        for (int i = 0; i < count; i++) {
+            int idx = (log->head - count + i) % log->cap;
+            if (idx < 0) idx += log->cap;
+            held[i] = log->events[idx];
+        }
+    }
+    pthread_mutex_unlock(&log->lock);
+
+    char tmp[1024];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) {
+        free(held);
+        return -1;
+    }
+    FILE *f = fopen(tmp, "w");
+    if (!f) {
+        free(held);
+        return -1;
+    }
+    for (int i = 0; i < count; i++)
+        fprintf(f, PULSE_EVENT_LOG_LINE, (unsigned long long)held[i].seq,
+                pulse_event_type_name(held[i].type), held[i].id,
+                held[i].incarnation, (long long)held[i].unix_ts);
+    free(held);
+    if (fclose(f) != 0) return -1;
+    if (rename(tmp, path) != 0) return -1;
+    return count;
+}
+
+int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return errno == ENOENT ? 0 : -1;
+    char line[512];
+    int loaded = 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long seq;
+        char type_name[16];
+        char id[PULSE_ID_LEN + 16];
+        unsigned inc;
+        long long ts;
+        if (sscanf(line, "%llu %15s %79s %u %lld", &seq, type_name, id,
+                   &inc, &ts) != 5)
+            continue;
+        if (seq == 0) continue;
+        pulse_event_type_t type;
+        if (pulse_event_type_parse(type_name, &type) != 0) continue;
+        pthread_mutex_lock(&log->lock);
+        /* The file is written in sequence order, so each line's
+         * seq is past the last: only advance next_seq forward, in
+         * case a hand-edited file ever repeats a sequence. */
+        if (seq >= log->next_seq) {
+            log_insert(log, seq, type, id, inc, (int64_t)ts);
+            log->next_seq = seq + 1;
+            loaded++;
+        }
+        pthread_mutex_unlock(&log->lock);
+    }
+    int err = ferror(f) ? -1 : loaded;
+    fclose(f);
+    return err;
 }
 
 uint64_t pulse_event_latest_seq(pulse_event_log_t *log) {

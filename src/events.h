@@ -21,10 +21,18 @@
  * ERR line and the client reconnects and re-reads the snapshot.
  * Sequence numbers are 1-based and monotonic for the node's life,
  * so a client that sees a jump in them knows it missed events
- * even when the gap is smaller than the ring. The log is not
- * persisted: a restarted node starts at sequence 1, and the
- * members it restores from disk are pre-existing state, not
- * events.
+ * even when the gap is smaller than the ring.
+ *
+ * The log is persisted (0.38.0): the node appends each event to
+ * <data-dir>/events as it records it, and on startup loads the
+ * file back into the ring, so sequence numbers continue across a
+ * restart instead of resetting to 1 and a WATCH FROM <seq> issued
+ * after a restart can still replay what happened before it. The
+ * file is compacted to the last <cap> events on startup and on
+ * clean shutdown, so it never grows past one run's worth of events
+ * plus the ring; a missing file loads zero events (first start),
+ * malformed lines are skipped, and a load failure never stops the
+ * node from starting — it just starts at sequence 1.
  *
  * The cap is set at init time, not compile time: a node takes
  * --event-log-cap (0.36.0) so an operator watching a busy cluster
@@ -82,10 +90,30 @@ const char *pulse_event_type_name(pulse_event_type_t type);
 int pulse_event_type_parse(const char *name, pulse_event_type_t *out);
 
 /* Append one event (assigning it the next sequence number) and wake
- * any waiter. Thread-safe; never blocks. */
-void pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
-                        const char *id, uint32_t incarnation,
-                        int64_t unix_ts);
+ * any waiter. Thread-safe; never blocks. Returns the sequence
+ * number assigned, so the caller can append the same event to the
+ * persisted log (0.38.0). */
+uint64_t pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
+                            const char *id, uint32_t incarnation,
+                            int64_t unix_ts);
+
+/* Write every event the ring currently holds, in sequence order,
+ * to path (one "<seq> <TYPE> <id> <incarnation> <unix_ts>" line per
+ * event), atomically via a tmp file + rename, so a crash mid-write
+ * never leaves a half-written file. Returns the number of events
+ * written, or -1 if the file could not be written. Used to compact
+ * the persisted log on startup and on clean shutdown (0.38.0). */
+int pulse_event_log_save(pulse_event_log_t *log, const char *path);
+
+/* Load events from path into the ring, in file order, restoring
+ * their sequence numbers: a restarted node continues from the last
+ * recorded sequence instead of starting at 1. Only the last <cap>
+ * events survive (the ring drops older ones as usual), and the
+ * next sequence is one past the last loaded event. Returns the
+ * number of events loaded, 0 when there is no file, or -1 if the
+ * file exists but could not be read at all. Malformed lines are
+ * skipped, never fatal (0.38.0). */
+int pulse_event_log_load(pulse_event_log_t *log, const char *path);
 
 /* The latest sequence number recorded so far (0 when the log is
  * empty): a WATCH with no argument starts live from here. */

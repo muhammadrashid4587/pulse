@@ -132,6 +132,15 @@ static pulse_event_log_t g_event_log; /* membership events for WATCH
     log line for the same transition, so the log and the log file
     agree. The log has its own lock; recording never takes g_lock,
     so it is safe to call after the table lock is released. */
+/* Event-log persistence (0.38.0): every recorded event is appended
+ * to <data-dir>/events as it happens, so the log survives a
+ * restart. The append runs under this lock, not the log's own
+ * lock, because two threads can record at once (the prober and
+ * the control thread both record DROPPED events) and two appends
+ * to the same FILE* must not interleave mid-line. The path is
+ * set once at startup, next to pulse_event_log_init. */
+static char g_events_path[1024];
+static pthread_mutex_t g_events_file_lock = PTHREAD_MUTEX_INITIALIZER;
 static int64_t g_start_ms = 0;
 static volatile sig_atomic_t g_stop = 0;
 /* Live peer-file reload (0.24.0): SIGHUP sets this flag and nothing
@@ -327,11 +336,28 @@ static void peer_set_known_version(const char *id, uint64_t version) {
 
 /* Membership events for WATCH (0.29.0): record one event in the
  * node's event log. Call after the table lock is released, next to
- * the log line for the same transition. */
+ * the log line for the same transition. Event-log persistence
+ * (0.38.0): the same event is appended to <data-dir>/events, so a
+ * restart restores it. The append is best-effort — a data dir that
+ * cannot be written just means the log does not survive the
+ * restart, and a failed append must never stop the node — so a
+ * failure is silent here; the log line for the transition is
+ * already in the node's stdout either way. */
 static void record_event(pulse_event_type_t type, const char *id,
                          uint32_t incarnation) {
-    pulse_event_record(&g_event_log, type, id, incarnation,
-                       (int64_t)time(NULL));
+    int64_t ts = (int64_t)time(NULL);
+    uint64_t seq = pulse_event_record(&g_event_log, type, id,
+                                      incarnation, ts);
+    if (g_events_path[0] == '\0') return;
+    pthread_mutex_lock(&g_events_file_lock);
+    FILE *f = fopen(g_events_path, "a");
+    if (f) {
+        fprintf(f, "%llu %s %s %u %lld\n", (unsigned long long)seq,
+                pulse_event_type_name(type), id, incarnation,
+                (long long)ts);
+        fclose(f);
+    }
+    pthread_mutex_unlock(&g_events_file_lock);
 }
 
 /* Direct contact with a member: it is alive. Logs JOIN for a first sighting
@@ -1984,6 +2010,25 @@ int main(int argc, char **argv) {
     member_table_init(&g_table);
     metrics_init(&g_metrics);
     pulse_event_log_init(&g_event_log, g_cfg.event_log_cap);
+    /* Event-log persistence (0.38.0): a restarted node loads the
+     * events it recorded before its last shutdown back into the
+     * ring, so sequence numbers continue instead of resetting to 1
+     * and a WATCH FROM <seq> issued after a restart can still
+     * replay what happened before it. The load is followed by a
+     * compacting save, so the file holds only the last <cap>
+     * events from here on; a missing file is the first-start case
+     * (zero events), and an unreadable file is a warning, never a
+     * failed start — the node just starts at sequence 1. */
+    snprintf(g_events_path, sizeof g_events_path, "%s/events",
+             g_cfg.data_dir);
+    int n_events = pulse_event_log_load(&g_event_log, g_events_path);
+    if (n_events > 0) {
+        log_line("EVENTS %d restored", n_events);
+        pulse_event_log_save(&g_event_log, g_events_path);
+    } else if (n_events < 0) {
+        fprintf(stderr, "warning: cannot read event log %s\n",
+                g_events_path);
+    }
     /* The address stored for self is the one the id advertises: peers
      * already reply to the advertised id, so the table entry should
      * agree with it. (An unparseable --id falls back to loopback.) */
@@ -2184,6 +2229,10 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&g_lock);
     pulse_members_save(g_cfg.data_dir, &final_copy, g_self_id,
                        pulse_now_ms());
+    /* Clean shutdown: compact the persisted event log too, so the
+     * file holds only the last <cap> events for the next start
+     * instead of every event this run appended. */
+    pulse_event_log_save(&g_event_log, g_events_path);
     log_line("STOP %s", g_self_id);
     close(g_sock);
     if (g_send_sock != g_sock) close(g_send_sock);

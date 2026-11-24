@@ -484,6 +484,66 @@ static void test_event_log(void) {
     pulse_event_log_init(&def, 0);
     CHECK(pulse_event_log_cap(&def) == PULSE_EVENT_LOG_CAP);
     pulse_event_log_free(&def);
+
+    /* Event-log persistence (0.38.0): save the ring to a file and
+     * load it back into a fresh log — the events come back with
+     * their original sequence numbers, and the next record
+     * continues the sequence instead of restarting at 1. */
+    const char *ev_path = "/tmp/pulse-event-log-test.txt";
+    pulse_event_log_t saved;
+    pulse_event_log_init(&saved, 4);
+    pulse_event_record(&saved, PULSE_EVENT_JOINED, "127.0.0.1:17904", 1,
+                       1700000300);
+    pulse_event_record(&saved, PULSE_EVENT_SUSPECTED, "127.0.0.1:17904",
+                       1, 1700000301);
+    pulse_event_record(&saved, PULSE_EVENT_DEAD, "127.0.0.1:17904", 1,
+                       1700000302);
+    CHECK(pulse_event_log_save(&saved, ev_path) == 3);
+    pulse_event_log_free(&saved);
+
+    pulse_event_log_t restored;
+    pulse_event_log_init(&restored, 4);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 3);
+    CHECK(pulse_event_latest_seq(&restored) == 3);
+    CHECK(pulse_event_oldest_seq(&restored) == 1);
+    CHECK(pulse_event_wait(&restored, 0, &ev, 20) == 1);
+    CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000300);
+    CHECK(pulse_event_wait(&restored, 1, &ev, 20) == 1);
+    CHECK(ev.seq == 2 && ev.type == PULSE_EVENT_SUSPECTED);
+    CHECK(pulse_event_wait(&restored, 2, &ev, 20) == 1);
+    CHECK(ev.seq == 3 && ev.type == PULSE_EVENT_DEAD);
+    /* The next record continues the sequence, not restarts it. */
+    pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
+                       2, 1700000303);
+    CHECK(pulse_event_latest_seq(&restored) == 4);
+    pulse_event_log_free(&restored);
+
+    /* A missing file loads zero events, and a malformed line is
+     * skipped while the good lines around it still load. */
+    pulse_event_log_init(&restored, 4);
+    CHECK(pulse_event_log_load(&restored,
+                               "/tmp/pulse-event-log-no-such-file.txt") == 0);
+    CHECK(pulse_event_latest_seq(&restored) == 0);
+    FILE *mf = fopen(ev_path, "w");
+    CHECK(mf != NULL);
+    if (mf) {
+        fprintf(mf, "not an event line\n");
+        fprintf(mf, "7 REVIVED 127.0.0.1:17905 2 1700000400\n");
+        fprintf(mf, "8 DEAD 127.0.0.1:17905 2 1700000401\n");
+        fclose(mf);
+    }
+    CHECK(pulse_event_log_load(&restored, ev_path) == 2);
+    CHECK(pulse_event_latest_seq(&restored) == 8);
+    CHECK(pulse_event_oldest_seq(&restored) == 7);
+    CHECK(pulse_event_wait(&restored, 6, &ev, 20) == 1);
+    CHECK(ev.seq == 7 && ev.type == PULSE_EVENT_REVIVED &&
+          strcmp(ev.id, "127.0.0.1:17905") == 0);
+    CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
+    CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_DEAD);
+    pulse_event_log_free(&restored);
+    unlink(ev_path);
 }
 
 int main(void) {
