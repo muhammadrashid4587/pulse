@@ -1150,14 +1150,19 @@ static void probe_cycle(int cycle) {
                 rejoins[n_rejoins].addr = saddr;
                 rejoins[n_rejoins].was_absent = was_absent;
                 n_rejoins++;
-                /* Seed-rejoin count (0.53.0, per-seed 0.54.0):
-                 * counted here, under the lock, because the send
-                 * loop below sends exactly this list — one count
-                 * per re-JOIN that goes out, whether the seed was
-                 * SUSPECT/DEAD in the table or already GC'd — and
-                 * the per-seed breakdown takes the seed's id, so
-                 * the total and the breakdown always agree. */
-                metrics_note_seed_rejoin(&g_metrics, g_cfg.seeds[i]);
+                /* Seed-rejoin count (0.53.0, per-seed 0.54.0,
+                 * last rejoin 0.55.0): counted here, under the
+                 * lock, because the send loop below sends exactly
+                 * this list — one count per re-JOIN that goes out,
+                 * whether the seed was SUSPECT/DEAD in the table
+                 * or already GC'd — and the per-seed breakdown
+                 * takes the seed's id, so the total and the
+                 * breakdown always agree. The attempt's
+                 * wall-clock time (unix ms) is recorded too, so
+                 * the breakdown also says when each seed was
+                 * last retried. */
+                metrics_note_seed_rejoin(&g_metrics, g_cfg.seeds[i],
+                                         (int64_t)time(NULL) * 1000);
             }
             pthread_mutex_unlock(&g_lock);
         }

@@ -46,20 +46,30 @@
 #define PULSE_RTT_HIST_BUCKETS 5
 #define PULSE_RTT_HIST_BOUNDS { 1, 5, 10, 50 }
 
-/* Per-seed seed-rejoin breakdown (0.54.0): the seed_rejoins total
- * above says how many re-JOINs the retry sent, but not to which
- * seed — a node with three seeds and a climbing total cannot tell
- * which one is still down. One entry per seed that has been
- * re-joined, in first-rejoin order; at most PULSE_MAX_SEED_REJOINS
- * entries, which is the seed list's own cap, so the table can never
- * overflow. A seed that was never re-joined has no entry (its count
- * is implicitly 0), and the table is local measurement like the
- * total: never gossiped, never persisted, reset on restart. */
+/* Per-seed seed-rejoin breakdown (0.54.0, last rejoin 0.55.0): the
+ * seed_rejoins total above says how many re-JOINs the retry sent,
+ * but not to which seed — a node with three seeds and a climbing
+ * total cannot tell which one is still down. One entry per seed
+ * that has been re-joined, in first-rejoin order; at most
+ * PULSE_MAX_SEED_REJOINS entries, which is the seed list's own
+ * cap, so the table can never overflow. A seed that was never
+ * re-joined has no entry (its count is implicitly 0), and the
+ * table is local measurement like the total: never gossiped,
+ * never persisted, reset on restart. */
 #define PULSE_MAX_SEED_REJOINS 16
 
 typedef struct {
     char id[PULSE_ID_LEN]; /* seed id, "host:port", IPv6 bracketed */
     int64_t count;         /* re-JOINs sent to this seed */
+    /* Per-seed last rejoin (0.55.0): wall-clock time of the most
+     * recent re-JOIN sent to this seed, as unix milliseconds —
+     * the same clock as the peer-file last_reload, but in ms, so
+     * an operator can tell when each seed was last retried (and,
+     * against the log, whether the retry is still firing). 0
+     * while the entry exists is impossible: the entry is created
+     * by the first re-JOIN, which sets this to that attempt's
+     * time. */
+    int64_t last_rejoin_unix_ms;
 } pulse_seed_rejoin_entry_t;
 
 typedef struct {
@@ -135,8 +145,12 @@ void metrics_note_join(pulse_metrics_t *m);
  * the seed was SUSPECT/DEAD in the table or already GC'd — and in
  * the per-seed breakdown too, so the total and the breakdown always
  * agree. seed_id must be a seed id ("host:port"); a NULL id counts
- * only the total. */
-void metrics_note_seed_rejoin(pulse_metrics_t *m, const char *seed_id);
+ * only the total. now_unix_ms is the wall-clock time of this
+ * attempt, as unix milliseconds; it becomes the seed's
+ * last_rejoin_unix_ms (0.55.0), so the breakdown also says when
+ * each seed was last retried. */
+void metrics_note_seed_rejoin(pulse_metrics_t *m, const char *seed_id,
+                              int64_t now_unix_ms);
 /* A suspicion was refuted: a peer marked SUSPECT came back ALIVE.
  * duration_ms is how long it sat SUSPECT, or -1 when it was learned
  * from gossip and there is nothing local to measure. */
@@ -151,6 +165,7 @@ void metrics_note_rtt(pulse_metrics_t *m, int64_t rtt_ms);
 /* Format one METRICS line (no trailing newline) into buf:
  *   METRICS suspected=N dead=N refutes=N joins=N seed_rejoins=N
  *           seed_rejoins_by_seed=<id>=N,<id>=N|->
+ *           seed_last_rejoin_ms_by_seed=<id>=N,<id>=N|->
  *           adaptive_fast_cycles=N suspect_refuted=N
  *           detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e]
  *           suspect_to_dead_ms mean=X max=Y samples=N
@@ -158,7 +173,9 @@ void metrics_note_rtt(pulse_metrics_t *m, int64_t rtt_ms);
  *           probe_rtt_ms mean=X max=Y samples=N hist=[a,b,c,d,e]
  * mean/max are "-" when there are no samples. The histograms are
  * always present (all zeros before any sample). The per-seed
- * breakdown is "-" when no seed has been re-joined yet. */
+ * breakdown is "-" when no seed has been re-joined yet, and the
+ * per-seed last-rejoin timestamps are "-" under the same rule —
+ * a seed that was never re-joined has no entry in either. */
 void metrics_format(const pulse_metrics_t *m, char *buf, size_t len);
 
 /* Format the per-seed seed-rejoin breakdown as a bare comma list
@@ -167,6 +184,13 @@ void metrics_format(const pulse_metrics_t *m, char *buf, size_t len);
 void metrics_seed_rejoins_text(const pulse_metrics_t *m, char *buf,
                                size_t len);
 
+/* Format the per-seed last-rejoin timestamps as a bare comma list
+ * "id=N,id=N" (no spaces) for the METRICS line, or "-" when no
+ * seed has been re-joined yet. N is the wall-clock time of the
+ * seed's most recent re-JOIN, as unix milliseconds. */
+void metrics_seed_last_rejoin_text(const pulse_metrics_t *m, char *buf,
+                                   size_t len);
+
 /* Format the per-seed seed-rejoin breakdown as a JSON object
  * "{\"id\":N,...}" for embedding in the JSON metrics object, or
  * "{}" when no seed has been re-joined yet. Member ids are
@@ -174,6 +198,13 @@ void metrics_seed_rejoins_text(const pulse_metrics_t *m, char *buf,
  * and need no JSON escaping. */
 void metrics_seed_rejoins_json(const pulse_metrics_t *m, char *buf,
                                size_t len);
+
+/* Format the per-seed last-rejoin timestamps as a JSON object
+ * "{\"id\":N,...}" for embedding in the JSON metrics object, or
+ * "{}" when no seed has been re-joined yet. N is the wall-clock
+ * time of the seed's most recent re-JOIN, as unix milliseconds. */
+void metrics_seed_last_rejoin_json(const pulse_metrics_t *m, char *buf,
+                                   size_t len);
 
 /* Format the detection-latency histogram as a bare comma list
  * "a,b,c,d,e" (no brackets) for embedding in a JSON array. */

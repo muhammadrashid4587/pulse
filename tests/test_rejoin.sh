@@ -126,5 +126,30 @@ else
     echo "--- prom"; echo "$prom"
 fi
 
+# 6. Per-seed last rejoin (0.55.0): when each seed was last retried,
+# as unix milliseconds — a 13-digit timestamp, recent (this run),
+# in all three views, under the same seed key as the breakdown.
+# A seed that was never re-joined has no entry anywhere; node 2
+# re-joined exactly one seed, so the value names it and is no
+# fabricated zero.
+if echo "$metrics" | grep -qE "seed_last_rejoin_ms_by_seed=127\\.0\\.0\\.1:17401=[0-9]{13}"; then
+    note ok "METRICS reports when the seed was last rejoined"
+else
+    note fail "METRICS reports when the seed was last rejoined"
+    echo "--- metrics"; echo "$metrics"
+fi
+if echo "$json" | grep -qE '"seed_last_rejoin_ms":\{"127\.0\.0\.1:17401":[0-9]{13}\}'; then
+    note ok "JSON reports when the seed was last rejoined"
+else
+    note fail "JSON reports when the seed was last rejoined"
+    echo "--- json"; echo "$json"
+fi
+if echo "$prom" | grep -qE 'pulse_seed_last_rejoin_ms\{seed="127\.0\.0\.1:17401"\} [0-9]{13}'; then
+    note ok "PROMETHEUS gauges when the seed was last rejoined"
+else
+    note fail "PROMETHEUS gauges when the seed was last rejoined"
+    echo "--- prom"; echo "$prom"
+fi
+
 echo "test_rejoin: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

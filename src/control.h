@@ -147,7 +147,13 @@
  *       been re-joined yet — so an operator polling the text
  *       protocol can see which seed a node keeps rejoining
  *       instead of only how often the retry fires; the counts
- *       sum to seed_rejoins.
+ *       sum to seed_rejoins. Per-seed last rejoin (0.55.0):
+ *       "seed_last_rejoin_ms_by_seed=<id>=N,<id>=N" rides right
+ *       after the breakdown — the wall-clock time of each seed's
+ *       most recent re-JOIN, as unix milliseconds, "-" under the
+ *       same rule — so an operator can also tell when each seed
+ *       was last retried; a seed that was never re-joined has no
+ *       entry in either, never a fabricated zero.
  *       Per-member phi (0.44.0): after the METRICS line, one
  *       "PHI <id> <value>" line per member that has a phi — phi
  *       mode on, not self, heartbeat history with at least
@@ -177,7 +183,13 @@
  *       (0.54.0): the per-seed breakdown of "seed_rejoins" as an
  *       object — {"127.0.0.1:17101":2} — or {} when no seed has
  *       been re-joined yet, so a JSON consumer can see which seed
- *       a node keeps rejoining. A top-level "peer_file" object carries the --peer-file
+ *       a node keeps rejoining. The metrics object also carries
+ *       "seed_last_rejoin_ms" (0.55.0): the same shape, but the
+ *       wall-clock time of each seed's most recent re-JOIN as unix
+ *       milliseconds — {"127.0.0.1:17101":1700000100000} — or {}
+ *       when no seed has been re-joined yet, so a JSON consumer
+ *       can tell when each seed was last retried; a seed that was
+ *       never re-joined has no key in either. A top-level "peer_file" object carries the --peer-file
  *       state (path, last_reload / last_mtime as unix seconds, and
  *       the counts from the last load), or null when the node runs
  *       without --peer-file. A top-level "watch" object (0.33.0)
@@ -220,7 +232,13 @@
  *       re-joined has no line, and a node that re-joined nothing
  *       emits the HELP/TYPE pair with no samples — so a scraper
  *       can alert on a single seed that keeps being rejoined;
- *       the event ring capacity (pulse_watch_event_log_cap, 0.36.0)
+ *       the wall-clock time of each seed's most recent re-JOIN
+ *       rides as "pulse_seed_last_rejoin_ms" (0.55.0), one
+ *       labelled gauge sample per re-joined seed, as unix
+ *       milliseconds — a seed never re-joined has no line, never
+ *       a fabricated zero — so a scraper can tell a retry that is
+ *       still firing from one that stopped when the cluster
+ *       merged; the event ring capacity (pulse_watch_event_log_cap, 0.36.0)
  *       as a gauge; the paused-stream count (pulse_watch_paused,
  *       0.37.0) as a gauge; the gossip digest size
  *       (pulse_gossip_digest_size, 0.41.0) as a gauge; the phi
