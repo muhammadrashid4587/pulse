@@ -1155,6 +1155,14 @@ static void probe_cycle(int cycle) {
         for (int i = 0; i < g_table.count; i++) {
             member_t *m = &g_table.members[i];
             if (strcmp(m->id, g_self_id) == 0) continue;
+            /* Phi history (0.47.0): sample the live phi every probe
+             * cycle for ALIVE and SUSPECT peers, so JSON can show how
+             * suspicion evolved instead of only the current value. A
+             * DEAD peer's history is frozen at suspicion: it is gone,
+             * its phi no longer changes, and sampling it would only
+             * push the interesting rise out of the bounded ring. */
+            if (m->state == MEMBER_ALIVE || m->state == MEMBER_SUSPECT)
+                phi_sample(&m->phi, now);
             if (m->state != MEMBER_ALIVE) continue;
             double phi = phi_value(&m->phi, now);
             int no_history = !m->phi.have_last;

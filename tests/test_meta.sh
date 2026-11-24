@@ -87,7 +87,7 @@ else
 fi
 json="$(ctl 18501 JSON)"
 if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
-   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17501","incarnation":1,"state":"ALIVE","phi":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null,"slow":false,"source":"self"}\]' \
+   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17501","incarnation":1,"state":"ALIVE","phi":null,"phi_history":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null,"slow":false,"source":"self"}\]' \
    && echo "$json" | grep -q "^END$"; then
     note ok "JSON carries annotations as a meta object"
 else
@@ -117,7 +117,7 @@ else
     echo "--- ctl output:"; echo "$members"
 fi
 json="$(ctl 18501 JSON)"
-if echo "$json" | grep -q '"id":"127.0.0.1:17502","incarnation":1,"state":"ALIVE","phi":null,"meta":{}'; then
+if echo "$json" | grep -q '"id":"127.0.0.1:17502","incarnation":1,"state":"ALIVE","phi":null,"phi_history":null,"meta":{}'; then
     note ok "JSON shows an empty meta object for a member with none"
 else
     note fail "JSON shows an empty meta object for a member with none"

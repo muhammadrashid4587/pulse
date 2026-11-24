@@ -91,6 +91,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_gossip_digest_size.sh
 	bash tests/test_phi_threshold_metrics.sh
 	bash tests/test_phi_threshold_json.sh
+	bash tests/test_phi_history_json.sh
 	bash tests/test_watch_backpressure.sh
 	bash tests/test_watch_events_persist.sh
 	bash tests/test_prometheus.sh

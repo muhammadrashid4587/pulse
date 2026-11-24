@@ -110,6 +110,39 @@ int main(void) {
     member_t *quiet = member_find(&tab, "127.0.0.1:17101");
     CHECK(phi_value(&quiet->phi, 100000) == 0.0);
 
+    /* Phi history (0.47.0): phi_sample records the live phi with its
+     * timestamp, oldest first, bounded at 16 samples. */
+    phi_accrual_t h;
+    phi_init(&h);
+    char hj[1024];
+    CHECK(phi_history_json(&h, 1000, hj, sizeof hj) == 2);
+    CHECK(strcmp(hj, "[]") == 0); /* no sample yet */
+    feed_regular(&h, 1000, 11, 100); /* 10 intervals, last at 2000 */
+    phi_sample(&h, 2100); /* 100 ms after last beat: phi near 0 */
+    phi_sample(&h, 2600); /* 600 ms after: phi climbing */
+    phi_sample(&h, 3000); /* 1000 ms after: phi past 8 */
+    CHECK(h.hist_count == 3);
+    CHECK(phi_history_json(&h, 1000, hj, sizeof hj) > 0);
+    /* Oldest first: ages 1100, 1600, 2000 ms since start, and the
+     * values rise with the silence. */
+    CHECK(strncmp(hj, "[[1100,0.", 9) == 0);
+    CHECK(strstr(hj, ",[1600,") != NULL);
+    CHECK(strstr(hj, ",[2000,") != NULL);
+    /* Same-millisecond re-sample is skipped, not duplicated. */
+    phi_sample(&h, 3000);
+    CHECK(h.hist_count == 3);
+    /* The ring is bounded: 20 more samples keep only the last 16,
+     * still oldest first, and the newest is the latest sample. */
+    for (int i = 0; i < 20; i++)
+        phi_sample(&h, 3100 + i * 100);
+    CHECK(h.hist_count == 16);
+    CHECK(phi_history_json(&h, 1000, hj, sizeof hj) > 0);
+    CHECK(strncmp(hj, "[[2500,", 7) == 0); /* 3100+400-1000, oldest kept */
+    CHECK(strstr(hj, "[4000,") != NULL);   /* newest: 5000-1000 age */
+    /* A buffer too small for the history reports -1. */
+    char tiny[4];
+    CHECK(phi_history_json(&h, 1000, tiny, sizeof tiny) == -1);
+
     printf("test_phi: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

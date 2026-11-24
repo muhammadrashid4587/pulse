@@ -567,8 +567,9 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
  * number when phi-accrual is on and the peer has heartbeat history,
  * null otherwise (including self). Latency means are null when there
  * are no samples. Built into a fixed buffer: 64 members at ~120
- * bytes each plus up to ~520 bytes of annotations each is under
- * 48 KB, so 64 KB has ample headroom. */
+ * bytes each plus up to ~520 bytes of annotations each plus up to
+ * ~360 bytes of phi history each is under 64 KB, so 128 KB has ample
+ * headroom. */
 static void handle_json(int fd, const control_hooks_t *hooks) {
     member_table_t t;
     hooks->snapshot(hooks->ctx, &t);
@@ -577,7 +578,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
     int phi_on = hooks->phi_enabled(hooks->ctx);
     int64_t now = pulse_now_ms();
     int64_t uptime = (now - hooks->start_ms) / 1000;
-    static char buf[65536];
+    static char buf[131072];
     size_t used = 0;
     int w = snprintf(buf + used, sizeof buf - used,
         "{\"id\":\"%s\",\"uptime\":%lld,\"alive\":%d,\"suspect\":%d,"
@@ -591,12 +592,27 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
     for (int i = 0; i < t.count; i++) {
         const member_t *mem = &t.members[i];
         char phibuf[32];
+        /* Phi history (0.47.0): the last 16 sampled phi values with
+         * their age in ms since this node started, oldest first —
+         * [[age_ms, phi], ...] — so a JSON consumer can see how a
+         * peer's suspicion evolved instead of only its live phi.
+         * Same rule as "phi" itself: null when phi-accrual is off,
+         * for self, or with no heartbeat history; "[]" when the
+         * peer has history but no probe cycle has sampled it yet.
+         * The samples are taken by the prober thread, never by a
+         * control-plane read: polling JSON must not move the
+         * history it is reading. */
+        char histbuf[512];
         if (!phi_on || strcmp(mem->id, hooks->self_id) == 0 ||
             !mem->phi.have_last || mem->phi.count < PULSE_PHI_MIN_SAMPLES) {
             snprintf(phibuf, sizeof phibuf, "null");
+            snprintf(histbuf, sizeof histbuf, "null");
         } else {
             snprintf(phibuf, sizeof phibuf, "%.2f",
                      phi_value(&mem->phi, now));
+            if (phi_history_json(&mem->phi, hooks->start_ms, histbuf,
+                                 sizeof histbuf) < 0)
+                snprintf(histbuf, sizeof histbuf, "[]");
         }
         /* Annotations are a JSON object: {"role":"worker"} — keys and
          * values are restricted to JSON-safe characters, so no
@@ -626,10 +642,10 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
          * distinguishable from a discovered one in JSON too. */
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
-                     "\"phi\":%s,\"meta\":%s,\"rtt_ms\":%s,"
+                     "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
                      "\"rtt_mean_ms\":%s,\"slow\":%s,\"source\":\"%s\"}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
-                     member_state_name(mem->state), phibuf, metajson,
+                     member_state_name(mem->state), phibuf, histbuf, metajson,
                      rttbuf, rttmeanbuf,
                      member_is_slow(mem, hooks->slow_rtt_threshold_ms)
                          ? "true"

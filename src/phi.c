@@ -2,6 +2,7 @@
 #include "phi.h"
 
 #include <math.h>
+#include <stdio.h>
 
 void phi_init(phi_accrual_t *p) {
     p->count = 0;
@@ -10,6 +11,8 @@ void phi_init(phi_accrual_t *p) {
     p->sumsq = 0.0;
     p->last_ms = 0;
     p->have_last = 0;
+    p->hist_count = 0;
+    p->hist_head = 0;
 }
 
 void phi_heartbeat(phi_accrual_t *p, int64_t now_ms) {
@@ -55,4 +58,44 @@ double phi_value(const phi_accrual_t *p, int64_t now_ms) {
     double phi = -log10(prob);
     if (phi > PULSE_PHI_MAX) phi = PULSE_PHI_MAX;
     return phi;
+}
+
+void phi_sample(phi_accrual_t *p, int64_t now_ms) {
+    /* Same-millisecond repeat: the probe cycle is at least 25 ms, so
+     * this only fires when two callers sample in one instant — the
+     * ring must hold distinct times, not duplicates. */
+    if (p->hist_count > 0) {
+        int last = (p->hist_head - 1 + PULSE_PHI_HISTORY) %
+                   PULSE_PHI_HISTORY;
+        if (p->hist_ms[last] == now_ms) return;
+    }
+    p->hist_phi[p->hist_head] = phi_value(p, now_ms);
+    p->hist_ms[p->hist_head] = now_ms;
+    p->hist_head = (p->hist_head + 1) % PULSE_PHI_HISTORY;
+    if (p->hist_count < PULSE_PHI_HISTORY) p->hist_count++;
+}
+
+int phi_history_json(const phi_accrual_t *p, int64_t start_ms, char *buf,
+                     size_t len) {
+    size_t used = 0;
+    int w = snprintf(buf + used, len - used, "[");
+    if (w < 0 || (size_t)w >= len - used) return -1;
+    used += (size_t)w;
+    /* Oldest first: the ring's oldest slot is hist_head - hist_count
+     * (wrapped), then forward. */
+    int start = p->hist_head - p->hist_count;
+    if (start < 0) start += PULSE_PHI_HISTORY;
+    for (int k = 0; k < p->hist_count; k++) {
+        int idx = (start + k) % PULSE_PHI_HISTORY;
+        w = snprintf(buf + used, len - used, "%s[%lld,%.2f]",
+                     k == 0 ? "" : ",",
+                     (long long)(p->hist_ms[idx] - start_ms),
+                     p->hist_phi[idx]);
+        if (w < 0 || (size_t)w >= len - used) return -1;
+        used += (size_t)w;
+    }
+    w = snprintf(buf + used, len - used, "]");
+    if (w < 0 || (size_t)w >= len - used) return -1;
+    used += (size_t)w;
+    return (int)used;
 }
