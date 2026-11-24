@@ -113,6 +113,10 @@
  *       stream in trouble: filtered events were excluded on
  *       purpose, while a growing dropped count means a consumer
  *       is not keeping up with the cluster.
+ *       watch_paused (0.37.0) is how many WATCH streams are
+ *       paused right now: a paused stream is still connected and
+ *       still counts as a subscriber, it just is not consuming
+ *       events — see "WATCH PAUSE / WATCH RESUME" below.
  *       watch_event_log_cap (0.36.0) is how many events the WATCH
  *       event ring holds — the --event-log-cap the node started
  *       with, 128 by default — so an operator can see how far
@@ -144,11 +148,14 @@
  *       (0.34.0): "delivered" (EVENT lines sent in total),
  *       "filtered" (events skipped by a stream's filter) and
  *       "dropped" (events lost to a gap in the event ring), and
+ *       "paused" (0.37.0, how many WATCH streams are paused right
+ *       now — a paused stream is still connected, it just is not
+ *       consuming events), and
  *       "event_log_cap" (0.36.0, how many events the WATCH ring
  *       holds — the --event-log-cap the node started with, 128 by
  *       default), and a "streams" array with the same three
  *       counts per currently-connected stream, keyed by its
- *       "session" number.
+ *       "session" number, plus "paused" per stream.
  *   PROMETHEUS
  *       The same values METRICS and JSON report, as Prometheus text
  *       exposition format, then END. Each metric family carries a
@@ -158,7 +165,8 @@
  *       joins, adaptive fast cycles, suspect refuted, watch
  *       sessions and the watch delivery / drop counts) as counters;
  *       the event ring capacity (pulse_watch_event_log_cap, 0.36.0)
- *       as a gauge; the three latency groups as mean/max/samples
+ *       as a gauge; the paused-stream count (pulse_watch_paused,
+ *       0.37.0) as a gauge; the three latency groups as mean/max/samples
  *       and max are 0 with no samples — Prometheus has no null —
  *       and the samples gauge says whether the mean is real); the
  *       detection latency also as a real histogram (the same five
@@ -234,6 +242,35 @@
  *       and is sent regardless of the filter; any line sent —
  *       EVENT, GAP, or HEARTBEAT — resets the 5 s clock, so a
  *       busy cluster never sees one.
+ *       Backpressure / pause (0.37.0): a slow consumer can stop
+ *       the flow without closing the connection — "WATCH PAUSE
+ *       <session>" on a separate connection pauses the stream
+ *       with that session number (the number JSON reports per
+ *       stream), and "WATCH RESUME <session>" resumes it. A
+ *       paused stream stops consuming events: its thread waits
+ *       instead of reading the ring, so the node keeps recording
+ *       into the same bounded ring and never grows memory for a
+ *       stream that is not reading. On resume the stream picks
+ *       up from the last sequence it consumed, replaying what
+ *       the ring still holds, in order; when the ring has
+ *       scrolled past the resume point the same gap signal
+ *       covers it — the stream ends with "ERR gap: events lost,
+ *       reconnect" and the lost events count as dropped. Both
+ *       commands are idempotent (pausing an already-paused
+ *       stream answers "OK paused <session>" again) and answer
+ *       "OK paused <session>" / "OK resumed <session>"; a
+ *       session that is not a live stream answers "ERR unknown
+ *       watch session <n>", a session that is not a number
+ *       answers "ERR invalid watch session <arg>", and a missing
+ *       session answers "ERR usage: WATCH PAUSE <session>".
+ *       A paused stream still sends its HEARTBEAT when 5 s pass
+ *       with nothing sent — the stream is alive, it is just not
+ *       consuming — and a paused stream whose client goes away
+ *       ends instead of lingering. METRICS reports how many
+ *       streams are paused ("watch_paused"), JSON carries the
+ *       count in the "watch" object ("paused") and per stream
+ *       ("paused":true/false), and PROMETHEUS carries
+ *       "pulse_watch_paused" as a gauge.
  *       Subscriber count (0.33.0): METRICS and JSON report how many
  *       WATCH streams are connected right now ("watch_subscribers"
  *       / "watch"."subscribers") and how many sessions the node has

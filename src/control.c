@@ -59,10 +59,85 @@ typedef struct {
     uint64_t delivered; /* EVENT lines sent on this stream */
     uint64_t filtered; /* events consumed but skipped by the filter */
     uint64_t dropped; /* events lost to a gap, never deliverable */
+    int paused; /* 1 when this stream is paused (0.37.0) */
     int active;
 } watch_stream_stat_t;
 
+/* WATCH pause (0.37.0): one entry per live WATCH stream, keyed by
+ * its session number, holding the stream's paused flag. A paused
+ * stream stops consuming events — its thread waits instead of
+ * calling watch_next — so a slow consumer can stop the flow
+ * without closing the connection, and resume later with the ring
+ * replaying what it missed (or the gap signal when the ring has
+ * scrolled past it). The entries live in a list of their own,
+ * separate from the 64-slot counts registry above: any live
+ * session can be paused, listed or not. The list is guarded by
+ * g_watch_mu; an entry is freed only by its own stream's thread
+ * when the stream ends, so a PAUSE / RESUME command can only ever
+ * find entries for streams that are still alive. */
+typedef struct watch_pause_entry {
+    uint64_t session;
+    int paused; /* 1 when the stream is paused */
+    struct watch_pause_entry *next;
+} watch_pause_entry_t;
+
 static pthread_mutex_t g_watch_mu = PTHREAD_MUTEX_INITIALIZER;
+static watch_pause_entry_t *g_watch_pause_list; /* under g_watch_mu */
+
+/* Find a pause entry by session. The caller must hold g_watch_mu. */
+static watch_pause_entry_t *watch_pause_find_locked(uint64_t session) {
+    for (watch_pause_entry_t *e = g_watch_pause_list; e; e = e->next)
+        if (e->session == session) return e;
+    return NULL;
+}
+
+/* Register a pause entry for a new stream. Returns the entry, or
+ * NULL on allocation failure: the stream still runs, it just
+ * cannot be paused (a PAUSE for its session then answers
+ * "unknown watch session"). */
+static watch_pause_entry_t *watch_pause_register(uint64_t session) {
+    watch_pause_entry_t *e = malloc(sizeof *e);
+    if (!e) return NULL;
+    e->session = session;
+    e->paused = 0;
+    pthread_mutex_lock(&g_watch_mu);
+    e->next = g_watch_pause_list;
+    g_watch_pause_list = e;
+    pthread_mutex_unlock(&g_watch_mu);
+    return e;
+}
+
+static void watch_pause_unregister(watch_pause_entry_t *e) {
+    if (!e) return;
+    pthread_mutex_lock(&g_watch_mu);
+    watch_pause_entry_t **p = &g_watch_pause_list;
+    while (*p && *p != e) p = &(*p)->next;
+    if (*p) *p = e->next;
+    pthread_mutex_unlock(&g_watch_mu);
+    free(e);
+}
+
+/* Set the paused flag for the stream with this session number.
+ * Returns 0 on success, -1 when no live stream has that session. */
+static int watch_pause_set(uint64_t session, int paused) {
+    pthread_mutex_lock(&g_watch_mu);
+    watch_pause_entry_t *e = watch_pause_find_locked(session);
+    if (e) e->paused = paused;
+    pthread_mutex_unlock(&g_watch_mu);
+    return e ? 0 : -1;
+}
+
+/* Is this stream paused? A watch thread reads its own entry's
+ * flag; a NULL entry (allocation failed at stream start) is never
+ * paused. */
+static int watch_pause_is_paused(watch_pause_entry_t *e) {
+    if (!e) return 0;
+    pthread_mutex_lock(&g_watch_mu);
+    int p = e->paused;
+    pthread_mutex_unlock(&g_watch_mu);
+    return p;
+}
+
 static int g_watch_current = 0;
 static uint64_t g_watch_total = 0;
 static uint64_t g_watch_delivered_total = 0;
@@ -76,6 +151,7 @@ typedef struct {
     uint64_t delivered;
     uint64_t filtered;
     uint64_t dropped;
+    int paused; /* WATCH streams paused right now (0.37.0) */
     watch_stream_stat_t streams[WATCH_MAX_STREAMS];
     int n_streams;
 } watch_stats_t;
@@ -87,10 +163,21 @@ static void watch_stats_snapshot(watch_stats_t *out) {
     out->delivered = g_watch_delivered_total;
     out->filtered = g_watch_filtered_total;
     out->dropped = g_watch_dropped_total;
+    out->paused = 0;
+    for (watch_pause_entry_t *e = g_watch_pause_list; e; e = e->next)
+        if (e->paused) out->paused++;
     out->n_streams = 0;
     for (int i = 0; i < WATCH_MAX_STREAMS; i++) {
-        if (g_watch_streams[i].active)
-            out->streams[out->n_streams++] = g_watch_streams[i];
+        if (g_watch_streams[i].active) {
+            watch_stream_stat_t s = g_watch_streams[i];
+            /* The paused flag lives in the pause list, keyed by
+             * session: a stream with no entry (allocation failed
+             * at stream start) is never paused. */
+            watch_pause_entry_t *e =
+                watch_pause_find_locked(s.session);
+            s.paused = e ? e->paused : 0;
+            out->streams[out->n_streams++] = s;
+        }
     }
     pthread_mutex_unlock(&g_watch_mu);
 }
@@ -404,11 +491,13 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
     snprintf(line + used, sizeof line - used,
              " watch_subscribers=%d watch_sessions=%llu "
              "watch_delivered=%llu watch_filtered=%llu "
-             "watch_dropped=%llu watch_event_log_cap=%d",
+             "watch_dropped=%llu watch_paused=%d "
+             "watch_event_log_cap=%d",
              ws.current, (unsigned long long)ws.sessions,
              (unsigned long long)ws.delivered,
              (unsigned long long)ws.filtered,
              (unsigned long long)ws.dropped,
+             ws.paused,
              event_log_cap_or_default(hooks));
     if (send_all(fd, line) != 0) return;
     send_all(fd, "\nEND\n");
@@ -555,12 +644,14 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         sw = snprintf(streams_json + s_used,
                       sizeof streams_json - s_used,
                       "%s{\"session\":%llu,\"delivered\":%llu,"
-                      "\"filtered\":%llu,\"dropped\":%llu}",
+                      "\"filtered\":%llu,\"dropped\":%llu,"
+                      "\"paused\":%s}",
                       i == 0 ? "" : ",",
                       (unsigned long long)ws.streams[i].session,
                       (unsigned long long)ws.streams[i].delivered,
                       (unsigned long long)ws.streams[i].filtered,
-                      (unsigned long long)ws.streams[i].dropped);
+                      (unsigned long long)ws.streams[i].dropped,
+                      ws.streams[i].paused ? "true" : "false");
         if (sw < 0 || (size_t)sw >= sizeof streams_json - s_used) return;
         s_used += (size_t)sw;
     }
@@ -577,7 +668,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"max\":%lld,\"samples\":%lld}},\"peer_file\":%s,"
         "\"watch\":{\"subscribers\":%d,\"sessions\":%llu,"
         "\"delivered\":%llu,\"filtered\":%llu,\"dropped\":%llu,"
-        "\"event_log_cap\":%d,\"streams\":%s}}\nEND\n",
+        "\"paused\":%d,\"event_log_cap\":%d,\"streams\":%s}}\nEND\n",
         (long long)m.suspected, (long long)m.dead, (long long)m.refutes,
         (long long)m.joins, (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
@@ -592,6 +683,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (unsigned long long)ws.delivered,
         (unsigned long long)ws.filtered,
         (unsigned long long)ws.dropped,
+        ws.paused,
         event_log_cap_or_default(hooks), streams_json);
     if (w < 0 || (size_t)w >= sizeof buf - used) return;
     send_all(fd, buf);
@@ -812,6 +904,14 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         "right now.\n"
         "# TYPE pulse_watch_subscribers gauge\n"
         "pulse_watch_subscribers %d\n", ws.current) == 0;
+    /* Paused streams (0.37.0): how many WATCH streams are paused
+     * right now — a paused stream is still connected and still
+     * counts as a subscriber, it just is not consuming events. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_watch_paused WATCH streams paused right "
+        "now.\n"
+        "# TYPE pulse_watch_paused gauge\n"
+        "pulse_watch_paused %d\n", ws.paused) == 0;
     ok &= prom_add(buf, sizeof buf, &used,
         "# HELP pulse_watch_sessions_total WATCH sessions served "
         "since startup.\n"
@@ -1131,6 +1231,104 @@ static int watch_filter_match_id(const watch_filter_t *f, const char *id) {
     return 0;
 }
 
+/* WATCH PAUSE / WATCH RESUME (0.37.0): one-shot commands on a
+ * separate connection that pause or resume an existing WATCH
+ * stream by its session number (the number JSON reports per
+ * stream). Pausing stops the stream consuming events — it waits
+ * instead of calling watch_next — so a slow consumer can stop
+ * the flow without closing the connection; resuming picks up
+ * from the last consumed sequence, replaying what the ring still
+ * holds, or the stream ends with ERR gap when the ring has
+ * scrolled past it. Both are idempotent: pausing an already
+ * paused stream (or resuming a running one) answers OK again —
+ * the state is observable in METRICS / JSON, so the reply does
+ * not need to say whether anything changed. A session that is
+ * not a live stream — never existed, or already closed — answers
+ * ERR unknown watch session; a session that is not a number, or
+ * 0 (sessions start at 1), answers ERR invalid watch session;
+ * a missing session answers ERR usage. */
+static void handle_watch_pause(int fd, const char *arg) {
+    int pause = strncmp(arg, "PAUSE", 5) == 0;
+    const char *rest = arg + (pause ? 5 : 6);
+    while (*rest == ' ' || *rest == '\t') rest++;
+    if (*rest == '\0') {
+        char line[64];
+        snprintf(line, sizeof line, "ERR usage: WATCH %s <session>\n",
+                 pause ? "PAUSE" : "RESUME");
+        send_all(fd, line);
+        return;
+    }
+    /* The session is digits only, with trailing blanks allowed —
+     * anything else is not a session number. */
+    const char *p = rest;
+    while (*p >= '0' && *p <= '9') p++;
+    const char *digits_end = p;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '\0' || digits_end == rest) {
+        char line[128];
+        snprintf(line, sizeof line, "ERR invalid watch session %s\n",
+                 rest);
+        send_all(fd, line);
+        return;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(rest, &end, 10);
+    if (errno != 0 || v == 0) {
+        char line[128];
+        snprintf(line, sizeof line, "ERR invalid watch session %s\n",
+                 rest);
+        send_all(fd, line);
+        return;
+    }
+    if (watch_pause_set((uint64_t)v, pause) != 0) {
+        char line[128];
+        snprintf(line, sizeof line,
+                 "ERR unknown watch session %llu\n", v);
+        send_all(fd, line);
+        return;
+    }
+    char line[64];
+    snprintf(line, sizeof line, "OK %s %llu\n",
+             pause ? "paused" : "resumed", v);
+    send_all(fd, line);
+}
+
+/* Wait while this stream is paused (0.37.0): sleep in 100 ms
+ * slices so a resume lands within a tenth of a second, checking
+ * each slice whether the client went away (a closed socket ends
+ * the stream — a paused stream whose client is gone must not
+ * linger as a thread forever) and sending the heartbeat when the
+ * stream has sent nothing for 5 s. The heartbeat keeps its usual
+ * meaning while paused — the stream is alive, it is just not
+ * consuming events — and it is the only line a paused stream
+ * sends, so a paused consumer sees no EVENT lines at all.
+ * Returns 0 when the stream resumed (or was never paused), -1
+ * when the client went away or a heartbeat send failed. */
+static int watch_wait_paused(int fd, watch_pause_entry_t *pause_entry,
+                             int64_t *last_sent_ms) {
+    char line[256];
+    while (watch_pause_is_paused(pause_entry)) {
+        struct timespec ts = { .tv_sec = 0,
+                               .tv_nsec = 100 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        char c;
+        ssize_t n = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n == 0) return -1;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+            errno != EINTR)
+            return -1;
+        int64_t now_ms = pulse_now_ms();
+        if (now_ms - *last_sent_ms >= WATCH_HEARTBEAT_IDLE_MS) {
+            snprintf(line, sizeof line, "HEARTBEAT %lld\n",
+                     (long long)time(NULL));
+            if (send_all(fd, line) != 0) return -1;
+            *last_sent_ms = now_ms;
+        }
+    }
+    return 0;
+}
+
 /* WATCH (0.29.0): stream membership events on a long-lived
  * connection. Runs on its own thread (see start_watch): the accept
  * loop keeps serving one-shot commands while a client watches.
@@ -1200,9 +1398,29 @@ static int watch_filter_match_id(const watch_filter_t *f, const char *id) {
  * buffered one). A send that fails ends the stream and is counted
  * neither way — the client is gone, so there is no consumer left
  * to report it to. The counts are per stream and feed lifetime
- * totals, exposed in METRICS and JSON. */
+ * totals, exposed in METRICS and JSON.
+ *
+ * Pause / resume (0.37.0): a stream paused with "WATCH PAUSE
+ * <session>" stops consuming events — its thread waits instead of
+ * calling watch_next — so a slow consumer can stop the flow
+ * without closing the connection. The events it misses while
+ * paused stay in the bounded ring: on "WATCH RESUME <session>"
+ * the stream picks up from the last sequence it consumed,
+ * replaying what the ring still holds, in order, exactly as a
+ * live stream does. When the ring has scrolled past the resume
+ * point the same gap signal covers it: the stream ends with
+ * "ERR gap: events lost, reconnect" and the lost events count as
+ * dropped, as with any mid-stream gap. A paused stream still
+ * sends its HEARTBEAT when 5 s pass with nothing sent — the
+ * stream is alive, it is just not consuming — and a paused stream
+ * whose client goes away ends, like any other stream, instead of
+ * lingering as a thread. Pausing never stalls the node and never
+ * grows memory: the node keeps recording events into the same
+ * bounded ring, and the paused stream simply does not read from
+ * it. */
 static void handle_watch(int fd, const control_hooks_t *hooks,
-                         const char *arg, int slot) {
+                         const char *arg, int slot,
+                         watch_pause_entry_t *pause_entry) {
     watch_filter_t filter;
     char ferr[128];
     if (parse_watch_filter(arg, &filter, ferr, sizeof ferr) != 0) {
@@ -1295,9 +1513,32 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
      * behind mid-stream: ERR and close, as before. */
     int first_wait = 1;
     for (;;) {
+        /* Paused (0.37.0): stop consuming events until the stream
+         * is resumed — the sequence number stays where it was, so
+         * the resume replays from the ring (or ends with ERR gap
+         * when the ring has scrolled past it). A client that went
+         * away while paused ends the stream here. */
+        if (watch_wait_paused(fd, pause_entry, &last_sent_ms) != 0)
+            break;
         pulse_event_t ev;
         int r = watch_next(hooks->ctx, seq, &ev, 1000);
         if (r == 1) {
+            /* Paused (0.37.0): the event arrived while a PAUSE
+             * was landing — the thread was already inside the
+             * wait when the flag flipped, so the loop-top check
+             * above never saw it. Do not send it and do not
+             * consume it: rewind the cursor so the resume
+             * replays it from the ring (or ends with ERR gap
+             * when the ring has scrolled past it), then wait
+             * paused. An event already being sent when the
+             * pause lands — returned before the flag flipped —
+             * still arrives: the pause stops the flow from the
+             * moment it takes effect, it does not recall a line
+             * already on the wire. */
+            if (watch_pause_is_paused(pause_entry)) {
+                seq = ev.seq - 1;
+                continue;
+            }
             first_wait = 0;
             /* Always consume the sequence number, even for a
              * filtered-out event: the next wait is for the event
@@ -1397,13 +1638,23 @@ typedef struct {
      * the session number it was assigned at start. */
     int slot;
     uint64_t session;
+    /* Pause / resume (0.37.0): this stream's entry in the pause
+     * list (NULL when its allocation failed — the stream then
+     * runs unpausable). The thread frees it when the stream
+     * ends. */
+    watch_pause_entry_t *pause_entry;
 } watch_arg_t;
 
 static void *watch_thread(void *arg) {
     watch_arg_t *w = arg;
     int slot = w->slot;
-    handle_watch(w->fd, w->hooks, w->arg, slot);
+    watch_pause_entry_t *pause_entry = w->pause_entry;
+    handle_watch(w->fd, w->hooks, w->arg, slot, pause_entry);
     free(w);
+    /* The stream is over: give its pause entry back (a later
+     * PAUSE for this session must answer "unknown session") and
+     * its registry slot, and leave the subscriber count. */
+    watch_pause_unregister(pause_entry);
     /* The stream is over: this subscriber leaves the count and
      * gives its registry slot back. The increment happened in
      * start_watch before the thread was created, so the count can
@@ -1444,8 +1695,13 @@ static int start_watch(int fd, const control_hooks_t *hooks,
     w->session = g_watch_total;
     pthread_mutex_unlock(&g_watch_mu);
     w->slot = watch_stream_register(w->session);
+    /* Pause / resume (0.37.0): register the stream's pause entry
+     * before the thread starts, so a PAUSE sent the moment the
+     * stream opens already finds it. */
+    w->pause_entry = watch_pause_register(w->session);
     pthread_t th;
     if (pthread_create(&th, NULL, watch_thread, w) != 0) {
+        watch_pause_unregister(w->pause_entry);
         watch_stream_unregister(w->slot);
         pthread_mutex_lock(&g_watch_mu);
         g_watch_current--;
@@ -1496,7 +1752,20 @@ static int handle_connection(int fd, const control_hooks_t *hooks) {
     } else if (strcmp(line, "JSON") == 0) {
         handle_json(fd, hooks);
     } else if (strcmp(line, "WATCH") == 0) {
-        return start_watch(fd, hooks, arg);
+        /* WATCH PAUSE <session> / WATCH RESUME <session>
+         * (0.37.0) are one-shot commands on a separate
+         * connection, not new streams: they pause or resume an
+         * existing WATCH stream by its session number. Anything
+         * else starts a stream. (A bare "PAUSE" was never a valid
+         * filter token, so no valid WATCH is affected.) */
+        if (arg && (strcmp(arg, "PAUSE") == 0 ||
+                    strncmp(arg, "PAUSE ", 6) == 0 ||
+                    strcmp(arg, "RESUME") == 0 ||
+                    strncmp(arg, "RESUME ", 7) == 0)) {
+            handle_watch_pause(fd, arg);
+        } else {
+            return start_watch(fd, hooks, arg);
+        }
     } else {
         send_all(fd, "ERR unknown command\n");
     }

@@ -123,7 +123,7 @@ else
     note fail "METRICS reports 0 delivered, 0 filtered, 0 dropped with no watcher"
     ctl 18871 METRICS
 fi
-if ctl 18871 JSON | grep -Fq '"watch":{"subscribers":0,"sessions":0,"delivered":0,"filtered":0,"dropped":0,"event_log_cap":128,"streams":[]}'; then
+if ctl 18871 JSON | grep -Fq '"watch":{"subscribers":0,"sessions":0,"delivered":0,"filtered":0,"dropped":0,"paused":0,"event_log_cap":128,"streams":[]}'; then
     note ok "JSON reports 0 delivered/filtered/dropped and no live streams with no watcher"
 else
     note fail "JSON reports 0 delivered/filtered/dropped and no live streams with no watcher"

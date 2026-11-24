@@ -99,7 +99,7 @@ else
     note fail "METRICS reports 0 subscribers and 0 sessions with no watcher"
     ctl 18861 METRICS
 fi
-if ctl 18861 JSON | grep -Fq '"watch":{"subscribers":0,"sessions":0,"delivered":0,"filtered":0,"dropped":0,"event_log_cap":128,"streams":[]}'; then
+if ctl 18861 JSON | grep -Fq '"watch":{"subscribers":0,"sessions":0,"delivered":0,"filtered":0,"dropped":0,"paused":0,"event_log_cap":128,"streams":[]}'; then
     note ok "JSON reports 0 subscribers and 0 sessions with no watcher"
 else
     note fail "JSON reports 0 subscribers and 0 sessions with no watcher"
@@ -118,7 +118,7 @@ else
     note fail "one WATCH: METRICS reports 1 subscriber, 1 session"
     ctl 18861 METRICS
 fi
-if ctl 18861 JSON | grep -Fq '"watch":{"subscribers":1,"sessions":1,"delivered":0,"filtered":0,"dropped":0,"event_log_cap":128,"streams":[{"session":1,"delivered":0,"filtered":0,"dropped":0}]}'; then
+if ctl 18861 JSON | grep -Fq '"watch":{"subscribers":1,"sessions":1,"delivered":0,"filtered":0,"dropped":0,"paused":0,"event_log_cap":128,"streams":[{"session":1,"delivered":0,"filtered":0,"dropped":0,"paused":false}]}'; then
     note ok "one WATCH: JSON reports 1 subscriber, 1 session"
 else
     note fail "one WATCH: JSON reports 1 subscriber, 1 session"

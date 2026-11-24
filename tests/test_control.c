@@ -49,7 +49,17 @@
  * and the events it lost to a gap in the event ring, and METRICS
  * and JSON report the totals plus a per-stream breakdown keyed by
  * session number; the counts end to end are covered by
- * tests/test_watch_delivery.sh. Prometheus exposition format
+ * tests/test_watch_delivery.sh. WATCH backpressure / pause
+ * (0.37.0) is covered here too: a stream paused with "WATCH PAUSE
+ * <session>" stops consuming events — one recorded while it is
+ * paused never reaches it — and METRICS / JSON report it paused,
+ * and "WATCH RESUME <session>" resumes it with the held event
+ * replayed from the ring; pausing an already-paused stream and
+ * resuming a running one answer OK again, and a bad pause /
+ * resume (unknown session, non-numeric session, missing session)
+ * is refused up front. The pause end to end — including the gap
+ * when a paused stream's resume point scrolls out of a small ring
+ * — is covered by tests/test_watch_backpressure.sh. Prometheus exposition format
  * (0.35.0) is covered here too: the same values as counters,
  * gauges, a real detection-latency histogram and one
  * pulse_member_info gauge per member, with the peer-file gauges
@@ -608,7 +618,7 @@ int main(void) {
                  "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
                  "pf_bad=0 watch_subscribers=0 watch_sessions=0 "
                  "watch_delivered=0 watch_filtered=0 watch_dropped=0 "
-                 "watch_event_log_cap=128\nEND\n") == 0);
+                 "watch_paused=0 watch_event_log_cap=128\nEND\n") == 0);
 
     /* JSON (0.28.0): the same state as a "peer_file" object, and
      * each member carries its "source" — the peer-file peer is
@@ -837,9 +847,10 @@ int main(void) {
         CHECK(strstr(reply,
                      "\"watch\":{\"subscribers\":1,\"sessions\":2,"
                      "\"delivered\":2,\"filtered\":0,\"dropped\":0,"
-                     "\"event_log_cap\":128,"
+                     "\"paused\":0,\"event_log_cap\":128,"
                      "\"streams\":[{\"session\":2,\"delivered\":0,"
-                     "\"filtered\":0,\"dropped\":0}]}") != NULL);
+                     "\"filtered\":0,\"dropped\":0,"
+                     "\"paused\":false}]}") != NULL);
         int tfd = watch_connect(18991);
         CHECK(tfd >= 0);
         if (tfd >= 0) {
@@ -864,7 +875,7 @@ int main(void) {
         CHECK(strstr(reply,
                      "\"watch\":{\"subscribers\":0,\"sessions\":3,"
                      "\"delivered\":2,\"filtered\":0,\"dropped\":0,"
-                     "\"event_log_cap\":128,"
+                     "\"paused\":0,\"event_log_cap\":128,"
                      "\"streams\":[]}") != NULL);
     }
 
@@ -1236,6 +1247,95 @@ int main(void) {
         CHECK(metrics_wait_contains(
             18991, "watch_subscribers=0 watch_sessions=13", 5000));
     }
+
+    /* WATCH pause / resume (0.37.0): a stream paused with
+     * "WATCH PAUSE <session>" stops consuming events — one
+     * recorded while it is paused never reaches it — and METRICS
+     * / JSON report it paused (watch_paused=1, and the stream's
+     * "paused":true); "WATCH RESUME <session>" resumes it and
+     * the held event arrives, replayed from the ring, in order.
+     * The log holds seqs 1-145 here and sessions 1-13 are done,
+     * so this stream is session 14 and the recorded event is seq
+     * 146. Pausing an already-paused stream (and resuming a
+     * running one) answers OK again: the state is observable in
+     * METRICS / JSON, so the reply does not need to say whether
+     * anything changed. */
+    int wpfd = watch_connect(18991);
+    CHECK(wpfd >= 0);
+    if (wpfd >= 0) {
+        const char *wpcmd = "WATCH\n";
+        CHECK(send(wpfd, wpcmd, strlen(wpcmd), 0) == (ssize_t)strlen(wpcmd));
+        char wpbuf[4096];
+        size_t wplen = 0;
+        wpbuf[0] = '\0';
+        CHECK(watch_read_until(wpfd, wpbuf, sizeof wpbuf, &wplen, "END\n",
+                               3000));
+        CHECK(strncmp(wpbuf, "OK watching\n", 12) == 0);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=1 watch_sessions=14", 5000));
+        /* Pause it: the one-shot command answers OK, and the
+         * paused state shows in METRICS and in the per-stream
+         * JSON entry. */
+        CHECK(send_cmd(18991, "WATCH PAUSE 14\n", reply,
+                       sizeof reply) > 0);
+        CHECK(strcmp(reply, "OK paused 14\n") == 0);
+        CHECK(metrics_wait_contains(18991, "watch_paused=1", 5000));
+        CHECK(json_wait_contains(
+            18991,
+            "\"session\":14,\"delivered\":0,\"filtered\":0,"
+            "\"dropped\":0,\"paused\":true",
+            5000));
+        /* Pausing again is idempotent: OK again, still paused. */
+        CHECK(send_cmd(18991, "WATCH PAUSE 14\n", reply,
+                       sizeof reply) > 0);
+        CHECK(strcmp(reply, "OK paused 14\n") == 0);
+        /* An event recorded while paused never reaches the
+         * stream: a 1.5 s read for it times out, and the buffer
+         * holds no EVENT line past the snapshot. The read
+         * timeout is set by watch_read_until itself, and the
+         * stream is far short of its 5 s heartbeat, so nothing
+         * else arrives in the window either. */
+        pulse_event_record(&g_watch_log, PULSE_EVENT_JOINED,
+                           "127.0.0.1:17901", 1, 1700000500);
+        CHECK(watch_read_until(wpfd, wpbuf, sizeof wpbuf, &wplen,
+                               "EVENT 146 ", 1500) == 0);
+        CHECK(strstr(wpbuf, "EVENT 146 ") == NULL);
+        /* Resume it: the held event arrives, replayed from the
+         * ring, and the stream is unpaused. */
+        CHECK(send_cmd(18991, "WATCH RESUME 14\n", reply,
+                       sizeof reply) > 0);
+        CHECK(strcmp(reply, "OK resumed 14\n") == 0);
+        CHECK(watch_read_until(wpfd, wpbuf, sizeof wpbuf, &wplen,
+                               "EVENT 146 JOINED 127.0.0.1:17901 1 1700000500\n",
+                               3000));
+        CHECK(metrics_wait_contains(18991, "watch_paused=0", 5000));
+        CHECK(json_wait_contains(
+            18991,
+            "\"session\":14,\"delivered\":1,\"filtered\":0,"
+            "\"dropped\":0,\"paused\":false",
+            5000));
+        /* Resuming a running stream is idempotent too. */
+        CHECK(send_cmd(18991, "WATCH RESUME 14\n", reply,
+                       sizeof reply) > 0);
+        CHECK(strcmp(reply, "OK resumed 14\n") == 0);
+        close(wpfd);
+        CHECK(metrics_wait_contains(
+            18991, "watch_subscribers=0 watch_sessions=14", 5000));
+    }
+
+    /* Bad pause / resume commands are refused up front: a
+     * session that is not a live stream, a session that is not
+     * a number, and a missing session. */
+    CHECK(send_cmd(18991, "WATCH PAUSE 99\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply, "ERR unknown watch session 99\n") == 0);
+    CHECK(send_cmd(18991, "WATCH RESUME 99\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply, "ERR unknown watch session 99\n") == 0);
+    CHECK(send_cmd(18991, "WATCH PAUSE xyz\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply, "ERR invalid watch session xyz\n") == 0);
+    CHECK(send_cmd(18991, "WATCH PAUSE\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply, "ERR usage: WATCH PAUSE <session>\n") == 0);
+    CHECK(send_cmd(18991, "WATCH RESUME\n", reply, sizeof reply) > 0);
+    CHECK(strcmp(reply, "ERR usage: WATCH RESUME <session>\n") == 0);
 
     /* A bad filter is refused up front, and the connection closes. */
     CHECK(send_cmd(18991, "WATCH BOGUS\n", reply, sizeof reply) > 0);
