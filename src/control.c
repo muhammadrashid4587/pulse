@@ -678,7 +678,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                  (long long)pf.last_mtime_unix, pf.peers, pf.added,
                  pf.dropped, pf.kept, pf.bad);
     }
-    char dmean[16], smean[16], rmean[16], dhist[64];
+    char dmean[16], smean[16], rmean[16], pmean[16], dhist[64],
+        prhist[64];
     if (m.detect_samples > 0)
         snprintf(dmean, sizeof dmean, "%lld",
                  (long long)(m.detect_sum_ms / m.detect_samples));
@@ -694,7 +695,17 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                  (long long)(m.refute_sum_ms / m.refute_samples));
     else
         snprintf(rmean, sizeof rmean, "null");
+    /* Probe-RTT histogram (0.48.0): the same mean/max/samples/hist
+     * shape as detect_latency_ms, over answered direct probes —
+     * mean is null with no samples yet, like the other latency
+     * groups. */
+    if (m.rtt_samples > 0)
+        snprintf(pmean, sizeof pmean, "%lld",
+                 (long long)(m.rtt_sum_ms / m.rtt_samples));
+    else
+        snprintf(pmean, sizeof pmean, "null");
     metrics_detect_hist_json(&m, dhist, sizeof dhist);
+    metrics_rtt_hist_json(&m, prhist, sizeof prhist);
     /* WATCH subscribers (0.33.0): the same counts METRICS reports,
      * as a top-level "watch" object — how many WATCH streams are
      * connected right now, and how many sessions since startup —
@@ -746,7 +757,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
         "\"max\":%lld,\"samples\":%lld},\"refute_latency_ms\":{\"mean\":%s,"
-        "\"max\":%lld,\"samples\":%lld}},\"peer_file\":%s,"
+        "\"max\":%lld,\"samples\":%lld},\"probe_rtt_ms\":{\"mean\":%s,"
+        "\"max\":%lld,\"samples\":%lld,\"hist\":[%s]}},\"peer_file\":%s,"
         "\"watch\":{\"subscribers\":%d,\"sessions\":%llu,"
         "\"delivered\":%llu,\"filtered\":%llu,\"dropped\":%llu,"
         "\"paused\":%d,\"event_log_cap\":%d,\"streams\":%s},"
@@ -760,7 +772,10 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (long long)m.suspect_dead_max_ms,
         (long long)m.suspect_dead_samples,
         rmean, (long long)m.refute_max_ms,
-        (long long)m.refute_samples, pfjson, ws.current,
+        (long long)m.refute_samples,
+        pmean, (long long)m.rtt_max_ms,
+        (long long)m.rtt_samples, prhist,
+        pfjson, ws.current,
         (unsigned long long)ws.sessions,
         (unsigned long long)ws.delivered,
         (unsigned long long)ws.filtered,
@@ -788,7 +803,10 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
  * mean is real), and the detection latency also rides as a real
  * histogram: the same five buckets METRICS reports as hist, with
  * _sum and _count, so a scraper can compute quantiles instead of
- * trusting the mean. Each member rides as a pulse_member_info
+ * trusting the mean. The probe RTT rides the same way since
+ * 0.48.0: mean/max/samples gauges plus a real histogram over the
+ * same five buckets METRICS reports as probe_rtt_ms hist
+ * (<1, 1-4, 5-9, 10-49, >=50 ms). Each member rides as a pulse_member_info
  * gauge (1, labelled by member, state and source), so a scraper
  * can alert on a member's state without polling JSON. The
  * peer-file gauges are only emitted when the node runs with
@@ -945,6 +963,59 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             "pulse_detect_latency_ms_count %lld\n",
             (long long)m.detect_sum_ms,
             (long long)m.detect_samples) == 0;
+    }
+    /* Probe-RTT histogram (0.48.0): the same shape as the
+     * detection-latency histogram — mean/max/samples gauges plus a
+     * real histogram, cumulative, with _sum and _count — but over
+     * answered direct probes: buckets <1, 1-4, 5-9, 10-49, >=50 ms,
+     * the same five buckets METRICS reports as probe_rtt_ms hist.
+     * A mean of 0 with 0 samples means "no probe answered yet". */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_probe_rtt_ms_mean Mean direct-probe "
+        "round-trip time in ms.\n"
+        "# TYPE pulse_probe_rtt_ms_mean gauge\n"
+        "pulse_probe_rtt_ms_mean %lld\n",
+        (long long)(m.rtt_samples > 0
+                        ? m.rtt_sum_ms / m.rtt_samples
+                        : 0)) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_probe_rtt_ms_max Max direct-probe "
+        "round-trip time in ms.\n"
+        "# TYPE pulse_probe_rtt_ms_max gauge\n"
+        "pulse_probe_rtt_ms_max %lld\n",
+        (long long)m.rtt_max_ms) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_probe_rtt_ms_samples Direct probes answered.\n"
+        "# TYPE pulse_probe_rtt_ms_samples gauge\n"
+        "pulse_probe_rtt_ms_samples %lld\n",
+        (long long)m.rtt_samples) == 0;
+    {
+        static const int64_t bounds[] = PULSE_RTT_HIST_BOUNDS;
+        int64_t cumulative = 0;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_probe_rtt_ms Direct-probe round-trip "
+            "time in ms.\n"
+            "# TYPE pulse_probe_rtt_ms histogram\n") == 0;
+        for (int b = 0; b < PULSE_RTT_HIST_BUCKETS; b++) {
+            cumulative += m.rtt_hist[b];
+            if (b < PULSE_RTT_HIST_BUCKETS - 1) {
+                ok &= prom_add(buf, sizeof buf, &used,
+                    "pulse_probe_rtt_ms_bucket{le=\"%lld\"} "
+                    "%lld\n",
+                    (long long)bounds[b],
+                    (long long)cumulative) == 0;
+            } else {
+                ok &= prom_add(buf, sizeof buf, &used,
+                    "pulse_probe_rtt_ms_bucket{le=\"+Inf\"} "
+                    "%lld\n",
+                    (long long)cumulative) == 0;
+            }
+        }
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_probe_rtt_ms_sum %lld\n"
+            "pulse_probe_rtt_ms_count %lld\n",
+            (long long)m.rtt_sum_ms,
+            (long long)m.rtt_samples) == 0;
     }
     ok &= prom_add(buf, sizeof buf, &used,
         "# HELP pulse_suspect_to_dead_ms_mean Mean SUSPECT to DEAD "

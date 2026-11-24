@@ -232,6 +232,16 @@ static void metrics_hook(void *ctx, pulse_metrics_t *out) {
         out->refute_samples = 1;
         out->refute_sum_ms = 120;
         out->refute_max_ms = 120;
+        /* Five probe-RTT samples, one per bucket (0.48.0): 0, 2, 7,
+         * 25 and 80 ms — mean 22, max 80, hist [1,1,1,1,1]. */
+        out->rtt_samples = 5;
+        out->rtt_sum_ms = 114;
+        out->rtt_max_ms = 80;
+        out->rtt_hist[0] = 1;
+        out->rtt_hist[1] = 1;
+        out->rtt_hist[2] = 1;
+        out->rtt_hist[3] = 1;
+        out->rtt_hist[4] = 1;
     }
 }
 
@@ -738,7 +748,8 @@ int main(void) {
                  "detect_latency_ms mean=- max=- samples=0 "
                  "hist=[0,0,0,0,0] suspect_to_dead_ms mean=- max=- "
                  "samples=0 refute_latency_ms mean=- max=- samples=0 "
-                 "slow_peers=0 peer_file=/tmp/peers "
+                 "probe_rtt_ms mean=- max=- samples=0 "
+                 "hist=[0,0,0,0,0] slow_peers=0 peer_file=/tmp/peers "
                  "last_reload=1700000000 last_mtime=1699999000 "
                  "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
                  "pf_bad=0 watch_subscribers=0 watch_sessions=0 "
@@ -792,6 +803,13 @@ int main(void) {
         CHECK(strstr(reply, "\"phi_threshold\":8.00") != NULL);
         g_hooks.phi_threshold = saved;
     }
+    /* Probe-RTT histogram (0.48.0): the same mean/max/samples/
+     * hist shape as detect_latency_ms, over answered direct
+     * probes — here the canned metrics are all zero, so the mean
+     * is null and the histogram is empty. */
+    CHECK(strstr(reply,
+                 "\"probe_rtt_ms\":{\"mean\":null,\"max\":0,"
+                 "\"samples\":0,\"hist\":[0,0,0,0,0]}") != NULL);
     /* The peer_file object sits at the top level, after metrics. */
     {
         const char *metrics = strstr(reply, "\"metrics\":{");
@@ -879,6 +897,23 @@ int main(void) {
         CHECK(strstr(preply, "pulse_detect_latency_ms_bucket{le=\"+Inf\"} 2\n") != NULL);
         CHECK(strstr(preply, "pulse_detect_latency_ms_sum 450\n") != NULL);
         CHECK(strstr(preply, "pulse_detect_latency_ms_count 2\n") != NULL);
+        /* Probe-RTT histogram (0.48.0): the same shape as the
+         * detection histogram — mean/max/samples gauges plus a
+         * real histogram with cumulative buckets — over the five
+         * canned samples 0, 2, 7, 25, 80 ms: mean 22, max 80,
+         * one per bucket, so every cumulative bucket steps by 1. */
+        CHECK(strstr(preply, "# TYPE pulse_probe_rtt_ms_mean gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_mean 22\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_max 80\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_samples 5\n") != NULL);
+        CHECK(strstr(preply, "# TYPE pulse_probe_rtt_ms histogram\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_bucket{le=\"1\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_bucket{le=\"5\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_bucket{le=\"10\"} 3\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_bucket{le=\"50\"} 4\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_bucket{le=\"+Inf\"} 5\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_sum 114\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_count 5\n") != NULL);
         /* Watch counts: no watcher has connected yet, all zero. */
         CHECK(strstr(preply, "pulse_watch_subscribers 0\n") != NULL);
         CHECK(strstr(preply, "pulse_watch_sessions_total 0\n") != NULL);
@@ -1003,6 +1038,14 @@ int main(void) {
         CHECK(strstr(preply, "pulse_detect_latency_ms_bucket{le=\"+Inf\"} 0\n") != NULL);
         CHECK(strstr(preply, "pulse_detect_latency_ms_sum 0\n") != NULL);
         CHECK(strstr(preply, "pulse_detect_latency_ms_count 0\n") != NULL);
+        /* Probe-RTT histogram (0.48.0): no probe answered yet, so
+         * the gauges are 0 and the histogram is all zeros. */
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_mean 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_max 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_samples 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_bucket{le=\"+Inf\"} 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_sum 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_probe_rtt_ms_count 0\n") != NULL);
         CHECK(strstr(preply, "pulse_suspected_total 0\n") != NULL);
     }
 

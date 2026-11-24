@@ -25,10 +25,14 @@ int main(void) {
     CHECK(strstr(buf, "suspected=0 dead=0 refutes=0 joins=0") != NULL);
     CHECK(strstr(buf, "detect_latency_ms mean=- max=- samples=0") != NULL);
     CHECK(strstr(buf, "suspect_to_dead_ms mean=- max=- samples=0") != NULL);
-    CHECK(m.detect_hist[0] == 0 && m.detect_hist[4] == 0);
-    CHECK(strstr(buf, "hist=[0,0,0,0,0]") != NULL);
+    CHECK(strstr(buf, "probe_rtt_ms mean=- max=- samples=0 "
+                      "hist=[0,0,0,0,0]") != NULL);
+    CHECK(m.rtt_samples == 0 && m.rtt_hist[0] == 0 &&
+          m.rtt_hist[4] == 0);
     char hbuf[64];
     metrics_detect_hist_json(&m, hbuf, sizeof hbuf);
+    CHECK(strcmp(hbuf, "0,0,0,0,0") == 0);
+    metrics_rtt_hist_json(&m, hbuf, sizeof hbuf);
     CHECK(strcmp(hbuf, "0,0,0,0,0") == 0);
 
     /* Locally detected suspicions feed the latency stats: mean is the
@@ -63,6 +67,40 @@ int main(void) {
     CHECK(strstr(buf, "hist=[1,3,1,1,2]") != NULL);
     metrics_detect_hist_json(&m, hbuf, sizeof hbuf);
     CHECK(strcmp(hbuf, "1,3,1,1,2") == 0);
+
+    /* Probe-RTT histogram (0.48.0): every answered probe adds one
+     * sample to the mean/max and one count to its bucket. Buckets
+     * are <1, 1-4, 5-9, 10-49, >=50 ms; a sample exactly at a bound
+     * lands in the higher bucket, like the detection histogram. */
+    metrics_note_rtt(&m, 0);
+    metrics_note_rtt(&m, 1);
+    metrics_note_rtt(&m, 4);
+    metrics_note_rtt(&m, 5);
+    metrics_note_rtt(&m, 9);
+    metrics_note_rtt(&m, 10);
+    metrics_note_rtt(&m, 49);
+    metrics_note_rtt(&m, 50);
+    metrics_note_rtt(&m, 500);
+    CHECK(m.rtt_samples == 9);
+    CHECK(m.rtt_sum_ms == 628);
+    CHECK(m.rtt_max_ms == 500);
+    CHECK(m.rtt_hist[0] == 1); /* 0 */
+    CHECK(m.rtt_hist[1] == 2); /* 1, 4 */
+    CHECK(m.rtt_hist[2] == 2); /* 5, 9 */
+    CHECK(m.rtt_hist[3] == 2); /* 10, 49 */
+    CHECK(m.rtt_hist[4] == 2); /* 50, 500 */
+    CHECK(m.rtt_hist[0] + m.rtt_hist[1] + m.rtt_hist[2] +
+          m.rtt_hist[3] + m.rtt_hist[4] == m.rtt_samples);
+    metrics_format(&m, buf, sizeof buf);
+    CHECK(strstr(buf, "probe_rtt_ms mean=69 max=500 samples=9 "
+                      "hist=[1,2,2,2,2]") != NULL);
+    metrics_rtt_hist_json(&m, hbuf, sizeof hbuf);
+    CHECK(strcmp(hbuf, "1,2,2,2,2") == 0);
+
+    /* A probe never answered adds nothing: -1 is not a sample. */
+    metrics_note_rtt(&m, -1);
+    CHECK(m.rtt_samples == 9);
+    CHECK(m.rtt_sum_ms == 628);
 
     /* A suspicion learned from gossip bumps the count but adds no
      * latency sample: there is no local heartbeat to measure. */

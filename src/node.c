@@ -624,6 +624,13 @@ static void handle_message(const gmsg_t *msg) {
              * the table lock across IO. */
             int64_t slow_mean_ms = -1;
             if (rtt_ms >= 0) {
+                /* Probe-RTT histogram (0.48.0): every answered
+                 * direct probe adds one sample to the global RTT
+                 * mean/max/histogram, next to the per-peer numbers
+                 * member_note_rtt keeps — same sample, same rule
+                 * (rtt_ms >= 0 only; a stale or duplicate ACK adds
+                 * nothing to either). */
+                metrics_note_rtt(&g_metrics, rtt_ms);
                 int r = member_note_rtt(&g_table, msg->from_id, rtt_ms,
                                         g_cfg.slow_peer_rtt_ms);
                 if (r == 2) {

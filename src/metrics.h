@@ -30,6 +30,20 @@
 #define PULSE_DETECT_HIST_BUCKETS 5
 #define PULSE_DETECT_HIST_BOUNDS { 100, 250, 500, 1000 }
 
+/* Probe-RTT histogram (0.48.0): 5 buckets over the direct-probe
+ * round-trip times, so the mean RTT cannot hide a slow tail — a
+ * peer that usually answers in under a millisecond but sometimes
+ * takes 60 ms looks fine as a mean and is exactly what the ward
+ * use case needs to see before the peer is suspected. Bucket upper
+ * bounds (ms): 1, 5, 10, 50; the last bucket holds everything
+ * >= 50. RTTs are measured in whole milliseconds, so bucket 0 is
+ * the sub-millisecond loopback case (rtt_ms == 0). Every answered
+ * direct probe adds one sample, including one that arrived via an
+ * indirect probe (its sample is an upper bound on the direct RTT,
+ * like the per-peer mean it feeds). */
+#define PULSE_RTT_HIST_BUCKETS 5
+#define PULSE_RTT_HIST_BOUNDS { 1, 5, 10, 50 }
+
 typedef struct {
     int64_t suspected; /* ALIVE -> SUSPECT transitions seen */
     int64_t dead;      /* SUSPECT -> DEAD transitions seen */
@@ -61,6 +75,18 @@ typedef struct {
      * prober ever sped up, since the current interval itself is not
      * stored. */
     int64_t adaptive_fast_cycles;
+    /* Probe-RTT histogram (0.48.0): the round-trip time of every
+     * answered direct probe, bucketed alongside the mean/max — the
+     * same shape as the detection-latency histogram, but over probe
+     * RTTs instead of suspicion latencies. A sample is added for
+     * every probe answer (rtt_ms >= 0); a probe never answered adds
+     * nothing, so samples can be smaller than the number of probes
+     * sent. Like the per-peer RTT, this is local measurement, never
+     * gossiped and never persisted. */
+    int64_t rtt_samples;
+    int64_t rtt_sum_ms;
+    int64_t rtt_max_ms;
+    int64_t rtt_hist[PULSE_RTT_HIST_BUCKETS];
 } pulse_metrics_t;
 
 void metrics_init(pulse_metrics_t *m);
@@ -79,6 +105,10 @@ void metrics_note_join(pulse_metrics_t *m);
 void metrics_note_suspect_refuted(pulse_metrics_t *m, int64_t duration_ms);
 /* One probe cycle ran at the fast interval (a peer was SUSPECT). */
 void metrics_note_adaptive_fast(pulse_metrics_t *m);
+/* A direct probe was answered. rtt_ms is the PING-to-ACK round-trip
+ * in ms (>= 0); every answer adds one sample to the mean/max and
+ * one count to the RTT histogram bucket it falls in. */
+void metrics_note_rtt(pulse_metrics_t *m, int64_t rtt_ms);
 
 /* Format one METRICS line (no trailing newline) into buf:
  *   METRICS suspected=N dead=N refutes=N joins=N
@@ -86,7 +116,8 @@ void metrics_note_adaptive_fast(pulse_metrics_t *m);
  *           detect_latency_ms mean=X max=Y samples=N hist=[a,b,c,d,e]
  *           suspect_to_dead_ms mean=X max=Y samples=N
  *           refute_latency_ms mean=X max=Y samples=N
- * mean/max are "-" when there are no samples. The histogram is
+ *           probe_rtt_ms mean=X max=Y samples=N hist=[a,b,c,d,e]
+ * mean/max are "-" when there are no samples. The histograms are
  * always present (all zeros before any sample). */
 void metrics_format(const pulse_metrics_t *m, char *buf, size_t len);
 
@@ -94,5 +125,10 @@ void metrics_format(const pulse_metrics_t *m, char *buf, size_t len);
  * "a,b,c,d,e" (no brackets) for embedding in a JSON array. */
 void metrics_detect_hist_json(const pulse_metrics_t *m, char *buf,
                               size_t len);
+
+/* Format the probe-RTT histogram the same way, for the JSON
+ * probe_rtt_ms.hist array. */
+void metrics_rtt_hist_json(const pulse_metrics_t *m, char *buf,
+                           size_t len);
 
 #endif

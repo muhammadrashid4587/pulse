@@ -51,6 +51,23 @@ void metrics_note_adaptive_fast(pulse_metrics_t *m) {
     m->adaptive_fast_cycles++;
 }
 
+void metrics_note_rtt(pulse_metrics_t *m, int64_t rtt_ms) {
+    if (rtt_ms < 0) return;
+    m->rtt_samples++;
+    m->rtt_sum_ms += rtt_ms;
+    if (rtt_ms > m->rtt_max_ms) m->rtt_max_ms = rtt_ms;
+    /* Bucket 0 is < 1 ms, bucket 1 is 1-4, bucket 2 is 5-9,
+     * bucket 3 is 10-49, bucket 4 is >= 50 — the same boundary
+     * rule as the detection histogram: a sample exactly at a
+     * bound lands in the higher bucket. */
+    static const int64_t bounds[] = PULSE_RTT_HIST_BOUNDS;
+    int bucket = 0;
+    while (bucket < PULSE_RTT_HIST_BUCKETS - 1 &&
+           rtt_ms >= bounds[bucket])
+        bucket++;
+    m->rtt_hist[bucket]++;
+}
+
 /* One latency group as "mean=X max=Y samples=N", with "-" for mean/max
  * when there are no samples yet. */
 static void format_group(char *buf, size_t len, int64_t samples,
@@ -72,23 +89,35 @@ void metrics_detect_hist_json(const pulse_metrics_t *m, char *buf,
              (long long)m->detect_hist[4]);
 }
 
+void metrics_rtt_hist_json(const pulse_metrics_t *m, char *buf,
+                           size_t len) {
+    snprintf(buf, len, "%lld,%lld,%lld,%lld,%lld",
+             (long long)m->rtt_hist[0], (long long)m->rtt_hist[1],
+             (long long)m->rtt_hist[2], (long long)m->rtt_hist[3],
+             (long long)m->rtt_hist[4]);
+}
+
 void metrics_format(const pulse_metrics_t *m, char *buf, size_t len) {
-    char detect[96], suspect_dead[96], refute[96], hist[64];
+    char detect[96], suspect_dead[96], refute[96], rtt[96];
+    char hist[64], rtthist[64];
     format_group(detect, sizeof detect, m->detect_samples, m->detect_sum_ms,
                  m->detect_max_ms);
     format_group(suspect_dead, sizeof suspect_dead, m->suspect_dead_samples,
                  m->suspect_dead_sum_ms, m->suspect_dead_max_ms);
     format_group(refute, sizeof refute, m->refute_samples, m->refute_sum_ms,
                  m->refute_max_ms);
+    format_group(rtt, sizeof rtt, m->rtt_samples, m->rtt_sum_ms,
+                 m->rtt_max_ms);
     metrics_detect_hist_json(m, hist, sizeof hist);
+    metrics_rtt_hist_json(m, rtthist, sizeof rtthist);
     snprintf(buf, len,
              "METRICS suspected=%lld dead=%lld refutes=%lld joins=%lld "
              "adaptive_fast_cycles=%lld suspect_refuted=%lld "
              "detect_latency_ms %s hist=[%s] suspect_to_dead_ms %s "
-             "refute_latency_ms %s",
+             "refute_latency_ms %s probe_rtt_ms %s hist=[%s]",
              (long long)m->suspected, (long long)m->dead,
              (long long)m->refutes, (long long)m->joins,
              (long long)m->adaptive_fast_cycles,
              (long long)m->suspect_refuted, detect, hist,
-             suspect_dead, refute);
+             suspect_dead, refute, rtt, rtthist);
 }
