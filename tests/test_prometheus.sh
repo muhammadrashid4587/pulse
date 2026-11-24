@@ -240,6 +240,18 @@ else
     printf '%s\n' "$PP" | grep -E 'pulse_member_phi|pulse_member_info' || true
 fi
 
+# 4b. Phi suspicion threshold (0.43.0): the same scrape carries the
+# configured threshold as a gauge — default 8.00 here — so a
+# scraper can alert on a rising phi against the threshold that
+# actually fires the suspicion, instead of hard-coding 8.0.
+if printf '%s' "$PP" | grep -q '^# TYPE pulse_phi_threshold gauge$' \
+   && printf '%s' "$PP" | grep -q '^pulse_phi_threshold 8.00$'; then
+    note ok "PROMETHEUS exposes the phi suspicion threshold gauge (default 8.00)"
+else
+    note fail "PROMETHEUS exposes the phi suspicion threshold gauge (default 8.00)"
+    printf '%s\n' "$PP" | grep -E 'pulse_phi_threshold' || true
+fi
+
 kill -9 "$(cat "$TMP/p2.pid")"
 if wait_for "$TMP/p1.log" "DEAD 127.0.0.1:17892" 10; then
     note ok "phi-mode node 1 marks the killed node DEAD"

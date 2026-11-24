@@ -241,6 +241,14 @@ static int phi_enabled_hook(void *ctx) {
     return g_phi_mode;
 }
 
+/* Phi suspicion threshold (0.43.0): a non-default 5.5, so the
+ * PROMETHEUS gauge proves it comes from the hook, not the
+ * default. */
+static double phi_threshold_hook(void *ctx) {
+    (void)ctx;
+    return 5.5;
+}
+
 static void reload_hook(void *ctx, pulse_reload_result_t *out) {
     (void)ctx;
     memset(out, 0, sizeof *out);
@@ -602,6 +610,7 @@ int main(void) {
     g_hooks.peer_file_state = peer_file_state_hook;
     g_hooks.set_meta = NULL;
     g_hooks.phi_enabled = phi_enabled_hook;
+    g_hooks.phi_threshold = phi_threshold_hook;
     g_hooks.peer_source = peer_source_hook;
     g_hooks.slow_rtt_threshold_ms = 0;
     g_hooks.self_id = "127.0.0.1:17999";
@@ -843,6 +852,20 @@ int main(void) {
          * harness, so it reports the default 16. */
         CHECK(strstr(preply, "# TYPE pulse_gossip_digest_size gauge\n") != NULL);
         CHECK(strstr(preply, "pulse_gossip_digest_size 16\n") != NULL);
+        /* Phi suspicion threshold (0.43.0): the fake hook reports
+         * a non-default 5.5, so the gauge proves it comes from
+         * the hook — and with no hook it falls back to the
+         * default 8.0. */
+        CHECK(strstr(preply, "# TYPE pulse_phi_threshold gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_phi_threshold 5.50\n") != NULL);
+        {
+            double (*saved)(void *) = g_hooks.phi_threshold;
+            g_hooks.phi_threshold = NULL;
+            char preply[8192];
+            CHECK(send_cmd(18991, "PROMETHEUS\n", preply, sizeof preply) > 0);
+            CHECK(strstr(preply, "pulse_phi_threshold 8.00\n") != NULL);
+            g_hooks.phi_threshold = saved;
+        }
         /* One pulse_member_info gauge per member, with state and
          * source labels. */
         CHECK(strstr(preply, "pulse_member_info{member=\"127.0.0.1:17999\",state=\"ALIVE\",source=\"self\"} 1\n") != NULL);

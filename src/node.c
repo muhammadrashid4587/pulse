@@ -1578,6 +1578,15 @@ static int gossip_digest_size_hook(void *ctx) {
                                         : PULSE_GOSSIP_ENTRIES;
 }
 
+/* Phi suspicion threshold (0.43.0): the phi value at which a peer
+ * is suspected — the --phi-threshold the node started with, 8.0
+ * by default — so PROMETHEUS can report it as
+ * pulse_phi_threshold. */
+static double phi_threshold_hook(void *ctx) {
+    (void)ctx;
+    return g_cfg.phi_threshold;
+}
+
 /* Set one annotation on this node itself (control plane META): update
  * the self entry, stamp it changed so the next digest gossips it, and
  * persist the set to the data dir so it survives a restart. Returns
@@ -1691,7 +1700,7 @@ int main(int argc, char **argv) {
     g_cfg.suspect_timeout_ms = 300;
     g_cfg.dead_retention_ms = 60000; /* 60 s */
     g_cfg.phi_accrual = 0;
-    g_cfg.phi_threshold = 8.0;
+    g_cfg.phi_threshold = PULSE_PHI_THRESHOLD_DEFAULT;
     g_cfg.sync_interval_ms = 10000; /* anti-entropy full-table exchange */
     g_cfg.slow_peer_rtt_ms = 0; /* slow-peer warning disabled */
     g_cfg.event_log_cap = 0; /* default WATCH event ring (128 events) */
@@ -2211,6 +2220,7 @@ int main(int argc, char **argv) {
         g_hooks.watch_oldest_seq = watch_oldest_seq_hook;
         g_hooks.event_log_cap = watch_event_log_cap_hook;
         g_hooks.gossip_digest_size = gossip_digest_size_hook;
+        g_hooks.phi_threshold = phi_threshold_hook;
         g_hooks.set_meta = set_meta_hook;
         g_hooks.phi_enabled = phi_enabled_hook;
         g_hooks.peer_source = peer_source_hook;

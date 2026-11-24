@@ -178,7 +178,12 @@
  *       the event ring capacity (pulse_watch_event_log_cap, 0.36.0)
  *       as a gauge; the paused-stream count (pulse_watch_paused,
  *       0.37.0) as a gauge; the gossip digest size
- *       (pulse_gossip_digest_size, 0.41.0) as a gauge; the three
+ *       (pulse_gossip_digest_size, 0.41.0) as a gauge; the phi
+ *       suspicion threshold (pulse_phi_threshold, 0.43.0) as a
+ *       gauge — the --phi-threshold the node started with, 8.0
+ *       by default, so a scraper can alert on a rising
+ *       pulse_member_phi against the threshold that actually
+ *       fires the suspicion; the three
  *       latency groups as mean/max/samples
  *       and max are 0 with no samples — Prometheus has no null —
  *       and the samples gauge says whether the mean is real); the
@@ -457,6 +462,13 @@ typedef struct {
      * operator can see whether the node is trading convergence
      * speed for bandwidth. NULL reports the default 16. */
     int (*gossip_digest_size)(void *ctx);
+    /* The phi value at which a peer is suspected (0.43.0): the
+     * --phi-threshold the node started with, 8.0 by default.
+     * PROMETHEUS reports it so a scraper can alert on a rising
+     * pulse_member_phi against the threshold that actually fires
+     * the suspicion, instead of hard-coding 8.0. NULL reports
+     * the default 8.0. */
+    double (*phi_threshold)(void *ctx);
     const char *self_id;
     int64_t start_ms; /* monotonic ms when the node started */
 } control_hooks_t;

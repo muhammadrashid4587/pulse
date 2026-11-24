@@ -23,6 +23,7 @@
 #define PULSE_PHI_WINDOW 100
 #define PULSE_PHI_MIN_SAMPLES 2
 #define PULSE_PHI_MAX 30.0 /* cap: erfc underflows to 0 for large z */
+#define PULSE_PHI_THRESHOLD_DEFAULT 8.0 /* --phi-threshold default */
 
 typedef struct {
     double intervals[PULSE_PHI_WINDOW];

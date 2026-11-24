@@ -245,6 +245,16 @@ static int gossip_digest_size_or_default(const control_hooks_t *hooks) {
     return PULSE_GOSSIP_ENTRIES;
 }
 
+/* The phi suspicion threshold (0.43.0): the phi value at which a
+ * peer is suspected — the --phi-threshold the node started with.
+ * A NULL hook reports the default, so PROMETHEUS never prints a
+ * nonsense threshold. */
+static double phi_threshold_or_default(const control_hooks_t *hooks) {
+    if (hooks->phi_threshold)
+        return hooks->phi_threshold(hooks->ctx);
+    return PULSE_PHI_THRESHOLD_DEFAULT;
+}
+
 int control_listen(int port, int family) {
     int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -976,6 +986,20 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         "# TYPE pulse_gossip_digest_size gauge\n"
         "pulse_gossip_digest_size %d\n",
         gossip_digest_size_or_default(hooks)) == 0;
+    /* The phi suspicion threshold (0.43.0): the phi value at which
+     * a peer is suspected — the --phi-threshold the node started
+     * with, 8.0 by default — as a gauge, so a scraper can alert on
+     * a rising pulse_member_phi against the threshold that
+     * actually fires the suspicion, instead of hard-coding 8.0.
+     * It is emitted always, like the other config gauges: the
+     * threshold is the node's configured value whether or not
+     * --phi-accrual is on. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_phi_threshold Phi value at which a peer is "
+        "suspected.\n"
+        "# TYPE pulse_phi_threshold gauge\n"
+        "pulse_phi_threshold %.2f\n",
+        phi_threshold_or_default(hooks)) == 0;
     /* One info gauge per member, labelled by member, state and
      * source — the Prometheus way of exposing per-member state
      * without a separate metric per peer. */
