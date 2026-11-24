@@ -6,7 +6,9 @@
 #     then END — with the membership gauges (alive=2, total=2),
 #     zeroed counters (nothing has been suspected yet), a
 #     pulse_member_info gauge per member labelled by member, state
-#     and source, and the peer-file gauges from the initial load
+#     and source, the per-member probe RTT gauges (0.40.0) for the
+#     peer that answered probes — and none for self, which never
+#     probes itself — and the peer-file gauges from the initial load
 #     (peers=2, added=2, bad=0). joins stays 0: peer-file peers are
 #     pre-added to the table at startup, so their first contact is
 #     not a join.
@@ -116,6 +118,12 @@ if [ -n "$P1" ] \
    && printf '%s' "$P1" | grep -q '^pulse_detect_latency_ms_count 0$' \
    && printf '%s' "$P1" | grep -q '^pulse_member_info{member="127.0.0.1:17881",state="ALIVE",source="self"} 1$' \
    && printf '%s' "$P1" | grep -q '^pulse_member_info{member="127.0.0.1:17882",state="ALIVE",source="peer-file"} 1$' \
+   && printf '%s' "$P1" | grep -q '^# TYPE pulse_member_rtt_ms gauge$' \
+   && printf '%s' "$P1" | grep -q '^pulse_member_rtt_ms{member="127.0.0.1:17882"} [0-9][0-9]*$' \
+   && printf '%s' "$P1" | grep -q '^# TYPE pulse_member_rtt_mean_ms gauge$' \
+   && printf '%s' "$P1" | grep -q '^pulse_member_rtt_mean_ms{member="127.0.0.1:17882"} [0-9][0-9]*$' \
+   && ! printf '%s' "$P1" | grep -q 'pulse_member_rtt_ms{member="127.0.0.1:17881"' \
+   && ! printf '%s' "$P1" | grep -q 'pulse_member_rtt_mean_ms{member="127.0.0.1:17881"' \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_peers 2$' \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_added 2$' \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_dropped 0$' \
@@ -124,14 +132,17 @@ if [ -n "$P1" ] \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_last_reload_seconds [0-9][0-9]*$' \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_last_mtime_seconds [0-9][0-9]*$' \
    && printf '%s' "$P1" | tail -n 1 | grep -q '^END$'; then
-    note ok "PROMETHEUS exposes the converged cluster (gauges, counters, member info, peer-file gauges, END)"
+    note ok "PROMETHEUS exposes the converged cluster (gauges, counters, member info, per-member RTT, peer-file gauges, END)"
 else
-    note fail "PROMETHEUS exposes the converged cluster (gauges, counters, member info, peer-file gauges, END)"
+    note fail "PROMETHEUS exposes the converged cluster (gauges, counters, member info, per-member RTT, peer-file gauges, END)"
     printf '%s\n' "$P1"
 fi
 
 # 2. Kill node 2: node 1 suspects then deads it, and the exposition
-# moves with it.
+# moves with it. The dead member's RTT gauge stays, at its last
+# measured value — the same as JSON, which reports the last
+# measured RTT too — so the gauge is the last-known RTT, not a
+# live one, for a dead member.
 kill -9 "$(cat "$TMP/n2.pid")"
 if wait_for "$TMP/n1.log" "DEAD 127.0.0.1:17882" 10; then
     note ok "node 1 marks the killed node DEAD"
@@ -144,6 +155,8 @@ if wait_prom 18881 '^pulse_suspected_total [1-9][0-9]*$' 5 \
    && wait_prom 18881 '^pulse_members_alive 1$' 5 \
    && wait_prom 18881 '^pulse_members_dead 1$' 5 \
    && wait_prom 18881 '^pulse_member_info\{member="127.0.0.1:17882",state="DEAD",source="peer-file"\} 1$' 5 \
+   && wait_prom 18881 '^pulse_member_rtt_ms\{member="127.0.0.1:17882"\} [0-9][0-9]*$' 5 \
+   && wait_prom 18881 '^pulse_member_rtt_mean_ms\{member="127.0.0.1:17882"\} [0-9][0-9]*$' 5 \
    && wait_prom 18881 '^pulse_detect_latency_ms_count 1$' 5 \
    && wait_prom 18881 '^pulse_detect_latency_ms_sum [1-9][0-9]*$' 5 \
    && wait_prom 18881 '^pulse_detect_latency_ms_bucket\{le="\+Inf"\} 1$' 5; then

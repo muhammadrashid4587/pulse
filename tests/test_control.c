@@ -72,7 +72,13 @@
  * pulse_member_info gauge per member, with the peer-file gauges
  * present only when the node runs with --peer-file, and zero
  * samples meaning 0 means/maxima and an all-zero histogram; the
- * exposition end to end is covered by tests/test_prometheus.sh. */
+ * exposition end to end is covered by tests/test_prometheus.sh.
+ * Per-member probe RTT (0.40.0) is covered here too: the last and
+ * mean direct-probe RTT ride as pulse_member_rtt_ms and
+ * pulse_member_rtt_mean_ms gauges, one line per member that
+ * answered a probe, with self and a never-heard-from peer absent
+ * entirely; the RTT end to end is covered by
+ * tests/test_prometheus.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -142,13 +148,30 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
     m = member_add(out, "127.0.0.1:17999", &addr, 1);
     if (m) m->last_seen_ms = now;
     m = member_add(out, "127.0.0.1:17901", &addr, 1);
-    if (m) m->last_seen_ms = now;
+    if (m) {
+        m->last_seen_ms = now;
+        /* Probe RTT (0.40.0): answered probes, last 3 ms, mean 2
+         * over 4 samples — so PROMETHEUS has a real rtt gauge to
+         * check for this peer. */
+        m->rtt_ms = 3;
+        m->rtt_sum_ms = 10;
+        m->rtt_samples = 4;
+    }
     m = member_add(out, "127.0.0.1:17903", &addr, 2);
-    if (m) m->last_seen_ms = now;
+    if (m) {
+        m->last_seen_ms = now;
+        /* A sub-millisecond probe: last and mean both 0, which is
+         * a real value, not a missing one. */
+        m->rtt_ms = 0;
+        m->rtt_sum_ms = 0;
+        m->rtt_samples = 1;
+    }
     m = member_add(out, "127.0.0.1:17902", &addr, 1);
     if (m) {
         m->state = MEMBER_DEAD;
         m->last_seen_ms = 0; /* never heard from */
+        /* No probe ever answered: rtt_ms stays -1, so PROMETHEUS
+         * has no rtt gauge for this peer (0.40.0). */
     }
 }
 
@@ -803,6 +826,22 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_info{member=\"127.0.0.1:17901\",state=\"ALIVE\",source=\"seed\"} 1\n") != NULL);
         CHECK(strstr(preply, "pulse_member_info{member=\"127.0.0.1:17903\",state=\"ALIVE\",source=\"peer-file\"} 1\n") != NULL);
         CHECK(strstr(preply, "pulse_member_info{member=\"127.0.0.1:17902\",state=\"DEAD\",source=\"discovered\"} 1\n") != NULL);
+        /* Probe RTT per member (0.40.0): last and mean RTT as
+         * gauges, one line per member that answered a probe —
+         * the seed peer at 3 / mean 2, the peer-file peer at a
+         * real sub-millisecond 0 / 0 — while self, which never
+         * probes itself, and the never-heard-from dead peer have
+         * no rtt gauge at all. */
+        CHECK(strstr(preply, "# TYPE pulse_member_rtt_ms gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_ms{member=\"127.0.0.1:17901\"} 3\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_ms{member=\"127.0.0.1:17903\"} 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_ms{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_ms{member=\"127.0.0.1:17902\"}") == NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_rtt_mean_ms gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17901\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17903\"} 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17902\"}") == NULL);
         /* Peer-file gauges from the canned load. */
         CHECK(strstr(preply, "pulse_peer_file_peers 3\n") != NULL);
         CHECK(strstr(preply, "pulse_peer_file_added 1\n") != NULL);

@@ -960,6 +960,39 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             t.members[i].id, member_state_name(t.members[i].state),
             peer_source_str(hooks, t.members[i].id)) == 0;
     }
+    /* Probe RTT per member (0.40.0): the last and mean direct-probe
+     * round-trip time JSON already reports as rtt_ms /
+     * rtt_mean_ms, as gauges a scraper can alert on — one line per
+     * member that has answered a probe. Self never probes itself
+     * and a peer never heard from has no RTT, so both are absent:
+     * an absent series is how Prometheus says "not applicable",
+     * the same as the peer-file gauges below. A value of 0 is a
+     * real sub-millisecond probe, not a missing one. A member that
+     * goes DEAD keeps its last RTT — the same as JSON, which
+     * reports the last measured value too — so the gauge is the
+     * last-known RTT, not a live one, for a dead member. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_rtt_ms Last direct-probe round-trip "
+        "time in ms, per member.\n"
+        "# TYPE pulse_member_rtt_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].rtt_ms < 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_rtt_ms{member=\"%s\"} %lld\n",
+            t.members[i].id, (long long)t.members[i].rtt_ms) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_rtt_mean_ms Mean direct-probe "
+        "round-trip time in ms, per member.\n"
+        "# TYPE pulse_member_rtt_mean_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].rtt_ms < 0 ||
+            t.members[i].rtt_samples == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_rtt_mean_ms{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)member_rtt_mean_ms(&t.members[i])) == 0;
+    }
     /* Peer-file state (0.28.0): only when the node runs with
      * --peer-file — an absent metric is how Prometheus says "not
      * applicable", matching METRICS reporting "-" and JSON null. */
