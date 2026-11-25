@@ -107,13 +107,14 @@ int pulse_event_result_state(pulse_event_type_t type, member_state_t *out) {
  * a fresh record does. */
 static void log_insert(pulse_event_log_t *log, uint64_t seq,
                        pulse_event_type_t type, const char *id,
-                       uint32_t incarnation, int64_t unix_ts) {
+                       uint32_t incarnation, int64_t unix_ts, double phi) {
     pulse_event_t *slot = &log->events[log->head];
     slot->seq = seq;
     slot->type = type;
     snprintf(slot->id, sizeof slot->id, "%s", id);
     slot->incarnation = incarnation;
     slot->unix_ts = unix_ts;
+    slot->phi = phi;
     log->head = (log->head + 1) % log->cap;
     if (log->count < log->cap) log->count++;
 }
@@ -121,9 +122,17 @@ static void log_insert(pulse_event_log_t *log, uint64_t seq,
 uint64_t pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
                             const char *id, uint32_t incarnation,
                             int64_t unix_ts) {
+    return pulse_event_record_phi(log, type, id, incarnation, unix_ts,
+                                  -1);
+}
+
+uint64_t pulse_event_record_phi(pulse_event_log_t *log,
+                                pulse_event_type_t type, const char *id,
+                                uint32_t incarnation, int64_t unix_ts,
+                                double phi) {
     pthread_mutex_lock(&log->lock);
     uint64_t seq = log->next_seq++;
-    log_insert(log, seq, type, id, incarnation, unix_ts);
+    log_insert(log, seq, type, id, incarnation, unix_ts, phi);
     /* A waiter may be waiting for exactly this event; a broadcast
      * wakes it, and it re-checks under the lock. */
     pthread_cond_broadcast(&log->cond);
@@ -133,8 +142,12 @@ uint64_t pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
 
 /* One line per event in the persisted log (0.38.0):
  * "<seq> <TYPE> <id> <incarnation> <unix_ts>". Ids carry no spaces
- * (host:port, bracketed for IPv6), so a plain %s round-trips. */
+ * (host:port, bracketed for IPv6), so a plain %s round-trips. A
+ * phi-mode SUSPECTED event (0.60.0) carries a trailing
+ * " phi=<value>" — two decimals, the phi at the threshold
+ * crossing — and the loader accepts lines with or without it. */
 #define PULSE_EVENT_LOG_LINE "%llu %s %s %u %lld\n"
+#define PULSE_EVENT_LOG_LINE_PHI "%llu %s %s %u %lld phi=%.2f\n"
 
 int pulse_event_log_save(pulse_event_log_t *log, const char *path) {
     /* Snapshot the held events in sequence order under the lock,
@@ -167,10 +180,19 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path) {
         free(held);
         return -1;
     }
-    for (int i = 0; i < count; i++)
-        fprintf(f, PULSE_EVENT_LOG_LINE, (unsigned long long)held[i].seq,
-                pulse_event_type_name(held[i].type), held[i].id,
-                held[i].incarnation, (long long)held[i].unix_ts);
+    for (int i = 0; i < count; i++) {
+        if (held[i].phi >= 0)
+            fprintf(f, PULSE_EVENT_LOG_LINE_PHI,
+                    (unsigned long long)held[i].seq,
+                    pulse_event_type_name(held[i].type), held[i].id,
+                    held[i].incarnation, (long long)held[i].unix_ts,
+                    held[i].phi);
+        else
+            fprintf(f, PULSE_EVENT_LOG_LINE,
+                    (unsigned long long)held[i].seq,
+                    pulse_event_type_name(held[i].type), held[i].id,
+                    held[i].incarnation, (long long)held[i].unix_ts);
+    }
     free(held);
     if (fclose(f) != 0) return -1;
     if (rename(tmp, path) != 0) return -1;
@@ -188,9 +210,16 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
         char id[PULSE_ID_LEN + 16];
         unsigned inc;
         long long ts;
-        if (sscanf(line, "%llu %15s %79s %u %lld", &seq, type_name, id,
-                   &inc, &ts) != 5)
-            continue;
+        double phi = -1;
+        /* A phi-mode SUSPECTED event carries a trailing
+         * " phi=<value>" (0.60.0); a line without it — written
+         * before 0.60.0, or any event with no phi measured — loads
+         * with phi -1. The %lf conversion only matches when the
+         * literal " phi=" is there, so one sscanf covers both. */
+        int n = sscanf(line, "%llu %15s %79s %u %lld phi=%lf", &seq,
+                       type_name, id, &inc, &ts, &phi);
+        if (n != 5 && n != 6) continue;
+        if (n == 5) phi = -1;
         if (seq == 0) continue;
         pulse_event_type_t type;
         if (pulse_event_type_parse(type_name, &type) != 0) continue;
@@ -199,7 +228,7 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
          * seq is past the last: only advance next_seq forward, in
          * case a hand-edited file ever repeats a sequence. */
         if (seq >= log->next_seq) {
-            log_insert(log, seq, type, id, inc, (int64_t)ts);
+            log_insert(log, seq, type, id, inc, (int64_t)ts, phi);
             log->next_seq = seq + 1;
             loaded++;
         }

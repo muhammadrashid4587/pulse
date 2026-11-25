@@ -537,6 +537,9 @@ static void test_event_log(void) {
     CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
           strcmp(ev.id, "127.0.0.1:17901") == 0 &&
           ev.incarnation == 1 && ev.unix_ts == 1700000000);
+    /* A plain record carries no phi (0.60.0): only a phi-mode
+     * threshold crossing does. */
+    CHECK(ev.phi == -1);
     CHECK(pulse_event_wait(&log, 1, &ev, 20) == 1);
     CHECK(ev.seq == 2 && ev.type == PULSE_EVENT_SUSPECTED);
     CHECK(pulse_event_wait(&log, 2, &ev, 20) == 1);
@@ -607,13 +610,19 @@ static void test_event_log(void) {
                        1, 1700000301);
     pulse_event_record(&saved, PULSE_EVENT_DEAD, "127.0.0.1:17904", 1,
                        1700000302);
-    CHECK(pulse_event_log_save(&saved, ev_path) == 3);
+    /* Phi at threshold crossing (0.60.0): a SUSPECTED event
+     * recorded with a phi round-trips through the file with it,
+     * so a restart restores the crossing value, not just the
+     * suspicion. */
+    pulse_event_record_phi(&saved, PULSE_EVENT_SUSPECTED,
+                           "127.0.0.1:17904", 1, 1700000303, 8.42);
+    CHECK(pulse_event_log_save(&saved, ev_path) == 4);
     pulse_event_log_free(&saved);
 
     pulse_event_log_t restored;
     pulse_event_log_init(&restored, 4);
-    CHECK(pulse_event_log_load(&restored, ev_path) == 3);
-    CHECK(pulse_event_latest_seq(&restored) == 3);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 4);
+    CHECK(pulse_event_latest_seq(&restored) == 4);
     CHECK(pulse_event_oldest_seq(&restored) == 1);
     CHECK(pulse_event_wait(&restored, 0, &ev, 20) == 1);
     CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
@@ -623,10 +632,13 @@ static void test_event_log(void) {
     CHECK(ev.seq == 2 && ev.type == PULSE_EVENT_SUSPECTED);
     CHECK(pulse_event_wait(&restored, 2, &ev, 20) == 1);
     CHECK(ev.seq == 3 && ev.type == PULSE_EVENT_DEAD);
+    CHECK(pulse_event_wait(&restored, 3, &ev, 20) == 1);
+    CHECK(ev.seq == 4 && ev.type == PULSE_EVENT_SUSPECTED &&
+          ev.phi == 8.42);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
-                       2, 1700000303);
-    CHECK(pulse_event_latest_seq(&restored) == 4);
+                       2, 1700000304);
+    CHECK(pulse_event_latest_seq(&restored) == 5);
     pulse_event_log_free(&restored);
 
     /* A missing file loads zero events, and a malformed line is
@@ -649,8 +661,12 @@ static void test_event_log(void) {
     CHECK(pulse_event_wait(&restored, 6, &ev, 20) == 1);
     CHECK(ev.seq == 7 && ev.type == PULSE_EVENT_REVIVED &&
           strcmp(ev.id, "127.0.0.1:17905") == 0);
+    /* A line without the trailing phi field — the pre-0.60.0
+     * format — loads with phi -1, so an old log still loads. */
+    CHECK(ev.phi == -1);
     CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
     CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_DEAD);
+    CHECK(ev.phi == -1);
     pulse_event_log_free(&restored);
     unlink(ev_path);
 }

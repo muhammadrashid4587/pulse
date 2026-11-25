@@ -58,6 +58,17 @@ typedef struct {
     char id[PULSE_ID_LEN];
     uint32_t incarnation;
     int64_t unix_ts; /* wall-clock seconds when the event was recorded */
+    /* Phi at threshold crossing (0.60.0): the phi value that crossed
+     * the suspect threshold, carried only on a SUSPECTED event this
+     * node raised itself in phi-accrual mode — the phi the probe
+     * cycle measured when it marked the peer SUSPECT. -1 on every
+     * other event: a fixed-timeout suspicion has no phi, and a
+     * suspicion learned from gossip was measured on another node,
+     * so this node must not claim a value it never saw. A WATCH
+     * consumer reads it as a trailing " phi=<value>" on the EVENT
+     * line, and the persisted log carries the same trailing field,
+     * so the crossing survives a restart and a replay. */
+    double phi;
 } pulse_event_t;
 
 typedef struct {
@@ -100,17 +111,28 @@ int pulse_event_result_state(pulse_event_type_t type, member_state_t *out);
 /* Append one event (assigning it the next sequence number) and wake
  * any waiter. Thread-safe; never blocks. Returns the sequence
  * number assigned, so the caller can append the same event to the
- * persisted log (0.38.0). */
+ * persisted log (0.38.0). The phi is -1: no phi was measured for
+ * this event. */
 uint64_t pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
                             const char *id, uint32_t incarnation,
                             int64_t unix_ts);
 
+/* The same, carrying the phi at a threshold crossing (0.60.0):
+ * the caller passes the phi the probe cycle measured when it
+ * suspected the peer, or -1 when no phi was measured. */
+uint64_t pulse_event_record_phi(pulse_event_log_t *log,
+                                pulse_event_type_t type, const char *id,
+                                uint32_t incarnation, int64_t unix_ts,
+                                double phi);
+
 /* Write every event the ring currently holds, in sequence order,
  * to path (one "<seq> <TYPE> <id> <incarnation> <unix_ts>" line per
- * event), atomically via a tmp file + rename, so a crash mid-write
- * never leaves a half-written file. Returns the number of events
- * written, or -1 if the file could not be written. Used to compact
- * the persisted log on startup and on clean shutdown (0.38.0). */
+ * event, with a trailing " phi=<value>" on a phi-mode SUSPECTED
+ * event — 0.60.0), atomically via a tmp file + rename, so a crash
+ * mid-write never leaves a half-written file. Returns the number
+ * of events written, or -1 if the file could not be written. Used
+ * to compact the persisted log on startup and on clean shutdown
+ * (0.38.0). */
 int pulse_event_log_save(pulse_event_log_t *log, const char *path);
 
 /* Load events from path into the ring, in file order, restoring
@@ -120,7 +142,9 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path);
  * next sequence is one past the last loaded event. Returns the
  * number of events loaded, 0 when there is no file, or -1 if the
  * file exists but could not be read at all. Malformed lines are
- * skipped, never fatal (0.38.0). */
+ * skipped, never fatal (0.38.0). A line without the trailing
+ * " phi=<value>" — written before 0.60.0, or any event with no phi
+ * measured — loads with phi -1, so an old log still loads. */
 int pulse_event_log_load(pulse_event_log_t *log, const char *path);
 
 /* The latest sequence number recorded so far (0 when the log is

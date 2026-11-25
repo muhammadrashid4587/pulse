@@ -363,21 +363,37 @@ static void peer_set_known_version(const char *id, uint64_t version) {
  * restart, and a failed append must never stop the node — so a
  * failure is silent here; the log line for the transition is
  * already in the node's stdout either way. */
-static void record_event(pulse_event_type_t type, const char *id,
-                         uint32_t incarnation) {
+static void record_event_phi(pulse_event_type_t type, const char *id,
+                             uint32_t incarnation, double phi) {
     int64_t ts = (int64_t)time(NULL);
-    uint64_t seq = pulse_event_record(&g_event_log, type, id,
-                                      incarnation, ts);
+    uint64_t seq = pulse_event_record_phi(&g_event_log, type, id,
+                                          incarnation, ts, phi);
     if (g_events_path[0] == '\0') return;
     pthread_mutex_lock(&g_events_file_lock);
     FILE *f = fopen(g_events_path, "a");
     if (f) {
-        fprintf(f, "%llu %s %s %u %lld\n", (unsigned long long)seq,
-                pulse_event_type_name(type), id, incarnation,
-                (long long)ts);
+        /* The persisted line mirrors the ring (0.38.0): a phi-mode
+         * SUSPECTED event (0.60.0) carries its phi at the crossing
+         * as a trailing " phi=<value>", so the value survives a
+         * restart and a replay exactly as the WATCH stream shows
+         * it; every other event writes the plain five fields. */
+        if (phi >= 0)
+            fprintf(f, "%llu %s %s %u %lld phi=%.2f\n",
+                    (unsigned long long)seq,
+                    pulse_event_type_name(type), id, incarnation,
+                    (long long)ts, phi);
+        else
+            fprintf(f, "%llu %s %s %u %lld\n", (unsigned long long)seq,
+                    pulse_event_type_name(type), id, incarnation,
+                    (long long)ts);
         fclose(f);
     }
     pthread_mutex_unlock(&g_events_file_lock);
+}
+
+static void record_event(pulse_event_type_t type, const char *id,
+                         uint32_t incarnation) {
+    record_event_phi(type, id, incarnation, -1);
 }
 
 /* Direct contact with a member: it is alive. Logs JOIN for a first sighting
@@ -1507,8 +1523,21 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
                      suspect_phi[idx]);
         else
             log_line("SUSPECT %s", suspect_ids[idx]);
-        record_event(PULSE_EVENT_SUSPECTED, suspect_ids[idx],
-                     changed_inc[i]);
+        /* Phi at threshold crossing (0.60.0): the SUSPECTED event
+         * carries the phi the probe cycle measured when it crossed
+         * the threshold, so the event log — and the WATCH stream
+         * reading it — records why this suspicion fired instead
+         * of only that it did. Only a real crossing carries a
+         * phi: a peer suspected by the no-history guard (never
+         * answered, so its phi is 0.00) or by the fixed timeout
+         * carries -1, and a gossip-learned suspicion records its
+         * event on the gossip path with no phi either, since this
+         * node never measured it. */
+        record_event_phi(PULSE_EVENT_SUSPECTED, suspect_ids[idx],
+                         changed_inc[i],
+                         suspect_phi[idx] >= g_cfg.phi_threshold
+                             ? suspect_phi[idx]
+                             : -1);
     }
     for (int i = 0; i < n_dead; i++) {
         log_line("DEAD %s", newly_dead[i]);

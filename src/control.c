@@ -2224,10 +2224,27 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
                 watch_stream_add(slot, 0, 1, 0);
                 continue;
             }
-            snprintf(line, sizeof line, "EVENT %llu %s %s %u %lld\n",
-                     (unsigned long long)ev.seq,
-                     pulse_event_type_name(ev.type), ev.id,
-                     ev.incarnation, (long long)ev.unix_ts);
+            /* Phi at threshold crossing (0.60.0): a SUSPECTED
+             * event this node raised in phi-accrual mode carries
+             * the phi that crossed the threshold as a trailing
+             * " phi=<value>" — two decimals, the same value the
+             * "SUSPECT ... phi=" log line printed — so a watcher
+             * sees why the suspicion fired without polling
+             * METRICS for a phi that has already moved on. Every
+             * other event writes the plain five fields, so
+             * existing consumers see byte-identical lines. */
+            if (ev.phi >= 0)
+                snprintf(line, sizeof line,
+                         "EVENT %llu %s %s %u %lld phi=%.2f\n",
+                         (unsigned long long)ev.seq,
+                         pulse_event_type_name(ev.type), ev.id,
+                         ev.incarnation, (long long)ev.unix_ts,
+                         ev.phi);
+            else
+                snprintf(line, sizeof line, "EVENT %llu %s %s %u %lld\n",
+                         (unsigned long long)ev.seq,
+                         pulse_event_type_name(ev.type), ev.id,
+                         ev.incarnation, (long long)ev.unix_ts);
             if (send_all(fd, line) != 0) break;
             watch_stream_add(slot, 1, 0, 0);
             last_sent_ms = pulse_now_ms();
