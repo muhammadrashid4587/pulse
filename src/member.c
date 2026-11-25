@@ -528,6 +528,11 @@ int64_t member_suspect_age_ms(const member_t *m, int64_t now) {
     return now - m->state_since_ms;
 }
 
+int64_t member_last_seen_age_ms(const member_t *m, int64_t now) {
+    if (!m || m->last_seen_ms <= 0) return -1;
+    return now - m->last_seen_ms;
+}
+
 int member_mark_suspect(member_table_t *t, const char *id, int64_t now) {
     member_t *m = member_find(t, id);
     if (!m || m->state != MEMBER_ALIVE) return 0;

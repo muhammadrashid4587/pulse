@@ -773,27 +773,59 @@ int main(void) {
 
     /* METRICS (0.28.0): the peer-file state rides at the end of the
      * line — path, last reload time / last mtime as unix seconds,
-     * and the counts from the last load. Exact line: the canned
-     * metrics are all zero, so every other field is known too. */
+     * and the counts from the last load. Exact first line: the
+     * canned metrics are all zero, so every other field is known
+     * too. Time since last contact (0.59.0) rides after it as one
+     * "LASTSEEN <id> <ms>" line per member heard from — the canned
+     * table's two heard-from peers, 17901 and 17903, in table
+     * order, with timing-dependent values checked as all digits
+     * like PEERS does; self (17999) and the never-heard-from peer
+     * (17902) have no line — then END. */
     g_peerfile_mode = 0;
     CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
-    CHECK(strcmp(reply,
-                 "METRICS suspected=0 dead=0 refutes=0 joins=0 "
-                 "seed_rejoins=0 seed_rejoins_by_seed=- "
-                 "seed_last_rejoin_ms_by_seed=- "
-                 "seed_rejoin_backoff_ms_by_seed=- "
-                 "adaptive_fast_cycles=0 suspect_refuted=0 "
-                 "detect_latency_ms mean=- max=- samples=0 "
-                 "hist=[0,0,0,0,0] suspect_to_dead_ms mean=- max=- "
-                 "samples=0 refute_latency_ms mean=- max=- samples=0 "
-                 "probe_rtt_ms mean=- max=- samples=0 "
-                 "hist=[0,0,0,0,0] slow_peers=0 peer_file=/tmp/peers "
-                 "last_reload=1700000000 last_mtime=1699999000 "
-                 "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
-                 "pf_bad=0 watch_subscribers=0 watch_sessions=0 "
-                 "watch_delivered=0 watch_filtered=0 watch_dropped=0 "
-                 "watch_paused=0 watch_event_log_cap=128 "
-                 "gossip_digest_size=16 phi_threshold=5.50\nEND\n") == 0);
+    {
+        static const char metrics_line[] =
+            "METRICS suspected=0 dead=0 refutes=0 joins=0 "
+            "seed_rejoins=0 seed_rejoins_by_seed=- "
+            "seed_last_rejoin_ms_by_seed=- "
+            "seed_rejoin_backoff_ms_by_seed=- "
+            "adaptive_fast_cycles=0 suspect_refuted=0 "
+            "detect_latency_ms mean=- max=- samples=0 "
+            "hist=[0,0,0,0,0] suspect_to_dead_ms mean=- max=- "
+            "samples=0 refute_latency_ms mean=- max=- samples=0 "
+            "probe_rtt_ms mean=- max=- samples=0 "
+            "hist=[0,0,0,0,0] slow_peers=0 peer_file=/tmp/peers "
+            "last_reload=1700000000 last_mtime=1699999000 "
+            "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
+            "pf_bad=0 watch_subscribers=0 watch_sessions=0 "
+            "watch_delivered=0 watch_filtered=0 watch_dropped=0 "
+            "watch_paused=0 watch_event_log_cap=128 "
+            "gossip_digest_size=16 phi_threshold=5.50\n";
+        CHECK(strncmp(reply, metrics_line, sizeof metrics_line - 1) == 0);
+        const char *want_seen_id[2] = {"127.0.0.1:17901",
+                                       "127.0.0.1:17903"};
+        int nseen = 0;
+        char *save = NULL;
+        char *line = strtok_r(reply + sizeof metrics_line - 1, "\n",
+                              &save);
+        while (line) {
+            if (strcmp(line, "END") == 0) break;
+            CHECK(nseen < 2);
+            if (nseen < 2) {
+                char id[64], ms[32];
+                CHECK(sscanf(line, "LASTSEEN %63s %31s", id, ms) == 2);
+                CHECK(strcmp(id, want_seen_id[nseen]) == 0);
+                int all_digits = ms[0] != '\0';
+                for (int i = 0; ms[i]; i++)
+                    if (!isdigit((unsigned char)ms[i])) all_digits = 0;
+                CHECK(all_digits);
+            }
+            nseen++;
+            line = strtok_r(NULL, "\n", &save);
+        }
+        CHECK(nseen == 2);
+        CHECK(line != NULL && strcmp(line, "END") == 0);
+    }
 
     /* Phi suspicion threshold in METRICS (0.45.0): the fake hook
      * reports 5.50, so the exact line above proves the value
@@ -863,6 +895,21 @@ int main(void) {
     CHECK(strstr(reply,
                  "\"probe_rtt_ms\":{\"mean\":null,\"max\":0,"
                  "\"samples\":0,\"hist\":[0,0,0,0,0]}") != NULL);
+    /* Time since last contact (0.59.0): each member carries
+     * "last_seen_ms" — a number for a peer heard from, null for
+     * self and for a peer never heard from. The values are
+     * timing-dependent, so check the field exists and the
+     * never-heard-from peer's entry carries null. */
+    CHECK(strstr(reply, "\"last_seen_ms\":") != NULL);
+    {
+        const char *never = strstr(reply, "\"id\":\"127.0.0.1:17902\"");
+        const char *seen_null =
+            never ? strstr(never, "\"last_seen_ms\":null") : NULL;
+        const char *next_id =
+            never ? strstr(never + 1, "\"id\":") : NULL;
+        CHECK(never != NULL && seen_null != NULL &&
+              (next_id == NULL || seen_null < next_id));
+    }
     /* The peer_file object sits at the top level, after metrics. */
     {
         const char *metrics = strstr(reply, "\"metrics\":{");
@@ -1058,6 +1105,19 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17903\"} 0\n") != NULL);
         CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17999\"}") == NULL);
         CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17902\"}") == NULL);
+        /* Time since last contact per member (0.59.0): one
+         * pulse_member_last_seen_ms gauge sample per member heard
+         * from — the seed peer and the peer-file peer, both heard
+         * from just now — while self and the never-heard-from
+         * dead peer have no sample at all. The values are
+         * timing-dependent, so check the HELP/TYPE lines and the
+         * sample prefixes, not the numbers. */
+        CHECK(strstr(preply, "# HELP pulse_member_last_seen_ms ") != NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_last_seen_ms gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_last_seen_ms{member=\"127.0.0.1:17901\"} ") != NULL);
+        CHECK(strstr(preply, "pulse_member_last_seen_ms{member=\"127.0.0.1:17903\"} ") != NULL);
+        CHECK(strstr(preply, "pulse_member_last_seen_ms{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_last_seen_ms{member=\"127.0.0.1:17902\"}") == NULL);
         /* Phi per member (0.42.0): phi mode is off in this
          * harness, so no pulse_member_phi line at all — the
          * canned phi history on the seed peer produces no gauge

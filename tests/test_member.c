@@ -247,6 +247,22 @@ int main(void) {
     CHECK(member_suspect_age_ms(m2, now) == -1); /* DEAD */
     CHECK(member_suspect_age_ms(NULL, now) == -1);
 
+    /* time since last contact (0.59.0): -1 for a peer never heard
+     * from, then now minus last_seen once contact is recorded;
+     * the age keeps growing after the peer goes DEAD — how long
+     * it has been silent — and NULL is -1. */
+    member_table_t t4;
+    member_table_init(&t4);
+    member_t *m4 = member_add(&t4, "127.0.0.1:17104", &a4, 1);
+    CHECK(member_last_seen_age_ms(m4, now) == -1); /* never heard from */
+    CHECK(member_mark_suspect(&t4, "127.0.0.1:17104", now + 100) == 1);
+    CHECK(member_mark_alive(&t4, "127.0.0.1:17104", &a4, 1, now + 200) == 1);
+    CHECK(member_last_seen_age_ms(m4, now + 200) == 0);
+    CHECK(member_last_seen_age_ms(m4, now + 700) == 500);
+    CHECK(member_mark_dead(&t4, "127.0.0.1:17104", now + 700) == 1);
+    CHECK(member_last_seen_age_ms(m4, now + 1700) == 1500); /* DEAD, still aging */
+    CHECK(member_last_seen_age_ms(NULL, now) == -1);
+
     /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
     CHECK(member_gossip_fanout(0) == 1);
     CHECK(member_gossip_fanout(1) == 1);

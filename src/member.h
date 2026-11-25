@@ -244,6 +244,17 @@ int member_count_slow(const member_table_t *t, int64_t slow_threshold_ms);
  * gossip it is the time since this node learned of it, not since
  * the detecting node suspected it. */
 int64_t member_suspect_age_ms(const member_t *m, int64_t now);
+/* How long since this node last heard from a member, in ms
+ * (0.59.0): now minus the member's last_seen_ms — the last direct
+ * contact (a probe ACK or a gossip message carrying the member).
+ * -1 when the member was never heard from (last_seen_ms 0): an
+ * absent value, not a zero — a zero would claim contact just now.
+ * Self is excluded by the caller: self never probes itself, so
+ * its last_seen is just startup time and the age would be the
+ * node's uptime, not a contact age. A DEAD member keeps its last
+ * contact time until GC, so its age keeps growing — how long it
+ * has been silent, which is the point. */
+int64_t member_last_seen_age_ms(const member_t *m, int64_t now);
 
 int member_count_state(const member_table_t *t, member_state_t state);
 /* Force-remove a member (operator action, e.g. the control plane's

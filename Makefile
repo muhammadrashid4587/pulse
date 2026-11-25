@@ -99,6 +99,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_phi_history_json.sh
 	bash tests/test_probe_rtt_hist.sh
 	bash tests/test_suspect_ms.sh
+	bash tests/test_last_seen_ms.sh
 	bash tests/test_phi_rtt.sh
 	bash tests/test_watch_backpressure.sh
 	bash tests/test_watch_events_persist.sh

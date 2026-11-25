@@ -180,6 +180,15 @@
  *       sits SUSPECT and the member drops off the list the
  *       moment it revives or goes DEAD; ALIVE and DEAD members
  *       have no line, so an absent line says "not suspected".
+ *       Time since last contact per member (0.59.0): after the
+ *       SUSPECT lines, one "LASTSEEN <id> <ms>" line per member
+ *       heard from — how long since this node last heard from
+ *       the member, in ms, the same value JSON reports as
+ *       "last_seen_ms" and PROMETHEUS as
+ *       pulse_member_last_seen_ms. Self has no line (its
+ *       last_seen is just startup time) and a peer never heard
+ *       from has none either; a DEAD member keeps its line
+ *       until GC, the age growing — how long it has been silent.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -192,7 +201,12 @@
  *       above --slow-peer-rtt-ms, false otherwise), "suspect_ms"
  *       (0.58.0: how long the member has been SUSPECT, in ms — null
  *       unless the member is SUSPECT — so a consumer can judge how
- *       close it is to the suspect timeout), "source" (where
+ *       close it is to the suspect timeout), "last_seen_ms"
+ *       (0.59.0: how long since this node last heard from the
+ *       member, in ms — null for self and for a peer never heard
+ *       from — so a consumer can see a peer going quiet before
+ *       the suspicion fires, and how long a DEAD member has been
+ *       silent), "source" (where
  *       the peer came from: "seed", "peer-file", "discovered" or
  *       "self" — the same provenance PEERS reports, so a peer-file
  *       peer is distinguishable from a discovered one), and the
@@ -291,7 +305,14 @@
  *       "suspect_ms" and METRICS as a SUSPECT line — so a scraper
  *       can alert on a suspicion nearing the suspect timeout
  *       instead of only on the DEAD transition; ALIVE and DEAD
- *       members have no line. The phi
+ *       members have no line. How long since this node last heard
+ *       from each member rides as a "pulse_member_last_seen_ms"
+ *       gauge (0.59.0), one line per member heard from — the same
+ *       value JSON reports as "last_seen_ms" and METRICS as a
+ *       LASTSEEN line — so a scraper can alert on a peer going
+ *       quiet before the suspicion fires; self and a peer never
+ *       heard from have no line, and a DEAD member keeps its
+ *       gauge until GC, the value growing. The phi
  *       failure-detector value per member rides as a
  *       "pulse_member_phi" gauge (0.42.0), one line per member
  *       that has a phi — phi mode on, not self, heartbeat history

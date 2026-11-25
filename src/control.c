@@ -583,6 +583,33 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
             if (send_all(fd, susline) != 0) return;
         }
     }
+    /* Time since last contact per member (0.59.0): how long since
+     * this node last heard from each member, in ms, as one
+     * "LASTSEEN <id> <ms>" line per member heard from, after the
+     * SUSPECT lines, under the same rule as JSON's "last_seen_ms"
+     * — the age is now minus the member's last_seen_ms. Self is
+     * excluded (its last_seen is just startup time, so the age
+     * would be uptime, not a contact age) and a peer never heard
+     * from has no line: an absent line is how the text protocol
+     * says "never heard from". A DEAD member keeps its line until
+     * GC, the age growing — how long it has been silent. A
+     * text-protocol consumer judges the age against the probe
+     * interval and the suspect timeout the same way a JSON
+     * consumer judges "last_seen_ms": a live peer's age stays
+     * under a few probe intervals, a dying peer's climbs. */
+    {
+        int64_t now = pulse_now_ms();
+        for (int i = 0; i < t.count; i++) {
+            const member_t *mem = &t.members[i];
+            if (strcmp(mem->id, hooks->self_id) == 0) continue;
+            int64_t age = member_last_seen_age_ms(mem, now);
+            if (age < 0) continue;
+            char seenline[128];
+            snprintf(seenline, sizeof seenline, "\nLASTSEEN %s %lld",
+                     mem->id, (long long)age);
+            if (send_all(fd, seenline) != 0) return;
+        }
+    }
     send_all(fd, "\nEND\n");
 }
 
@@ -675,6 +702,27 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         else
             snprintf(suspectbuf, sizeof suspectbuf, "%lld",
                      (long long)age);
+        /* Time since last contact (0.59.0): how long since this
+         * node last heard from this member, in ms — now minus its
+         * last_seen_ms. Null for self (its last_seen is just
+         * startup time, so the age would be uptime, not a contact
+         * age) and for a peer never heard from (last_seen_ms 0):
+         * an absent value, not a zero — a zero would claim
+         * contact just now. A live peer's age stays under a few
+         * probe intervals; a dying peer's climbs toward the
+         * suspect timeout, and a DEAD member's keeps growing
+         * until GC — how long it has been silent. */
+        char seenbuf[32];
+        if (strcmp(mem->id, hooks->self_id) == 0)
+            snprintf(seenbuf, sizeof seenbuf, "null");
+        else {
+            int64_t seen_age = member_last_seen_age_ms(mem, now);
+            if (seen_age < 0)
+                snprintf(seenbuf, sizeof seenbuf, "null");
+            else
+                snprintf(seenbuf, sizeof seenbuf, "%lld",
+                         (long long)seen_age);
+        }
         /* "source" (0.28.0) is where this node got the peer from —
          * "seed", "peer-file", "discovered" or "self" — the same
          * provenance PEERS reports, so a peer-file peer is
@@ -683,6 +731,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
                      "\"rtt_mean_ms\":%s,\"slow\":%s,\"suspect_ms\":%s,"
+                     "\"last_seen_ms\":%s,"
                      "\"source\":\"%s\"}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
@@ -690,7 +739,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                      member_is_slow(mem, hooks->slow_rtt_threshold_ms)
                          ? "true"
                          : "false",
-                     suspectbuf,
+                     suspectbuf, seenbuf,
                      peer_source_str(hooks, mem->id));
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
@@ -1330,6 +1379,30 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         if (age < 0) continue;
         ok &= prom_add(buf, sizeof buf, &used,
             "pulse_member_suspect_ms{member=\"%s\"} %lld\n",
+            t.members[i].id, (long long)age) == 0;
+    }
+    /* Time since last contact per member (0.59.0): how long since
+     * this node last heard from each member, in ms — the same
+     * value JSON reports as "last_seen_ms" and METRICS as a
+     * LASTSEEN line — as a gauge a scraper can alert on, one line
+     * per member heard from. Self is excluded (its last_seen is
+     * just startup time) and a peer never heard from has no line:
+     * an absent series is how Prometheus says "never heard from",
+     * the same as the RTT gauges say "never probed". A live
+     * peer's gauge stays under a few probe intervals; a dying
+     * peer's climbs toward the suspect timeout, and a DEAD
+     * member's keeps growing until GC, so a scraper can alert on
+     * a peer going quiet before the suspicion even fires. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_last_seen_ms How long since this node "
+        "last heard from a member, in ms, per member.\n"
+        "# TYPE pulse_member_last_seen_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (strcmp(t.members[i].id, hooks->self_id) == 0) continue;
+        int64_t age = member_last_seen_age_ms(&t.members[i], now);
+        if (age < 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_last_seen_ms{member=\"%s\"} %lld\n",
             t.members[i].id, (long long)age) == 0;
     }
     /* Phi per member (0.42.0): the failure-detector value JSON
