@@ -87,7 +87,7 @@ else
 fi
 json="$(ctl 18501 JSON)"
 if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
-   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17501","incarnation":1,"state":"ALIVE","phi":null,"phi_history":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null,"rtt_max_ms":null,"slow":false,"quiet":false,"suspect_ms":null,"last_seen_ms":null,"source":"self","probes_sent":0,"probes_answered":0,"low_probe_rate":false,"probe_rate":null,"probe_rate_history":null,"flap_count":0,"flaps_10m":0}\]' \
+   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17501","incarnation":1,"state":"ALIVE","phi":null,"phi_history":null,"meta":{"role":"worker","zone":"us-east-1"},"rtt_ms":null,"rtt_mean_ms":null,"rtt_max_ms":null,"slow":false,"quiet":false,"suspect_ms":null,"last_seen_ms":null,"source":"self","probes_sent":0,"probes_answered":0,"low_probe_rate":false,"probe_rate":null,"probe_rate_history":null,"flap_count":0,"flaps_10m":0,"flap_rate":false}\]' \
    && echo "$json" | grep -q "^END$"; then
     note ok "JSON carries annotations as a meta object"
 else

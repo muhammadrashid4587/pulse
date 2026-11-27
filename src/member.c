@@ -802,6 +802,40 @@ int member_flaps_recent(const member_t *m, int64_t now) {
     return n;
 }
 
+/* Flap-rate warning (0.76.0): the peer counts as flap-rate
+ * when the warning is enabled (threshold > 0), the peer is
+ * ALIVE, and at least threshold of its completed flap cycles
+ * fall inside the recent window — the count is the same
+ * member_flaps_recent JSON reports as "flaps_10m", so the
+ * predicate and the surfaces agree. The comparison is at or
+ * above: a threshold of 3 fires on the third flap in 10
+ * minutes, not the fourth. A peer that never flapped has a
+ * recent count of 0, so it never counts; a SUSPECT or DEAD
+ * peer does not either — the warning is for a peer still
+ * counted ALIVE, the same rule as the low-probe-rate and
+ * quiet warnings. */
+int member_is_flap_rate(const member_t *m, int64_t threshold,
+                        int64_t now) {
+    if (!m || threshold <= 0) return 0;
+    if (m->state != MEMBER_ALIVE) return 0;
+    return member_flaps_recent(m, now) >= threshold;
+}
+
+int member_count_flap_rate(const member_table_t *t,
+                           const char *self_id, int64_t threshold,
+                           int64_t now) {
+    int n = 0;
+    for (int i = 0; i < t->count; i++) {
+        /* Self never suspects itself (see member_is_flap_rate),
+         * so it is excluded here, not in the predicate: the
+         * predicate cannot tell self from a peer. */
+        if (self_id && strcmp(t->members[i].id, self_id) == 0) continue;
+        if (member_is_flap_rate(&t->members[i], threshold, now))
+            n++;
+    }
+    return n;
+}
+
 int member_mark_suspect(member_table_t *t, const char *id, int64_t now) {
     member_t *m = member_find(t, id);
     if (!m || m->state != MEMBER_ALIVE) return 0;

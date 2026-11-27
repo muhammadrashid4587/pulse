@@ -694,6 +694,77 @@ int main(void) {
     CHECK(mg->flap_count == 2);
     CHECK(member_flaps_recent(mg, now + 500) == 2);
 
+    /* Flap-rate warning (0.76.0): a member counts as flap-rate
+     * when it is ALIVE and at least threshold of its completed
+     * flap cycles fall inside the last 10 minutes — the count
+     * is the same member_flaps_recent the surfaces report, so
+     * the predicate and the surfaces agree. The comparison is
+     * at or above: a threshold of 3 fires on the third flap,
+     * not the fourth. A disabled threshold (0 or negative)
+     * never counts, a peer that never flapped never counts, and
+     * a SUSPECT or DEAD peer does not count either — the
+     * warning is for a peer still counted ALIVE. The count only
+     * falls as flaps age out of the window, so a peer at the
+     * threshold stops counting a window after its earliest flap
+     * — that is the recovery the probe cycle turns into a
+     * FLAPOK. The table count excludes self: self never
+     * suspects itself, so it has no flaps to judge. */
+    member_table_t tr;
+    member_table_init(&tr);
+    member_t *mr = member_add(&tr, "127.0.0.1:17112", &a4, 1);
+    CHECK(member_is_flap_rate(NULL, 1, now) == 0);
+    CHECK(member_is_flap_rate(mr, 0, now + 100) == 0);
+    CHECK(member_is_flap_rate(mr, -1, now + 100) == 0);
+    CHECK(member_is_flap_rate(mr, 1, now + 100) == 0);
+    /* Three cycles: SUSPECT -> ALIVE, SUSPECT -> ALIVE,
+     * SUSPECT -> ALIVE, completing at +200, +400 and +600. */
+    CHECK(member_mark_suspect(&tr, "127.0.0.1:17112", now + 100) == 1);
+    CHECK(member_mark_alive(&tr, "127.0.0.1:17112", &a4, 1,
+                            now + 200) == 1);
+    CHECK(member_mark_suspect(&tr, "127.0.0.1:17112", now + 300) == 1);
+    CHECK(member_mark_alive(&tr, "127.0.0.1:17112", &a4, 1,
+                            now + 400) == 1);
+    CHECK(member_mark_suspect(&tr, "127.0.0.1:17112", now + 500) == 1);
+    CHECK(member_mark_alive(&tr, "127.0.0.1:17112", &a4, 1,
+                            now + 600) == 1);
+    CHECK(mr->flap_count == 3);
+    CHECK(member_is_flap_rate(mr, 1, now + 700) == 1);
+    CHECK(member_is_flap_rate(mr, 3, now + 700) == 1);
+    CHECK(member_is_flap_rate(mr, 4, now + 700) == 0);
+    /* A SUSPECT peer does not count, even at the threshold. */
+    CHECK(member_mark_suspect(&tr, "127.0.0.1:17112", now + 800) == 1);
+    CHECK(member_is_flap_rate(mr, 1, now + 800) == 0);
+    /* A DEAD peer does not count either — and the suspicion
+     * that just ended in death is a fourth flap. */
+    CHECK(member_mark_dead(&tr, "127.0.0.1:17112", now + 900) == 1);
+    CHECK(mr->flap_count == 4);
+    CHECK(member_is_flap_rate(mr, 1, now + 900) == 0);
+    /* The recovery: revive the peer first — a DEAD peer never
+     * counts, so the ageing has to be judged on an ALIVE one.
+     * A window after the earliest flap it ages out, so 3 of
+     * the 4 still count — at the threshold, but below 4 — and
+     * a window after the last, none do. */
+    CHECK(member_mark_alive(&tr, "127.0.0.1:17112", &a4, 2,
+                            now + 1000) == 1);
+    CHECK(member_is_flap_rate(mr, 4,
+                              now + 201 + PULSE_FLAP_WINDOW_MS) == 0);
+    CHECK(member_is_flap_rate(mr, 3,
+                              now + 201 + PULSE_FLAP_WINDOW_MS) == 1);
+    CHECK(member_is_flap_rate(mr, 1,
+                              now + 901 + PULSE_FLAP_WINDOW_MS) == 0);
+    /* The table count: mr is ALIVE again with all four flaps
+     * recent, so it counts at a threshold of 4 and not at 5 —
+     * and the count is 0 with the warning disabled, and 0 when
+     * the member itself is passed as self. */
+    CHECK(member_count_flap_rate(&tr, "127.0.0.1:17101", 4,
+                                 now + 1000) == 1);
+    CHECK(member_count_flap_rate(&tr, "127.0.0.1:17101", 5,
+                                 now + 1000) == 0);
+    CHECK(member_count_flap_rate(&tr, "127.0.0.1:17101", 0,
+                                 now + 1000) == 0);
+    CHECK(member_count_flap_rate(&tr, "127.0.0.1:17112", 4,
+                                 now + 1000) == 0);
+
     /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
     CHECK(member_gossip_fanout(0) == 1);
     CHECK(member_gossip_fanout(1) == 1);

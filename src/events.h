@@ -73,6 +73,13 @@ typedef enum {
                                   recovered to the slow-peer
                                   threshold or below after a SLOW
                                   episode (0.73.0) */
+    PULSE_EVENT_FLAPRATE,      /* an ALIVE peer's flap count in the
+                                  last 10 minutes reached the
+                                  flap-rate threshold (0.76.0) */
+    PULSE_EVENT_FLAPOK,        /* an ALIVE peer's flap count in the
+                                  last 10 minutes fell back below
+                                  the flap-rate threshold after a
+                                  FLAPRATE episode (0.76.0) */
 } pulse_event_type_t;
 
 typedef struct {
@@ -180,6 +187,25 @@ typedef struct {
      * present, and the persisted log carries the same trailing
      * field. */
     int64_t rtt_mean_ms;
+    /* Flap count at record time (0.76.0): how many of the
+     * member's completed flap cycles fall inside the recent
+     * window when the event was recorded — the same value JSON
+     * reports as "flaps_10m" and METRICS as the recent number
+     * on a FLAP line, frozen at the event instead of recomputed
+     * at replay time, so a replayed FLAPRATE event still shows
+     * how fast the peer was flapping when the threshold was
+     * crossed, and a replayed FLAPOK event still shows how far
+     * the count had fallen when the episode ended. Carried
+     * only on a FLAPRATE or FLAPOK event: every other event has
+     * no flap count to report. -1 when the member never
+     * flapped, for self (it never suspects itself), or when
+     * the member had already left the table when the event was
+     * recorded: an absent value, never a fabricated zero. A
+     * WATCH consumer reads it as a trailing " flaps_10m=<n>"
+     * on the EVENT line, after the mean probe RTT when it is
+     * present, and the persisted log carries the same trailing
+     * field. */
+    int64_t flaps_10m;
 } pulse_event_t;
 
 typedef struct {
@@ -203,7 +229,8 @@ void pulse_event_log_free(pulse_event_log_t *log);
 int pulse_event_log_cap(pulse_event_log_t *log);
 
 /* "JOINED", "SUSPECTED", "DEAD", "REVIVED", "DROPPED", "REFUTED",
- * "QUIET", "LOWRATE", "RATEOK", "QUIETOK", "SLOW", "SLOWOK": the word that rides in the EVENT line for a
+ * "QUIET", "LOWRATE", "RATEOK", "QUIETOK", "SLOW", "SLOWOK",
+ * "FLAPRATE", "FLAPOK": the word that rides in the EVENT line for a
  * type. */
 const char *pulse_event_type_name(pulse_event_type_t type);
 
@@ -222,7 +249,11 @@ int pulse_event_type_parse(const char *name, pulse_event_type_t *out);
  * just been heard from again after going quiet. SLOW and SLOWOK
  * (0.73.0) land on ALIVE too: the peer is still alive, its mean
  * probe RTT has just crossed the slow-peer threshold, or just
- * recovered to it or below after a SLOW episode.
+ * recovered to it or below after a SLOW episode. FLAPRATE and
+ * FLAPOK (0.76.0) land on ALIVE too: the peer is still alive,
+ * its flap count in the last 10 minutes has just reached the
+ * flap-rate threshold, or just fallen back below it after a
+ * FLAPRATE episode.
  * Used by the WATCH state filter (0.39.0), which subscribes
  * to events by the state they land on. */
 int pulse_event_result_state(pulse_event_type_t type, member_state_t *out);
@@ -345,6 +376,34 @@ uint64_t pulse_event_record_rtt_mean_ms(pulse_event_log_t *log,
                                        int64_t suspect_ms,
                                        int64_t rtt_mean_ms);
 
+/* The same, carrying the phi at a threshold crossing, the
+ * last-contact age at record time, the probe counts at record
+ * time, the recent probe success rate at record time, the
+ * suspicion duration at record time, the mean probe RTT at
+ * record time, and the flap count in the recent window at
+ * record time (0.76.0): the caller passes how many of the
+ * member's completed flap cycles fall inside the last 10
+ * minutes when the event was recorded — the same value JSON
+ * reports as "flaps_10m" — or -1 when the event is not a
+ * FLAPRATE or FLAPOK event (which are the only events a flap
+ * count is measured for). The count is frozen at the event: a
+ * replayed FLAPRATE event still shows how fast the peer was
+ * flapping when the threshold was crossed, and a replayed
+ * FLAPOK event still shows how far the count had fallen when
+ * the episode ended. */
+uint64_t pulse_event_record_flap_rate(pulse_event_log_t *log,
+                                      pulse_event_type_t type,
+                                      const char *id,
+                                      uint32_t incarnation,
+                                      int64_t unix_ts, double phi,
+                                      int64_t last_seen_ms,
+                                      int64_t probes_sent,
+                                      int64_t probes_answered,
+                                      double probe_rate,
+                                      int64_t suspect_ms,
+                                      int64_t rtt_mean_ms,
+                                      int64_t flaps_10m);
+
 /* Write every event the ring currently holds, in sequence order,
  * to path (one "<seq> <TYPE> <id> <incarnation> <unix_ts>" line per
  * event, with a trailing " phi=<value>" on a phi-mode SUSPECTED
@@ -359,7 +418,9 @@ uint64_t pulse_event_record_rtt_mean_ms(pulse_event_log_t *log,
  * REVIVED event for a peer that was SUSPECT — 0.70.0, after the
  * probe rate when it is present — and a trailing
  * " rtt_mean_ms=<ms>" on a SLOW event — 0.73.0, or a SLOWOK event,
- * after the suspicion duration when it is present),
+ * after the suspicion duration when it is present — and a trailing
+ * " flaps_10m=<n>" on a FLAPRATE event — 0.76.0, or a FLAPOK event,
+ * after the mean probe RTT when it is present),
  * atomically via a tmp file + rename, so a crash
  * mid-write never leaves a half-written file. Returns the number
  * of events written, or -1 if the file could not be written. Used
@@ -390,7 +451,9 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path);
  * loads with suspect_ms -1; a line without the trailing
  * " rtt_mean_ms=<ms>" — written before 0.73.0, or any event
  * that is not a SLOW or SLOWOK event — loads with rtt_mean_ms
- * -1; the trailing fields are
+ * -1; a line without the trailing " flaps_10m=<n>" — written
+ * before 0.76.0, or any event that is not a FLAPRATE or FLAPOK
+ * event — loads with flaps_10m -1; the trailing fields are
  * parsed independently, so any of them may be present without
  * the others. */
 int pulse_event_log_load(pulse_event_log_t *log, const char *path);

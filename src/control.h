@@ -93,7 +93,11 @@
  *       members currently count as low-probe-rate: ALIVE with a
  *       recent probe success rate below --low-probe-rate-frac (0
  *       when the warning is disabled; see "Low-probe-rate
- *       alert").
+ *       alert"). flap_rate_peers (0.76.0) is how many members
+ *       currently count as flap-rate: ALIVE with at least
+ *       --flap-rate-threshold completed flap cycles in the last
+ *       10 minutes (0 when the warning is disabled; see
+ *       "Flap-rate alert").
  *       The peer-file fields (0.28.0) are the --peer-file state: the
  *       path, the wall-clock time of the last successful load or
  *       reload, the file's mtime at that load, and the counts from
@@ -232,6 +236,15 @@
  *       above the threshold, a peer never probed, and a SUSPECT
  *       or DEAD peer have no line; self never probes itself and
  *       has none either.
+ *       Flap-rate warning (0.76.0): after the FLAP lines, one
+ *       "FLAPRATE <id> <flaps>" line per member that counts as
+ *       flap-rate — ALIVE, with at least --flap-rate-threshold
+ *       completed flap cycles in the last 10 minutes — the
+ *       recent count itself, the same value JSON reports as
+ *       "flaps_10m" and PROMETHEUS as pulse_member_flaps_10m.
+ *       A peer below the threshold, a peer that never flapped,
+ *       and a SUSPECT or DEAD peer have no line; self never
+ *       suspects itself and has none either.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -273,7 +286,13 @@
  *       metrics object carries "slow_peers" (how many members are
  *       slow) and "quiet_peers" (0.62.0: how many members are
  *       quiet) and "low_probe_rate_peers" (0.68.0: how many
- *       members count as low-probe-rate).
+ *       members count as low-probe-rate) and "flap_rate_peers"
+ *       (0.76.0: how many members count as flap-rate). Each
+ *       member also carries "flap_rate" (0.76.0: true when the
+ *       peer is ALIVE and its completed flap cycles in the last
+ *       10 minutes reach --flap-rate-threshold, false
+ *       otherwise — self and a peer that never flapped are
+ *       always false).
  *       (0.54.0): the per-seed breakdown of "seed_rejoins" as an
  *       object — {"127.0.0.1:17101":2} — or {} when no seed has
  *       been re-joined yet, so a JSON consumer can see which seed
@@ -391,7 +410,15 @@
  *       like JSON's "probe_rate" — so a scraper can alert on a
  *       peer answering one probe in ten instead of only on the
  *       count; self and a peer never probed have no line, and a
- *       DEAD member keeps its last window rate until GC. The phi
+ *       DEAD member keeps its last window rate until GC. How many
+ *       members count as flap-rate rides as a
+ *       "pulse_flap_rate_peers" gauge (0.76.0) — ALIVE members
+ *       whose completed flap cycles in the last 10 minutes reach
+ *       --flap-rate-threshold, 0 when the warning is disabled —
+ *       so a scraper can alert on a member flapping right now
+ *       instead of only on the per-member flap counts; the
+ *       per-member count itself already rides as
+ *       pulse_member_flaps_10m. The phi
  *       failure-detector value per member rides as a
  *       "pulse_member_phi" gauge (0.42.0), one line per member
  *       that has a phi — phi mode on, not self, heartbeat history
@@ -412,7 +439,7 @@
  *       SNAPSHOT line per member — id, incarnation, state,
  *       last-seen-ms (or '-') and source, the PEERS shape — then
  *       END, then one EVENT line per membership event as it happens:
- *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE|RATEOK|QUIETOK|SLOW|SLOWOK>
+ *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE|RATEOK|QUIETOK|SLOW|SLOWOK|FLAPRATE|FLAPOK>
  *       <id> <incarnation> <unix-seconds>. JOINED is a peer
  *       appearing in the table, SUSPECTED is ALIVE -> SUSPECT, DEAD
  *       is SUSPECT -> DEAD, REVIVED is a SUSPECT/DEAD peer coming
@@ -438,7 +465,15 @@
  *       answering its probes slowly — and SLOWOK (0.73.0) is an
  *       ALIVE peer whose mean probe RTT recovered to the
  *       slow-peer threshold or below after a SLOW episode — the
- *       peer is still alive, it is answering fast enough again.
+ *       peer is still alive, it is answering fast enough again —
+ *       and FLAPRATE (0.76.0) is an ALIVE peer whose completed
+ *       flap cycles in the last 10 minutes reached the
+ *       flap-rate threshold — the peer is still alive, it has
+ *       just started flapping too fast — and FLAPOK (0.76.0) is
+ *       an ALIVE peer whose flap count in the last 10 minutes
+ *       fell back below the flap-rate threshold after a FLAPRATE
+ *       episode — the peer is still alive, it has stopped
+ *       flapping fast enough to warn about.
  *       The connection
  *       stays open until the client closes it (or falls too far
  *       behind: the event log is a bounded ring, so a slow consumer
@@ -500,7 +535,17 @@
  *       carries the same trailing field — the mean when it
  *       recovered to the threshold or below, frozen at the event
  *       so a replay still shows how far the mean had come back —
- *       and no other event carries one. An event with
+ *       and no other event carries one. A FLAPRATE event carries
+ *       a trailing " flaps_10m=<n>" (0.76.0) — how many of the
+ *       peer's flap cycles fall inside the recent window when
+ *       the threshold was crossed, the same value JSON reports
+ *       as "flaps_10m", frozen at the event so a replay still
+ *       shows how fast the peer was flapping — after the mean
+ *       probe RTT when it is present; a FLAPOK event carries the
+ *       same trailing field — the count when it fell back below
+ *       the threshold, frozen at the event so a replay still
+ *       shows how far the count had fallen — and no other event
+ *       carries one. An event with
  *       no trailing field writes the plain five fields, so
  *       existing consumers see byte-identical lines.
  *       A filter (0.30.0) narrows the stream server-side: an
@@ -522,7 +567,8 @@
  *       state an event leaves its member in: "WATCH STATE
  *       SUSPECT,DEAD" carries only events that land on SUSPECT
  *       or DEAD. JOINED, REVIVED, REFUTED, QUIET, QUIETOK,
- *       LOWRATE, RATEOK, SLOW and SLOWOK land on ALIVE,
+ *       LOWRATE, RATEOK, SLOW, SLOWOK, FLAPRATE and FLAPOK land
+ *       on ALIVE,
  *       SUSPECTED on SUSPECT, DEAD on DEAD, and DROPPED lands on
  *       no state — the member left the table — so it never
  *       matches a state filter; a watcher that wants removals
@@ -713,6 +759,12 @@ typedef struct {
      * and is reported as "low_probe_rate" per member in JSON
      * and as low_probe_rate_peers in METRICS and JSON. */
     double low_probe_rate_frac;
+    /* Flap-rate threshold as a count (0 = warning disabled,
+     * 0.76.0): an ALIVE peer whose completed flap cycles in
+     * the last 10 minutes reach this count counts as
+     * flap-rate, and is reported as "flap_rate" per member in
+     * JSON and as flap_rate_peers in METRICS and JSON. */
+    int64_t flap_rate_threshold;
     /* Membership events for the WATCH command (0.29.0): the next
      * event after last_seq, or a wait for one. Returns 1 with *out
      * filled, 0 when no new event arrived within timeout_ms, -1

@@ -193,6 +193,26 @@ typedef struct {
     int flap_hist_count;
     int flap_hist_head;
     int flap_armed;
+    /* Flap-rate warning (0.76.0): whether a FLAPRATE log line
+     * and event have already been emitted for the current
+     * flap-rate episode — an ALIVE peer whose flap count in
+     * the last 10 minutes reached the configured threshold.
+     * Set when the count first reaches the threshold, cleared
+     * when it falls back below it, so a persistently flapping
+     * peer warns once per episode instead of once per probe
+     * cycle, and a peer that recovers and flaps again warns
+     * again. Clearing the flag is the recovery: the probe
+     * cycle logs a FLAPOK line and records a FLAPOK event for
+     * the peer, so the episode ends in the log and on the WATCH
+     * stream instead of silently. Like quiet_warned it is
+     * NOT cleared on direct contact: the count only falls as
+     * flaps age out of the 10-minute window, so clearing on
+     * contact would re-fire almost at once for a peer still
+     * flapping. A peer that goes SUSPECT while warned keeps
+     * its flag until it revives to ALIVE, so its FLAPOK fires
+     * only once the recovery stuck — the same rule as
+     * quiet_warned. */
+    int flap_rate_warned;
     /* Low-probe-rate warning (0.68.0): whether a LOWRATE log
      * line and event have already been emitted for the current
      * low-rate episode — an ALIVE peer whose windowed probe
@@ -451,6 +471,27 @@ void member_probe_rate_history_hist(const member_t *m, const double *bounds,
  * lifetime flap_count keeps growing. 0 for a NULL member, and
  * for a member that never flapped. */
 int member_flaps_recent(const member_t *m, int64_t now);
+/* 1 when the peer counts as flap-rate (0.76.0): the
+ * flap-rate warning is enabled (threshold > 0), the peer
+ * is ALIVE, and at least threshold of its completed flap
+ * cycles fall inside the recent window — member_flaps_recent
+ * at or above the threshold. The threshold is a count, not
+ * a rate: a peer that completed 3 flap cycles in the last 10
+ * minutes counts with a threshold of 3, and one that
+ * completed 2 does not. Self never suspects itself, so self
+ * has no flaps and is never flap-rate; a peer never flapped
+ * has none either. SUSPECT and DEAD peers are not flap-rate
+ * either — a suspicion already says the peer is silent, and a
+ * DEAD peer is already gone, so the warning is only for a
+ * peer still counted ALIVE. */
+int member_is_flap_rate(const member_t *m, int64_t threshold,
+                        int64_t now);
+/* How many members in the table currently count as flap-rate
+ * (see member_is_flap_rate), excluding self (self_id): self
+ * never suspects itself, so it has no flaps to judge. */
+int member_count_flap_rate(const member_table_t *t,
+                           const char *self_id, int64_t threshold,
+                           int64_t now);
 /* 1 when the peer counts as low-probe-rate (0.68.0): the
  * low-probe-rate warning is enabled (threshold > 0), the peer
  * is ALIVE, at least PULSE_PROBE_WINDOW_MIN probes are in its

@@ -67,6 +67,10 @@ const char *pulse_event_type_name(pulse_event_type_t type) {
             return "SLOW";
         case PULSE_EVENT_SLOWOK:
             return "SLOWOK";
+        case PULSE_EVENT_FLAPRATE:
+            return "FLAPRATE";
+        case PULSE_EVENT_FLAPOK:
+            return "FLAPOK";
         default:
             return "UNKNOWN";
     }
@@ -76,8 +80,9 @@ int pulse_event_type_parse(const char *name, pulse_event_type_t *out) {
     static const char *names[] = {"JOINED",   "SUSPECTED", "DEAD",
                                   "REVIVED",  "DROPPED",   "REFUTED",
                                   "QUIET",    "LOWRATE",   "RATEOK",
-                                  "QUIETOK",  "SLOW",      "SLOWOK"};
-    for (int i = 0; i < 12; i++) {
+                                  "QUIETOK",  "SLOW",      "SLOWOK",
+                                  "FLAPRATE", "FLAPOK"};
+    for (int i = 0; i < 14; i++) {
         if (strcmp(name, names[i]) == 0) {
             *out = (pulse_event_type_t)i;
             return 0;
@@ -106,6 +111,8 @@ int pulse_event_result_state(pulse_event_type_t type, member_state_t *out) {
         case PULSE_EVENT_QUIETOK:
         case PULSE_EVENT_SLOW:
         case PULSE_EVENT_SLOWOK:
+        case PULSE_EVENT_FLAPRATE:
+        case PULSE_EVENT_FLAPOK:
             *out = MEMBER_ALIVE;
             return 1;
         case PULSE_EVENT_SUSPECTED:
@@ -130,7 +137,8 @@ static void log_insert(pulse_event_log_t *log, uint64_t seq,
                        uint32_t incarnation, int64_t unix_ts, double phi,
                        int64_t last_seen_ms, int64_t probes_sent,
                        int64_t probes_answered, double probe_rate,
-                       int64_t suspect_ms, int64_t rtt_mean_ms) {
+                       int64_t suspect_ms, int64_t rtt_mean_ms,
+                       int64_t flaps_10m) {
     pulse_event_t *slot = &log->events[log->head];
     slot->seq = seq;
     slot->type = type;
@@ -144,6 +152,7 @@ static void log_insert(pulse_event_log_t *log, uint64_t seq,
     slot->probe_rate = probe_rate;
     slot->suspect_ms = suspect_ms;
     slot->rtt_mean_ms = rtt_mean_ms;
+    slot->flaps_10m = flaps_10m;
     log->head = (log->head + 1) % log->cap;
     if (log->count < log->cap) log->count++;
 }
@@ -223,11 +232,30 @@ uint64_t pulse_event_record_rtt_mean_ms(pulse_event_log_t *log,
                                        double probe_rate,
                                        int64_t suspect_ms,
                                        int64_t rtt_mean_ms) {
+    return pulse_event_record_flap_rate(log, type, id, incarnation,
+                                        unix_ts, phi, last_seen_ms,
+                                        probes_sent, probes_answered,
+                                        probe_rate, suspect_ms,
+                                        rtt_mean_ms, -1);
+}
+
+uint64_t pulse_event_record_flap_rate(pulse_event_log_t *log,
+                                      pulse_event_type_t type,
+                                      const char *id,
+                                      uint32_t incarnation,
+                                      int64_t unix_ts, double phi,
+                                      int64_t last_seen_ms,
+                                      int64_t probes_sent,
+                                      int64_t probes_answered,
+                                      double probe_rate,
+                                      int64_t suspect_ms,
+                                      int64_t rtt_mean_ms,
+                                      int64_t flaps_10m) {
     pthread_mutex_lock(&log->lock);
     uint64_t seq = log->next_seq++;
     log_insert(log, seq, type, id, incarnation, unix_ts, phi,
                last_seen_ms, probes_sent, probes_answered, probe_rate,
-               suspect_ms, rtt_mean_ms);
+               suspect_ms, rtt_mean_ms, flaps_10m);
     /* A waiter may be waiting for exactly this event; a broadcast
      * wakes it, and it re-checks under the lock. */
     pthread_cond_broadcast(&log->cond);
@@ -260,7 +288,12 @@ uint64_t pulse_event_record_rtt_mean_ms(pulse_event_log_t *log,
  * — or a SLOWOK event — carries a trailing " rtt_mean_ms=<ms>"
  * — the peer's mean probe RTT when the threshold was crossed,
  * or when the mean recovered to it — after the suspicion
- * duration when it is present; the loader accepts lines
+ * duration when it is present; and a FLAPRATE event (0.76.0)
+ * — or a FLAPOK event — carries a trailing " flaps_10m=<n>"
+ * — how many of the peer's flap cycles fall inside the recent
+ * window when the threshold was crossed, or when the count
+ * fell back below it — after the mean probe RTT when it is
+ * present; the loader accepts lines
  * with any of the trailing fields, or none of them. An event
  * with none writes the plain five fields, so existing consumers
  * see byte-identical lines. */
@@ -321,6 +354,9 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path) {
         if (held[i].rtt_mean_ms >= 0)
             fprintf(f, " rtt_mean_ms=%lld",
                     (long long)held[i].rtt_mean_ms);
+        if (held[i].flaps_10m >= 0)
+            fprintf(f, " flaps_10m=%lld",
+                    (long long)held[i].flaps_10m);
         fputc('\n', f);
     }
     free(held);
@@ -358,11 +394,13 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
          * when it is present, and a SLOW event carries a
          * trailing " rtt_mean_ms=<ms>" (0.73.0) — or a SLOWOK
          * event — after the suspicion duration when it is
-         * present.
+         * present, and a FLAPRATE event carries a trailing
+         * " flaps_10m=<n>" (0.76.0) — or a FLAPOK event —
+         * after the mean probe RTT when it is present.
          * The fields are parsed independently — any of them may
          * be present without the others — so a line without one,
          * or without all five (written before 0.60.0/0.61.0/
-         * 0.67.0/0.68.0/0.70.0/0.73.0, or an event with nothing measured),
+         * 0.67.0/0.68.0/0.70.0/0.73.0/0.76.0, or an event with nothing measured),
          * loads with -1 for the missing ones. Ids carry no
          * spaces, so the strstr cannot match inside an id. */
         double phi = -1;
@@ -372,6 +410,7 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
         double probe_rate = -1;
         int64_t suspect_ms = -1;
         int64_t rtt_mean_ms = -1;
+        int64_t flaps_10m = -1;
         const char *phi_at = strstr(line, " phi=");
         if (phi_at) sscanf(phi_at + 5, "%lf", &phi);
         const char *seen_at = strstr(line, " last_seen_ms=");
@@ -406,6 +445,12 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
             if (sscanf(rtt_mean_at + 13, "%lld", &v) == 1)
                 rtt_mean_ms = (int64_t)v;
         }
+        const char *flaps_at = strstr(line, " flaps_10m=");
+        if (flaps_at) {
+            long long v;
+            if (sscanf(flaps_at + 11, "%lld", &v) == 1)
+                flaps_10m = (int64_t)v;
+        }
         if (seq == 0) continue;
         pulse_event_type_t type;
         if (pulse_event_type_parse(type_name, &type) != 0) continue;
@@ -416,7 +461,7 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
         if (seq >= log->next_seq) {
             log_insert(log, seq, type, id, inc, (int64_t)ts, phi,
                        last_seen_ms, probes_sent, probes_answered,
-                       probe_rate, suspect_ms, rtt_mean_ms);
+                       probe_rate, suspect_ms, rtt_mean_ms, flaps_10m);
             log->next_seq = seq + 1;
             loaded++;
         }

@@ -101,6 +101,11 @@ typedef struct {
                                   probe success rate falls below this
                                   fraction, 0 = disabled (see
                                   member.h) */
+    int64_t flap_rate_threshold; /* flap-rate warning threshold:
+                                  warn when an ALIVE peer has
+                                  completed at least this many flap
+                                  cycles in the last 10 minutes, 0
+                                  = disabled (see member.h) */
     int event_log_cap;         /* WATCH event ring capacity: how many
                                   membership events the log holds for
                                   replay (0.36.0), 0 = default 128 */
@@ -438,7 +443,21 @@ static void record_event_phi_suspect(pulse_event_type_t type,
      * and a member never answered a probe, or already gone from
      * the table when the event was recorded, has none: -1, never
      * a fabricated zero. */
+    /* Flap count at record time (0.76.0): how many of the
+     * member's completed flap cycles fall inside the recent
+     * window when the event was recorded — the same value JSON
+     * reports as "flaps_10m", frozen at the event instead of
+     * recomputed at replay time, so a replayed FLAPRATE event
+     * still shows how fast the peer was flapping when the
+     * threshold was crossed, and a replayed FLAPOK event still
+     * shows how far the count had fallen when the episode
+     * ended. Carried only on a FLAPRATE or FLAPOK event: every
+     * other event has no flap count to report. Self never
+     * suspects itself and a member never flapped, or already
+     * gone from the table when the event was recorded, has
+     * none: -1, never a fabricated zero. */
     int64_t rtt_mean_ms = -1;
+    int64_t flaps_10m = -1;
     if (strcmp(id, g_self_id) != 0) {
         int64_t now = pulse_now_ms();
         pthread_mutex_lock(&g_lock);
@@ -455,17 +474,21 @@ static void record_event_phi_suspect(pulse_event_type_t type,
             if (type == PULSE_EVENT_SLOW ||
                 type == PULSE_EVENT_SLOWOK)
                 rtt_mean_ms = member_rtt_mean_ms(m);
+            if (type == PULSE_EVENT_FLAPRATE ||
+                type == PULSE_EVENT_FLAPOK)
+                flaps_10m = member_flaps_recent(m, now);
         }
         pthread_mutex_unlock(&g_lock);
     }
-    uint64_t seq = pulse_event_record_rtt_mean_ms(&g_event_log, type, id,
-                                                  incarnation, ts, phi,
-                                                  last_seen_age,
-                                                  probes_sent,
-                                                  probes_answered,
-                                                  probe_rate,
-                                                  suspect_ms,
-                                                  rtt_mean_ms);
+    uint64_t seq = pulse_event_record_flap_rate(&g_event_log, type, id,
+                                                incarnation, ts, phi,
+                                                last_seen_age,
+                                                probes_sent,
+                                                probes_answered,
+                                                probe_rate,
+                                                suspect_ms,
+                                                rtt_mean_ms,
+                                                flaps_10m);
     if (g_events_path[0] == '\0') return;
     pthread_mutex_lock(&g_events_file_lock);
     FILE *f = fopen(g_events_path, "a");
@@ -488,7 +511,11 @@ static void record_event_phi_suspect(pulse_event_type_t type,
          * probe rate when it is present, and a SLOW event
          * (0.73.0) — or a SLOWOK event — carries its mean probe
          * RTT as a trailing " rtt_mean_ms=<ms>", after the
-         * suspicion duration when it is present — so all six values
+         * suspicion duration when it is present, and a FLAPRATE
+         * event (0.76.0) — or a FLAPOK event — carries its flap
+         * count in the recent window as a trailing
+         * " flaps_10m=<n>", after the mean probe RTT when it is
+         * present — so all seven values
          * survive a restart and a replay exactly as the WATCH
          * stream shows them; an event with none writes the plain
          * five fields. */
@@ -509,6 +536,8 @@ static void record_event_phi_suspect(pulse_event_type_t type,
             fprintf(f, " suspect_ms=%lld", (long long)suspect_ms);
         if (rtt_mean_ms >= 0)
             fprintf(f, " rtt_mean_ms=%lld", (long long)rtt_mean_ms);
+        if (flaps_10m >= 0)
+            fprintf(f, " flaps_10m=%lld", (long long)flaps_10m);
         fputc('\n', f);
         fclose(f);
     }
@@ -1790,6 +1819,100 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
             }
         }
     }
+    /* 3a-d. Flap-rate warning (0.76.0): an ALIVE peer whose
+     * completed flap cycles in the last 10 minutes reached the
+     * configured threshold gets one FLAPRATE log line and one
+     * FLAPRATE event per episode. The check runs here, after
+     * the suspect-to-dead sweep, so a peer that just went DEAD
+     * this cycle is never warned as flap-rate — the DEAD line
+     * already says it is gone — and a peer that just revived
+     * from SUSPECT this cycle, completing a flap, is ALIVE
+     * again and is judged on its new count. The warning is
+     * once per crossing: flap_rate_warned is set here and
+     * cleared when the recent count falls back below the
+     * threshold, so a persistently flapping peer warns once
+     * instead of once per probe cycle, and a peer that
+     * recovers and flaps again warns again. The re-arm is on
+     * recovery, like quiet_warned and low_rate_warned: the
+     * count only falls as flaps age out of the 10-minute
+     * window, so clearing on contact would re-fire almost at
+     * once for a peer still flapping. A peer that goes SUSPECT
+     * while warned keeps its flag until it revives to ALIVE,
+     * so its FLAPOK fires only once the recovery stuck — the
+     * same rule as quiet_warned. The count is captured for
+     * the log line; the event re-measures it at record time
+     * (record_event), the same value within a millisecond.
+     * Recovery: the cycle that clears the flag also logs one
+     * FLAPOK line and records one FLAPOK event for the peer —
+     * the mirror of FLAPRATE, so a consumer watching the alert
+     * lifecycle sees the episode end instead of the flag
+     * silently clearing — once per episode, re-armed by the
+     * next FLAPRATE. The FLAPOK event carries the fallen count
+     * frozen as its flaps_10m, like FLAPRATE carries the count
+     * at the crossing. A warned peer whose recent count is
+     * still at or above the threshold stays warned with no
+     * new line; a peer below the threshold that was never
+     * warned stays quiet. */
+    char flaprate_ids[8][PULSE_ID_LEN];
+    uint32_t flaprate_inc[8];
+    int flaprate_flaps[8];
+    int n_flaprate = 0;
+    char flapok_ids[8][PULSE_ID_LEN];
+    uint32_t flapok_inc[8];
+    int flapok_flaps[8];
+    int n_flapok = 0;
+    if (g_cfg.flap_rate_threshold > 0) {
+        for (int i = 0; i < g_table.count; i++) {
+            member_t *m = &g_table.members[i];
+            if (strcmp(m->id, g_self_id) == 0) continue;
+            if (m->state != MEMBER_ALIVE) continue;
+            int recent = member_flaps_recent(m, now);
+            if (member_is_flap_rate(m, g_cfg.flap_rate_threshold,
+                                    now)) {
+                if (m->flap_rate_warned) continue;
+                m->flap_rate_warned = 1;
+                if (n_flaprate < 8) {
+                    snprintf(flaprate_ids[n_flaprate], PULSE_ID_LEN,
+                             "%s", m->id);
+                    flaprate_inc[n_flaprate] = m->incarnation;
+                    flaprate_flaps[n_flaprate] = recent;
+                    n_flaprate++;
+                } else {
+                    /* Batch full: leave the flag set but the
+                     * episode unannounced — the next cycle
+                     * collects it once the batch has been
+                     * emitted. The flag is already set, so the
+                     * next cycle would skip it: clear it again
+                     * so the warning is not lost. */
+                    m->flap_rate_warned = 0;
+                }
+            } else if (m->flap_rate_warned) {
+                /* Not flap-rate any more: the recent count fell
+                 * back below the threshold as flaps aged out of
+                 * the 10-minute window. Clearing the flag is
+                 * the recovery: the FLAPOK line and event below
+                 * announce it, so the episode ends in the log
+                 * and on the WATCH stream, not silently. A full
+                 * flapok batch (8) leaves the flag set, so the
+                 * recovery is collected on the next cycle
+                 * instead of lost. */
+                m->flap_rate_warned = 0;
+                if (n_flapok < 8) {
+                    snprintf(flapok_ids[n_flapok], PULSE_ID_LEN,
+                             "%s", m->id);
+                    flapok_inc[n_flapok] = m->incarnation;
+                    flapok_flaps[n_flapok] = recent;
+                    n_flapok++;
+                } else {
+                    /* Batch full: re-set the flag so the
+                     * recovery is not lost — the next cycle
+                     * collects it once the batch has been
+                     * emitted. */
+                    m->flap_rate_warned = 1;
+                }
+            }
+        }
+    }
     /* 3b. Garbage-collect DEAD entries older than the retention period.
      * Tombstones live twice as long: a peer that learned the DEAD entry
      * later than we did still has up to one retention period to GC it
@@ -2006,6 +2129,36 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
                  g_cfg.low_probe_rate_frac);
         record_event(PULSE_EVENT_RATEOK, rateok_ids[i],
                      rateok_inc[i]);
+    }
+    /* Flap-rate warning (0.76.0): the FLAPRATE line says how
+     * many flap cycles the peer completed in the last 10 minutes
+     * when the threshold was crossed, and the FLAPRATE event
+     * carries the same count frozen as its flaps_10m, so a WATCH
+     * replay shows it too. The peer is still ALIVE at this point
+     * — that is the point of the warning: the peer keeps dying
+     * and coming back, and the count says how fast, instead of
+     * only the latest death saying it died. */
+    for (int i = 0; i < n_flaprate; i++) {
+        log_line("FLAPRATE %s flaps=%d threshold=%lld",
+                 flaprate_ids[i], flaprate_flaps[i],
+                 (long long)g_cfg.flap_rate_threshold);
+        record_event(PULSE_EVENT_FLAPRATE, flaprate_ids[i],
+                     flaprate_inc[i]);
+    }
+    /* Flap-rate recovery (0.76.0): the FLAPOK line says how far
+     * the peer's recent flap count had fallen when the episode
+     * ended — flaps ageing out of the 10-minute window — and the
+     * FLAPOK event carries the same count frozen as its
+     * flaps_10m, so a WATCH replay shows it too. The peer is
+     * still ALIVE at this point — that is the point of the
+     * recovery: the flag cleared because the peer stopped
+     * flapping fast, not because it was suspected. */
+    for (int i = 0; i < n_flapok; i++) {
+        log_line("FLAPOK %s flaps=%d threshold=%lld",
+                 flapok_ids[i], flapok_flaps[i],
+                 (long long)g_cfg.flap_rate_threshold);
+        record_event(PULSE_EVENT_FLAPOK, flapok_ids[i],
+                     flapok_inc[i]);
     }
     /* gc_ids holds at most 8 ids even when more entries were GC'd
      * in one cycle (member_gc returns the total removed), so the
@@ -2317,6 +2470,7 @@ static void usage(const char *prog) {
             "       [--slow-peer-rtt-ms N]\n"
             "       [--quiet-peer-ms N]\n"
             "       [--low-probe-rate-frac N]\n"
+            "       [--flap-rate-threshold N]\n"
             "       [--dead-retention SECONDS]\n"
             "       [--phi-accrual] [--phi-threshold N]\n"
             "       [--sync-interval-ms N]\n"
@@ -2345,6 +2499,7 @@ int main(int argc, char **argv) {
     g_cfg.slow_peer_rtt_ms = 0; /* slow-peer warning disabled */
     g_cfg.quiet_peer_ms = 0; /* quiet-peer warning disabled */
     g_cfg.low_probe_rate_frac = 0; /* low-probe-rate warning disabled */
+    g_cfg.flap_rate_threshold = 0; /* flap-rate warning disabled */
     g_cfg.event_log_cap = 0; /* default WATCH event ring (128 events) */
     g_cfg.gossip_digest_size = 0; /* default gossip digest (16 entries) */
     g_cfg.control_port = -1; /* disabled unless --control-port is given */
@@ -2449,6 +2604,29 @@ int main(int argc, char **argv) {
             if (g_cfg.low_probe_rate_frac < 0 ||
                 g_cfg.low_probe_rate_frac > 1) {
                 fprintf(stderr, "--low-probe-rate-frac must be 0 (disabled) or a fraction between 0 and 1\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--flap-rate-threshold") == 0 &&
+                   i + 1 < argc) {
+            /* Flap-rate warning (0.76.0): warn when an ALIVE
+             * peer has completed at least this many flap cycles
+             * in the last 10 minutes, so a peer dying and coming
+             * back over and over is visible while it is still
+             * ALIVE instead of only in the log after each death.
+             * 0 disables it, like --low-probe-rate-frac: the
+             * right threshold depends on how flappy the cluster
+             * is allowed to be, so there is no safe universal
+             * default — a peer that dies once an hour is an
+             * incident, one that dies three times in ten minutes
+             * is unstable. The count is read off a ring of the
+             * last 16 flap times, so it saturates at 16: a
+             * threshold above 16 could never fire, so it is a
+             * clean startup error instead of a silent never. */
+            g_cfg.flap_rate_threshold = atoi(argv[++i]);
+            if (g_cfg.flap_rate_threshold < 0 ||
+                g_cfg.flap_rate_threshold > PULSE_FLAP_HISTORY) {
+                fprintf(stderr, "--flap-rate-threshold must be 0 (disabled) or a count between 1 and %d\n",
+                        PULSE_FLAP_HISTORY);
                 return 2;
             }
         } else if (strcmp(argv[i], "--control-port") == 0 && i + 1 < argc) {
@@ -2858,13 +3036,20 @@ int main(int argc, char **argv) {
                  g_cfg.low_probe_rate_frac);
     else
         lowratebuf[0] = '\0';
+    char flapratebuf[32];
+    if (g_cfg.flap_rate_threshold > 0)
+        snprintf(flapratebuf, sizeof flapratebuf, " flap-rate=%lld",
+                 (long long)g_cfg.flap_rate_threshold);
+    else
+        flapratebuf[0] = '\0';
     if (g_cfg.phi_accrual) {
-        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s%s%s%s%s", g_self_id,
+        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s%s%s%s%s%s", g_self_id,
                  g_incarnation, g_cfg.port, g_cfg.phi_threshold, sec, v6,
-                 slowbuf, quietbuf, lowratebuf);
+                 slowbuf, quietbuf, lowratebuf, flapratebuf);
     } else {
-        log_line("START %s inc=%u port=%d%s%s%s%s%s", g_self_id, g_incarnation,
-                 g_cfg.port, sec, v6, slowbuf, quietbuf, lowratebuf);
+        log_line("START %s inc=%u port=%d%s%s%s%s%s%s", g_self_id, g_incarnation,
+                 g_cfg.port, sec, v6, slowbuf, quietbuf, lowratebuf,
+                 flapratebuf);
     }
     if (g_cfg.meta_count > 0) {
         char metabuf[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
@@ -2936,6 +3121,7 @@ int main(int argc, char **argv) {
         g_hooks.slow_rtt_threshold_ms = g_cfg.slow_peer_rtt_ms;
         g_hooks.quiet_threshold_ms = g_cfg.quiet_peer_ms;
         g_hooks.low_probe_rate_frac = g_cfg.low_probe_rate_frac;
+        g_hooks.flap_rate_threshold = g_cfg.flap_rate_threshold;
         g_hooks.self_id = g_self_id;
         g_hooks.start_ms = g_start_ms;
         if (pthread_create(&control, NULL, control_thread, NULL) != 0) {

@@ -495,6 +495,16 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
     snprintf(line + used, sizeof line - used, " low_probe_rate_peers=%d",
              member_count_low_probe_rate(&t, hooks->self_id,
                                         hooks->low_probe_rate_frac));
+    /* Flap-rate warning (0.76.0): how many members currently
+     * count as flap-rate — ALIVE with at least
+     * --flap-rate-threshold completed flap cycles in the last 10
+     * minutes. Like low_probe_rate_peers, the count is derived
+     * from the table, not a metrics counter, since flapping is
+     * current state, not a transition. */
+    used = strlen(line);
+    snprintf(line + used, sizeof line - used, " flap_rate_peers=%d",
+             member_count_flap_rate(&t, hooks->self_id,
+                                   hooks->flap_rate_threshold, now));
     /* Peer-file state (0.28.0): the roster this node seeds from and
      * what the last load of it did. A path with a space breaks the
      * space-separated format — JSON is the machine-readable form —
@@ -761,6 +771,32 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
             if (send_all(fd, flapline) != 0) return;
         }
     }
+    /* Flap-rate warning (0.76.0): the recent flap count JSON
+     * reports as "flaps_10m", as one "FLAPRATE <id> <flaps>"
+     * line per member that counts as flap-rate, after the FLAP
+     * lines, under the same rule as JSON's "flap_rate" — ALIVE,
+     * with at least --flap-rate-threshold completed flap cycles
+     * in the last 10 minutes — so a text-protocol consumer can
+     * see how fast a flagged peer is flapping. A peer below the
+     * threshold, a peer that never flapped, and a SUSPECT or
+     * DEAD peer have no line: an absent line is how the text
+     * protocol says "not flapping too fast". Self never suspects
+     * itself, so self has no line either. */
+    {
+        int64_t now = pulse_now_ms();
+        for (int i = 0; i < t.count; i++) {
+            const member_t *mem = &t.members[i];
+            if (strcmp(mem->id, hooks->self_id) == 0) continue;
+            if (!member_is_flap_rate(mem, hooks->flap_rate_threshold,
+                                     now))
+                continue;
+            char flaprateline[128];
+            snprintf(flaprateline, sizeof flaprateline,
+                     "\nFLAPRATE %s %d", mem->id,
+                     member_flaps_recent(mem, now));
+            if (send_all(fd, flaprateline) != 0) return;
+        }
+    }
     send_all(fd, "\nEND\n");
 }
 
@@ -964,7 +1000,14 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
          * never suspects itself) and for a peer that never
          * flapped. A DEAD member keeps its count until GC, like
          * its probe counts, so the flaps that killed it stay
-         * visible after it is gone. */
+         * visible after it is gone. "flap_rate" (0.76.0) is
+         * true when the peer is ALIVE and its recent flap count
+         * reaches --flap-rate-threshold — the peer is flapping
+         * too fast right now — false when the warning is
+         * disabled, when the peer is below the threshold, or
+         * when the peer is SUSPECT or DEAD. Self is always
+         * false: it never suspects itself, so it has no flaps
+         * to judge. */
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
@@ -974,7 +1017,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                      "\"source\":\"%s\",\"probes_sent\":%lld,"
                      "\"probes_answered\":%lld,\"low_probe_rate\":%s,"
                      "\"probe_rate\":%s,\"probe_rate_history\":%s,"
-                     "\"flap_count\":%lld,\"flaps_10m\":%d}",
+                     "\"flap_count\":%lld,\"flaps_10m\":%d,"
+                     "\"flap_rate\":%s}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
                      rttbuf, rttmeanbuf, rttmaxbuf,
@@ -997,7 +1041,13 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                          : "false",
                      ratebuf, ratehistbuf,
                      (long long)mem->flap_count,
-                     member_flaps_recent(mem, now));
+                     member_flaps_recent(mem, now),
+                     (strcmp(mem->id, hooks->self_id) != 0 &&
+                      member_is_flap_rate(mem,
+                                          hooks->flap_rate_threshold,
+                                          now))
+                         ? "true"
+                         : "false");
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }
@@ -1128,7 +1178,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"seed_last_rejoin_ms\":%s,\"seed_rejoin_backoff_ms\":%s,"
         "\"adaptive_fast_cycles\":%lld,"
         "\"suspect_refuted\":%lld,\"slow_peers\":%d,\"quiet_peers\":%d,"
-        "\"low_probe_rate_peers\":%d,"
+        "\"low_probe_rate_peers\":%d,\"flap_rate_peers\":%d,"
         "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
         "\"max\":%lld,\"samples\":%lld},\"refute_latency_ms\":{\"mean\":%s,"
@@ -1147,6 +1197,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         member_count_quiet(&t, hooks->self_id, hooks->quiet_threshold_ms, now),
         member_count_low_probe_rate(&t, hooks->self_id,
                                     hooks->low_probe_rate_frac),
+        member_count_flap_rate(&t, hooks->self_id,
+                               hooks->flap_rate_threshold, now),
         dmean, (long long)m.detect_max_ms,
         (long long)m.detect_samples, dhist, smean,
         (long long)m.suspect_dead_max_ms,
@@ -1267,6 +1319,22 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         "pulse_low_probe_rate_peers %d\n",
         member_count_low_probe_rate(&t, hooks->self_id,
                                     hooks->low_probe_rate_frac)) == 0;
+    /* Flap-rate warning (0.76.0): how many members currently
+     * count as flap-rate — ALIVE with at least
+     * --flap-rate-threshold completed flap cycles in the last 10
+     * minutes. Like the other alert counts it is derived from
+     * the table, not a metrics counter, since flapping is
+     * current state, not a transition — and 0 when the warning
+     * is disabled, so a scraper can alert on a member flapping
+     * right now instead of only on the per-member flap counts. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_flap_rate_peers ALIVE members whose flap "
+        "cycles in the last 10 minutes reach "
+        "--flap-rate-threshold.\n"
+        "# TYPE pulse_flap_rate_peers gauge\n"
+        "pulse_flap_rate_peers %d\n",
+        member_count_flap_rate(&t, hooks->self_id,
+                               hooks->flap_rate_threshold, now)) == 0;
     ok &= prom_add(buf, sizeof buf, &used,
         "# HELP pulse_uptime_seconds Seconds since this node "
         "started.\n"
@@ -2800,7 +2868,16 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
              * suspicion duration when it is present; a SLOWOK
              * event carries the same field with the mean when it
              * recovered to the threshold or below; no other event
-             * carries one. */
+             * carries one. Flap count (0.76.0): a FLAPRATE event
+             * carries how many of the peer's flap cycles fall
+             * inside the recent window when the threshold was
+             * crossed, as a trailing " flaps_10m=<n>" — the same
+             * value JSON reports as "flaps_10m", frozen at the
+             * event so a replay still shows how fast the peer
+             * was flapping — after the mean probe RTT when it is
+             * present; a FLAPOK event carries the same field
+             * with the count when it fell back below the
+             * threshold; no other event carries one. */
             size_t used = (size_t)snprintf(
                 line, sizeof line, "EVENT %llu %s %s %u %lld",
                 (unsigned long long)ev.seq,
@@ -2839,6 +2916,12 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
                 snprintf(line + used, sizeof line - used,
                          " rtt_mean_ms=%lld",
                          (long long)ev.rtt_mean_ms);
+                used = strlen(line);
+            }
+            if (ev.flaps_10m >= 0) {
+                snprintf(line + used, sizeof line - used,
+                         " flaps_10m=%lld",
+                         (long long)ev.flaps_10m);
                 used = strlen(line);
             }
             if (used < sizeof line - 1) {

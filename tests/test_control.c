@@ -129,7 +129,15 @@
  * METRICS for each member with at least one flap, and
  * pulse_member_flap_count_total / pulse_member_flaps_10m ride in
  * PROMETHEUS under the same rule; the counter end to end is
- * covered by tests/test_flap_counter.sh. */
+ * covered by tests/test_flap_counter.sh. The flap-rate warning
+ * (0.76.0) is covered here too: each member carries a
+ * "flap_rate" flag in JSON (true for the canned 17901 with the
+ * threshold at 2, false for the DEAD 17902, self and the
+ * never-flapped 17903), a "flap_rate_peers" count rides in the
+ * metrics object, one "FLAPRATE <id> <flaps>" line rides after
+ * the FLAP lines in METRICS for each member that counts as
+ * flap-rate, and pulse_flap_rate_peers rides in PROMETHEUS; the
+ * warning end to end is covered by tests/test_flaprate.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -736,7 +744,7 @@ static void test_event_log(void) {
      * continues the sequence instead of restarting at 1. */
     const char *ev_path = "/tmp/pulse-event-log-test.txt";
     pulse_event_log_t saved;
-    pulse_event_log_init(&saved, 11);
+    pulse_event_log_init(&saved, 13);
     pulse_event_record(&saved, PULSE_EVENT_JOINED, "127.0.0.1:17904", 1,
                        1700000300);
     pulse_event_record(&saved, PULSE_EVENT_SUSPECTED, "127.0.0.1:17904",
@@ -820,13 +828,31 @@ static void test_event_log(void) {
     pulse_event_record_rtt_mean_ms(&saved, PULSE_EVENT_SLOWOK,
                                    "127.0.0.1:17904", 1, 1700000310, -1,
                                    1, 41, 40, -1, -1, 4);
-    CHECK(pulse_event_log_save(&saved, ev_path) == 11);
+    /* Flap-rate warning (0.76.0): a FLAPRATE event recorded with
+     * the flap count at the crossing — 3 flaps in the last 10
+     * minutes against a threshold of 3 — and the probe counts at
+     * the crossing, 51 sent and 44 answered, round-trips with
+     * all of it, so a restart restores how fast the peer was
+     * flapping, not just that it was flapping too fast. */
+    pulse_event_record_flap_rate(&saved, PULSE_EVENT_FLAPRATE,
+                                 "127.0.0.1:17904", 1, 1700000311, -1,
+                                 3, 51, 44, -1, -1, -1, 3);
+    /* Flap-rate recovery (0.76.0): a FLAPOK event recorded with
+     * the flap count at the recovery — 2 flaps, back below the
+     * threshold of 3 — and the probe counts at the recovery, 61
+     * sent and 58 answered, round-trips with all of it, so a
+     * restart restores how far the count had fallen, not just
+     * that the episode ended. */
+    pulse_event_record_flap_rate(&saved, PULSE_EVENT_FLAPOK,
+                                 "127.0.0.1:17904", 1, 1700000312, -1,
+                                 4, 61, 58, -1, -1, -1, 2);
+    CHECK(pulse_event_log_save(&saved, ev_path) == 13);
     pulse_event_log_free(&saved);
 
     pulse_event_log_t restored;
-    pulse_event_log_init(&restored, 11);
-    CHECK(pulse_event_log_load(&restored, ev_path) == 11);
-    CHECK(pulse_event_latest_seq(&restored) == 11);
+    pulse_event_log_init(&restored, 13);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 13);
+    CHECK(pulse_event_latest_seq(&restored) == 13);
     CHECK(pulse_event_oldest_seq(&restored) == 1);
     CHECK(pulse_event_wait(&restored, 0, &ev, 20) == 1);
     CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
@@ -945,10 +971,42 @@ static void test_event_log(void) {
     CHECK(ev.probe_rate == -1);
     CHECK(ev.phi == -1);
     CHECK(ev.suspect_ms == -1);
+    /* The FLAPRATE event recorded after it comes back with the
+     * count at the crossing and the probe counts (0.76.0): the
+     * warning survives the restart with the number that fired
+     * it, not just the fact that it fired. */
+    CHECK(pulse_event_wait(&restored, 11, &ev, 20) == 1);
+    CHECK(ev.seq == 12 && ev.type == PULSE_EVENT_FLAPRATE &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000311);
+    CHECK(ev.last_seen_ms == 3);
+    CHECK(ev.probes_sent == 51);
+    CHECK(ev.probes_answered == 44);
+    CHECK(ev.flaps_10m == 3);
+    CHECK(ev.rtt_mean_ms == -1);
+    CHECK(ev.probe_rate == -1);
+    CHECK(ev.phi == -1);
+    CHECK(ev.suspect_ms == -1);
+    /* The FLAPOK event recorded after it comes back with the
+     * count at the recovery and the probe counts (0.76.0): the
+     * recovery survives the restart with how far the count had
+     * fallen, not just that the episode ended. */
+    CHECK(pulse_event_wait(&restored, 12, &ev, 20) == 1);
+    CHECK(ev.seq == 13 && ev.type == PULSE_EVENT_FLAPOK &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000312);
+    CHECK(ev.last_seen_ms == 4);
+    CHECK(ev.probes_sent == 61);
+    CHECK(ev.probes_answered == 58);
+    CHECK(ev.flaps_10m == 2);
+    CHECK(ev.rtt_mean_ms == -1);
+    CHECK(ev.probe_rate == -1);
+    CHECK(ev.phi == -1);
+    CHECK(ev.suspect_ms == -1);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
-                       2, 1700000311);
-    CHECK(pulse_event_latest_seq(&restored) == 12);
+                       2, 1700000313);
+    CHECK(pulse_event_latest_seq(&restored) == 14);
     pulse_event_log_free(&restored);
 
     /* The QUIET word (0.62.0) parses back to the QUIET type, so a
@@ -1023,11 +1081,35 @@ static void test_event_log(void) {
     CHECK(pulse_event_result_state(PULSE_EVENT_SLOWOK, &ostate) == 1);
     CHECK(ostate == MEMBER_ALIVE);
 
+    /* The FLAPRATE word (0.76.0) parses back to the FLAPRATE
+     * type, so a WATCH filter can subscribe to it by name, and
+     * it lands on ALIVE for the state filter — the peer is still
+     * alive, it has just started flapping too fast. */
+    pulse_event_type_t ftype;
+    CHECK(pulse_event_type_parse("FLAPRATE", &ftype) == 0);
+    CHECK(ftype == PULSE_EVENT_FLAPRATE);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_FLAPRATE), "FLAPRATE") == 0);
+    member_state_t fstate;
+    CHECK(pulse_event_result_state(PULSE_EVENT_FLAPRATE, &fstate) == 1);
+    CHECK(fstate == MEMBER_ALIVE);
+
+    /* The FLAPOK word (0.76.0) parses back to the FLAPOK type,
+     * so a WATCH filter can subscribe to it by name, and it lands
+     * on ALIVE for the state filter — the peer is still alive,
+     * it has stopped flapping fast enough to warn about. */
+    pulse_event_type_t k2type;
+    CHECK(pulse_event_type_parse("FLAPOK", &k2type) == 0);
+    CHECK(k2type == PULSE_EVENT_FLAPOK);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_FLAPOK), "FLAPOK") == 0);
+    member_state_t k2state;
+    CHECK(pulse_event_result_state(PULSE_EVENT_FLAPOK, &k2state) == 1);
+    CHECK(k2state == MEMBER_ALIVE);
+
     /* A missing file loads zero events, and a malformed line is
      * skipped while the good lines around it still load. */
-    /* Nine events load into a cap-9 ring (0.73.0), so all of them
+    /* Ten events load into a cap-10 ring (0.76.0), so all of them
      * survive, including the plain pre-0.60.0 DEAD line. */
-    pulse_event_log_init(&restored, 9);
+    pulse_event_log_init(&restored, 10);
     CHECK(pulse_event_log_load(&restored,
                                "/tmp/pulse-event-log-no-such-file.txt") == 0);
     CHECK(pulse_event_latest_seq(&restored) == 0);
@@ -1077,10 +1159,16 @@ static void test_event_log(void) {
                 "15 SLOWOK 127.0.0.1:17905 2 1700000408 "
                 "last_seen_ms=1 probes_sent=41 probes_answered=40 "
                 "rtt_mean_ms=4\n");
+        /* A FLAPRATE event line (0.76.0) loads as FLAPRATE with
+         * its flap count and probe counts and no phi. */
+        fprintf(mf,
+                "16 FLAPRATE 127.0.0.1:17905 2 1700000409 "
+                "last_seen_ms=3 probes_sent=51 probes_answered=44 "
+                "flaps_10m=5\n");
         fclose(mf);
     }
-    CHECK(pulse_event_log_load(&restored, ev_path) == 9);
-    CHECK(pulse_event_latest_seq(&restored) == 15);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 10);
+    CHECK(pulse_event_latest_seq(&restored) == 16);
     CHECK(pulse_event_oldest_seq(&restored) == 7);
     CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
     CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_DEAD);
@@ -1146,6 +1234,17 @@ static void test_event_log(void) {
     CHECK(ev.probes_sent == 41);
     CHECK(ev.probes_answered == 40);
     CHECK(ev.rtt_mean_ms == 4);
+    /* The FLAPRATE event recorded after it comes back with the
+     * count at the crossing and the probe counts (0.76.0): the
+     * warning survives the load with the number that fired it. */
+    CHECK(pulse_event_wait(&restored, 15, &ev, 20) == 1);
+    CHECK(ev.seq == 16 && ev.type == PULSE_EVENT_FLAPRATE &&
+          ev.last_seen_ms == 3);
+    CHECK(ev.phi == -1);
+    CHECK(ev.probes_sent == 51);
+    CHECK(ev.probes_answered == 44);
+    CHECK(ev.flaps_10m == 5);
+    CHECK(ev.rtt_mean_ms == -1);
     pulse_event_log_free(&restored);
     unlink(ev_path);
 }
@@ -1166,6 +1265,7 @@ int main(void) {
     g_hooks.slow_rtt_threshold_ms = 0;
     g_hooks.quiet_threshold_ms = 0;
     g_hooks.low_probe_rate_frac = 0;
+    g_hooks.flap_rate_threshold = 0;
     g_hooks.self_id = "127.0.0.1:17999";
     g_hooks.start_ms = pulse_now_ms();
 
@@ -1180,11 +1280,14 @@ int main(void) {
     pthread_t server;
     CHECK(pthread_create(&server, NULL, serve_thread, &fd) == 0);
 
-    /* 8 KB, not 4 KB: the JSON reply grows a field at a time
+    /* 16 KB, not 8 KB: the replies grow a field at a time
      * (0.62.0's per-member "quiet" flag and "quiet_peers" pushed
-     * it past 4 KB with the canned table), and a truncated reply
-     * drops the watch "streams" array at the end. */
-    char reply[8192];
+     * the JSON reply past 4 KB with the canned table, and
+     * 0.76.0's "pulse_flap_rate_peers" family pushed the
+     * PROMETHEUS reply past 8 KB, cutting off the tail lines),
+     * and a truncated reply drops the watch "streams" array at
+     * the end. */
+    char reply[16384];
 
     /* RELOAD success: the exact outcome line, no END trailer (like
      * LEAVE/META, a single-line reply). */
@@ -1308,7 +1411,7 @@ int main(void) {
             "samples=0 refute_latency_ms mean=- max=- samples=0 "
             "probe_rtt_ms mean=- max=- samples=0 "
             "hist=[0,0,0,0,0] slow_peers=0 quiet_peers=0 "
-            "low_probe_rate_peers=0 "
+            "low_probe_rate_peers=0 flap_rate_peers=0 "
             "peer_file=/tmp/peers "
             "last_reload=1700000000 last_mtime=1699999000 "
             "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
@@ -1673,6 +1776,66 @@ int main(void) {
     CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
     CHECK(strstr(reply, "\"low_probe_rate_peers\":0") != NULL);
     CHECK(strstr(reply, "\"low_probe_rate\":true") == NULL);
+    /* Flap-rate warning (0.76.0): with the threshold at 2, the
+     * canned 17901 (2 flaps in the last 10 minutes) counts as
+     * flap-rate, the DEAD 17902 (1 flap) does not — the flag is
+     * only for a peer still ALIVE — and self (never flaps) and
+     * the never-flapped 17903 never do. */
+    g_hooks.flap_rate_threshold = 2;
+    CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "flap_rate_peers=1") != NULL);
+    {
+        const char *fr = strstr(reply, "FLAPRATE 127.0.0.1:17901 2\n");
+        CHECK(fr != NULL);
+        CHECK(strstr(reply, "FLAPRATE 127.0.0.1:17902") == NULL);
+        CHECK(strstr(reply, "FLAPRATE 127.0.0.1:17903") == NULL);
+        CHECK(strstr(reply, "FLAPRATE 127.0.0.1:17999") == NULL);
+        /* The FLAPRATE line rides after the FLAP lines, like
+         * every other per-member line rides after the one it
+         * follows. */
+        const char *flap = strstr(reply, "FLAP 127.0.0.1:17902 1 1");
+        CHECK(flap != NULL && fr != NULL && fr > flap);
+    }
+    CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "\"flap_rate_peers\":1") != NULL);
+    {
+        const char *peer = strstr(reply, "\"id\":\"127.0.0.1:17901\"");
+        const char *flag =
+            peer ? strstr(peer, "\"flap_rate\":true") : NULL;
+        const char *next_id =
+            peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && flag != NULL &&
+              (next_id == NULL || flag < next_id));
+        peer = strstr(reply, "\"id\":\"127.0.0.1:17903\"");
+        flag = peer ? strstr(peer, "\"flap_rate\":false") : NULL;
+        next_id = peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && flag != NULL &&
+              (next_id == NULL || flag < next_id));
+        /* The DEAD peer keeps its count but never the flag. */
+        peer = strstr(reply, "\"id\":\"127.0.0.1:17902\"");
+        flag = peer ? strstr(peer, "\"flap_rate\":false") : NULL;
+        next_id = peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && flag != NULL &&
+              (next_id == NULL || flag < next_id));
+        /* Self is the first member, so anchor at the members
+         * array like the probe-counts check above does. */
+        peer = strstr(reply, "\"members\":[{\"id\":\"127.0.0.1:17999\"");
+        flag = peer ? strstr(peer, "\"flap_rate\":false") : NULL;
+        next_id = peer ? strstr(peer, "\"id\":\"127.0.0.1:17901\"") : NULL;
+        CHECK(peer != NULL && flag != NULL &&
+              (next_id == NULL || flag < next_id));
+    }
+    CHECK(send_cmd(18991, "PROMETHEUS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "pulse_flap_rate_peers 1\n") != NULL);
+    /* With the warning disabled again the count is 0 and no
+     * FLAPRATE line rides anywhere. */
+    g_hooks.flap_rate_threshold = 0;
+    CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "flap_rate_peers=0") != NULL);
+    CHECK(strstr(reply, "FLAPRATE ") == NULL);
+    CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "\"flap_rate_peers\":0") != NULL);
+    CHECK(strstr(reply, "\"flap_rate\":true") == NULL);
     /* The peer_file object sits at the top level, after metrics. */
     {
         const char *metrics = strstr(reply, "\"metrics\":{");
