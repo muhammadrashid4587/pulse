@@ -529,6 +529,37 @@ void member_note_probe_answered(member_table_t *t, const char *id,
      * window — either way there is nothing to flip. */
 }
 
+const char *pulse_traffic_kind_name(int kind) {
+    switch (kind) {
+        case PULSE_TRAFFIC_PING: return "ping";
+        case PULSE_TRAFFIC_ACK: return "ack";
+        case PULSE_TRAFFIC_PING_REQ: return "ping_req";
+        case PULSE_TRAFFIC_JOIN: return "join";
+        case PULSE_TRAFFIC_GOSSIP: return "gossip";
+        case PULSE_TRAFFIC_SYNC: return "sync";
+        default: return "unknown";
+    }
+}
+
+void member_note_traffic(member_table_t *t, const char *id, int kind,
+                         int is_sent) {
+    if (kind < 0 || kind >= PULSE_TRAFFIC_KINDS) return;
+    member_t *m = member_find(t, id);
+    if (!m) return;
+    if (is_sent)
+        m->traffic_sent[kind]++;
+    else
+        m->traffic_recv[kind]++;
+}
+
+int64_t member_traffic_total(const member_t *m) {
+    if (!m) return 0;
+    int64_t total = 0;
+    for (int i = 0; i < PULSE_TRAFFIC_KINDS; i++)
+        total += m->traffic_sent[i] + m->traffic_recv[i];
+    return total;
+}
+
 double member_probe_rate(const member_t *m) {
     if (!m || m->probe_window_count == 0) return -1;
     int answered = 0;

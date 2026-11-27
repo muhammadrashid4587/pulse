@@ -245,6 +245,22 @@
  *       A peer below the threshold, a peer that never flapped,
  *       and a SUSPECT or DEAD peer have no line; self never
  *       suspects itself and has none either.
+ *       Gossip traffic counters (0.80.0): after the FLAPRATE
+ *       lines, one "TRAFFIC <id>
+ *       sent=ping:N,ack:N,ping_req:N,join:N,gossip:N,sync:N
+ *       recv=ping:N,ack:N,ping_req:N,join:N,gossip:N,sync:N"
+ *       line per member with any traffic at all — how many
+ *       messages of each kind this node sent to the peer and
+ *       received from it, the same values JSON reports as the
+ *       "traffic" object and PROMETHEUS as
+ *       pulse_member_traffic_sent_total /
+ *       pulse_member_traffic_recv_total. All six kinds ride on
+ *       every line, even at 0, so the line is a fixed schema;
+ *       self exchanges nothing with itself except a startup
+ *       JOIN and its SYNC reply, when it lists itself as a
+ *       seed — so self's line, when present, carries only join
+ *       and sync; a peer never exchanged with has none; a DEAD
+ *       member keeps its counts until GC.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -282,7 +298,15 @@
  *       goes out, and always null for self — so a consumer can
  *       see how far below the threshold a flagged peer sits,
  *       and a DEAD member keeps its last window rate until GC),
- *       and the
+ *       and "traffic" (0.80.0: how many messages of each kind
+ *       this node sent to the peer and received from it, as
+ *       {"sent":{"ping":N,"ack":N,"ping_req":N,"join":N,
+ *       "gossip":N,"sync":N},"recv":{...}} — always present,
+ *       always numbers, never null: 0 for a peer never exchanged
+ *       with; self's ping, ack, ping_req and gossip are 0 — it
+ *       never probes or gossips with itself — but it can carry
+ *       join and sync when it lists itself as a seed; a DEAD
+ *       member keeps its counts until GC), and the
  *       metrics object carries "slow_peers" (how many members are
  *       slow) and "quiet_peers" (0.62.0: how many members are
  *       quiet) and "low_probe_rate_peers" (0.68.0: how many
@@ -386,7 +410,16 @@
  *       one labelled sample per member that has been probed — a
  *       peer probed but never answered still has a sample (sent
  *       climbing, answered 0); self and a peer never probed have
- *       none; a DEAD member keeps its counters until GC. How long each
+ *       none; a DEAD member keeps its counters until GC. How many
+ *       messages of each kind this node sent to each member and
+ *       received from it rides as
+ *       "pulse_member_traffic_sent_total" and
+ *       "pulse_member_traffic_recv_total" counters (0.80.0),
+ *       labelled by member and kind — one sample per member and
+ *       kind with a count above 0; a kind never exchanged has no
+ *       series, self has series only for join and sync, when it
+ *       lists itself as a seed, and a DEAD member keeps its series
+ *       until GC. How long each
  *       SUSPECT member has been suspected rides as a
  *       "pulse_member_suspect_ms" gauge (0.58.0), one line per
  *       SUSPECT member — the same value JSON reports as

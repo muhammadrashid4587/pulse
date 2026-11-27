@@ -587,6 +587,37 @@ static void record_event(pulse_event_type_t type, const char *id,
     record_event_phi(type, id, incarnation, -1);
 }
 
+/* Gossip traffic counters (0.80.0): map a parsed message to the
+ * traffic kind it counts as. The switch is explicit instead of
+ * casting the gmsg_type_t: the two enums agree today, but a new
+ * wire verb must not silently land in the wrong bucket. -1 for
+ * GMSG_UNKNOWN: an unparsed verb is not traffic with a peer. */
+static int traffic_kind_for(gmsg_type_t type) {
+    switch (type) {
+        case GMSG_PING: return PULSE_TRAFFIC_PING;
+        case GMSG_ACK: return PULSE_TRAFFIC_ACK;
+        case GMSG_PING_REQ: return PULSE_TRAFFIC_PING_REQ;
+        case GMSG_JOIN: return PULSE_TRAFFIC_JOIN;
+        case GMSG_GOSSIP: return PULSE_TRAFFIC_GOSSIP;
+        case GMSG_SYNC: return PULSE_TRAFFIC_SYNC;
+        case GMSG_UNKNOWN: return -1;
+    }
+    return -1;
+}
+
+/* Count one message this node sent to a peer (0.80.0): the
+ * traffic counters' send side. Takes the lock itself, so call
+ * sites outside the table lock stay one line; call sites that
+ * already hold the lock call member_note_traffic directly. An
+ * unknown id is ignored — the peer may have been GC'd between
+ * the send decision and the count — and a send to self never
+ * happens. */
+static void note_traffic_sent(const char *id, int kind) {
+    pthread_mutex_lock(&g_lock);
+    member_note_traffic(&g_table, id, kind, 1);
+    pthread_mutex_unlock(&g_lock);
+}
+
 /* Direct contact with a member: it is alive. Logs JOIN for a first sighting
  * and ALIVE when a suspected/dead member comes back. The address stored is
  * the one the member advertises in its id, never the datagram source. */
@@ -883,9 +914,13 @@ static void handle_membership_msg(const gmsg_t *msg,
         pthread_mutex_lock(&g_lock);
         copy = g_table;
         pthread_mutex_unlock(&g_lock);
+        /* Gossip traffic counters (0.80.0): the reply SYNC counts
+         * as a SYNC sent to the peer, on the attempt like every
+         * other send count. */
         if (gossip_send_full_table(g_send_sock, from_addr, g_self_id,
                                    g_incarnation, &copy) == 0)
             peer_set_known_version(msg->from_id, copy.version);
+        note_traffic_sent(msg->from_id, PULSE_TRAFFIC_SYNC);
     }
 }
 
@@ -902,6 +937,9 @@ static void handle_message(const gmsg_t *msg) {
         case GMSG_PING:
             note_contact(msg, &from_addr);
             gossip_send_ack(g_send_sock, &from_addr, msg->seq, g_self_id, g_incarnation);
+            /* Gossip traffic counters (0.80.0): the ACK answering
+             * the peer's PING. */
+            note_traffic_sent(msg->from_id, PULSE_TRAFFIC_ACK);
             break;
 
         case GMSG_ACK: {
@@ -1002,6 +1040,15 @@ static void handle_message(const gmsg_t *msg) {
                 /* Forward the ACK to the node that asked us to probe. */
                 gossip_send_ack(g_send_sock, &requester, msg->seq,
                                 msg->from_id, msg->from_inc);
+                /* Gossip traffic counters (0.80.0): the forwarded
+                 * ACK counts against the requester, not the target
+                 * — the requester is the peer this datagram went
+                 * to, and its id is the address it advertised when
+                 * it sent the PING_REQ. */
+                char requester_id[PULSE_ID_LEN];
+                member_format_id(&requester, requester_id,
+                                 sizeof requester_id);
+                note_traffic_sent(requester_id, PULSE_TRAFFIC_ACK);
             }
             break;
         }
@@ -1030,6 +1077,10 @@ static void handle_message(const gmsg_t *msg) {
             if (slot >= 0) {
                 gossip_send_ping(g_send_sock, &msg->target_addr, seq, g_self_id,
                                  g_incarnation);
+                /* Gossip traffic counters (0.80.0): the indirect
+                 * PING counts against the target — the peer this
+                 * datagram went to — not the requester. */
+                note_traffic_sent(msg->target_id, PULSE_TRAFFIC_PING);
             }
             break;
         }
@@ -1052,6 +1103,9 @@ static void handle_message(const gmsg_t *msg) {
             if (gossip_send_full_table(g_send_sock, &from_addr, g_self_id,
                                        g_incarnation, &copy) == 0)
                 peer_set_known_version(msg->from_id, copy.version);
+            /* Gossip traffic counters (0.80.0): the JOIN reply is
+             * a SYNC sent to the joiner. */
+            note_traffic_sent(msg->from_id, PULSE_TRAFFIC_SYNC);
             break;
         }
 
@@ -1065,6 +1119,22 @@ static void handle_message(const gmsg_t *msg) {
 
         case GMSG_UNKNOWN:
             break;
+    }
+    /* Gossip traffic counters (0.80.0): the received message counts
+     * against its sender, after handling — the handler may have
+     * just added the sender to the table (JOIN, note_contact, the
+     * membership merge), so counting here catches a first message
+     * from a new member instead of dropping it for arriving before
+     * the entry existed. A PING_REQ from a sender this node never
+     * heard of has no entry — that case adds none — so that one
+     * recv is missed, not invented. Unknown verbs count nothing. */
+    {
+        int kind = traffic_kind_for(msg->type);
+        if (kind >= 0) {
+            pthread_mutex_lock(&g_lock);
+            member_note_traffic(&g_table, msg->from_id, kind, 0);
+            pthread_mutex_unlock(&g_lock);
+        }
     }
 }
 
@@ -1300,9 +1370,13 @@ static void reload_peer_file_locked(pulse_reload_result_t *r) {
      * merges — it is in the seed list, so the rejoin retry covers
      * it — but the backoff may have pushed that retry seconds away.
      */
-    for (int i = 0; i < n_joins; i++)
+    for (int i = 0; i < n_joins; i++) {
         gossip_send_join_retry(g_send_sock, &joins[i].addr, g_self_id,
                                g_incarnation);
+        /* Gossip traffic counters (0.80.0): a reload JOIN counts
+         * as a JOIN sent to the newly listed peer. */
+        note_traffic_sent(joins[i].id, PULSE_TRAFFIC_JOIN);
+    }
     for (int i = 0; i < n_added; i++) {
         /* An added peer with no room never joined the seed list; the
          * summary line counts it as skipped, not added. */
@@ -1480,6 +1554,10 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
              * ACK can flip exactly this probe's outcome. */
             pthread_mutex_lock(&g_lock);
             member_note_probe_sent(&g_table, peer_id, seq);
+            /* Gossip traffic counters (0.80.0): the direct PING
+             * counts as a PING sent to the peer, next to the probe
+             * count it already moves. */
+            member_note_traffic(&g_table, peer_id, PULSE_TRAFFIC_PING, 1);
             pthread_mutex_unlock(&g_lock);
         }
     }
@@ -2122,6 +2200,13 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
         for (int j = 0; j < actions[i].n_inter; j++) {
             gossip_send_ping_req(g_send_sock, &actions[i].inter[j], actions[i].seq,
                                  actions[i].target_id, g_self_id);
+            /* Gossip traffic counters (0.80.0): the PING_REQ counts
+             * against the intermediary it went to — its id is the
+             * address the probe cycle picked from the table. */
+            char inter_id[PULSE_ID_LEN];
+            member_format_id(&actions[i].inter[j], inter_id,
+                             sizeof inter_id);
+            note_traffic_sent(inter_id, PULSE_TRAFFIC_PING_REQ);
         }
     }
     for (int i = 0; i < n_rejoins; i++) {
@@ -2135,6 +2220,9 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
          * just on the second syscall. */
         gossip_send_join_retry(g_send_sock, &rejoins[i].addr, g_self_id,
                                g_incarnation);
+        /* Gossip traffic counters (0.80.0): the re-JOIN counts as
+         * a JOIN sent to the seed. */
+        note_traffic_sent(rejoins[i].id, PULSE_TRAFFIC_JOIN);
         /* Logged only when the seed had been GC'd: a re-JOIN to a
          * SUSPECT/DEAD seed still in the table is routine. */
         if (rejoins[i].was_absent)
@@ -2290,6 +2378,9 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
                                            &digest_copy) == 0)
                     peer_set_known_version(digest_ids[i],
                                            digest_copy.version);
+                /* Gossip traffic counters (0.80.0): a peer too far
+                 * behind for a delta gets a full SYNC instead. */
+                note_traffic_sent(digest_ids[i], PULSE_TRAFFIC_SYNC);
             } else {
                 uint64_t through = known;
                 if (gossip_send_digest(g_send_sock, &digest_to[i],
@@ -2298,6 +2389,9 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
                                        &through,
                                        gossip_digest_size_hook(NULL)) == 0)
                     peer_set_known_version(digest_ids[i], through);
+                /* Gossip traffic counters (0.80.0): the digest is
+                 * a GOSSIP sent to the peer. */
+                note_traffic_sent(digest_ids[i], PULSE_TRAFFIC_GOSSIP);
             }
         }
     }
@@ -2305,6 +2399,9 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
         if (gossip_send_full_table(g_send_sock, &sync_to, g_self_id,
                                    g_incarnation, &sync_copy) == 0)
             peer_set_known_version(sync_id, sync_copy.version);
+        /* Gossip traffic counters (0.80.0): the periodic
+         * anti-entropy SYNC counts as a SYNC sent to the peer. */
+        note_traffic_sent(sync_id, PULSE_TRAFFIC_SYNC);
         log_line("SYNC %s", sync_id);
     }
     if (cycle % 10 == 0) {
@@ -3114,6 +3211,9 @@ int main(int argc, char **argv) {
          * when the first send failed. */
         gossip_send_join_retry(g_send_sock, &seed_addr, g_self_id,
                                g_incarnation);
+        /* Gossip traffic counters (0.80.0): the startup JOIN
+         * counts as a JOIN sent to the seed. */
+        note_traffic_sent(g_cfg.seeds[i], PULSE_TRAFFIC_JOIN);
     }
 
     /* The secret itself is never logged; only that a secret is on. */
@@ -3265,6 +3365,11 @@ int main(int argc, char **argv) {
                                    0, NULL,
                                    gossip_digest_size_hook(NULL)) == 0)
                 n_notified++;
+            /* Gossip traffic counters (0.80.0): the leave
+             * announcement is a GOSSIP sent to the peer — the
+             * last datagram this process sends, counted on the
+             * attempt like every other send. */
+            note_traffic_sent(m->id, PULSE_TRAFFIC_GOSSIP);
         }
     }
     if (n_notified > 0)

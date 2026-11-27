@@ -297,6 +297,57 @@ int main(void) {
     CHECK(m3->rtt_samples == 0);
     CHECK(member_rtt_mean_ms(m3) == -1);
 
+    /* Gossip traffic counters (0.80.0): sent and received start at
+     * 0 for every kind; each note moves exactly one kind in one
+     * direction, and the total is the sum over both directions and
+     * all kinds. Kind names are the wire verbs in lowercase, and an
+     * out-of-range kind names "unknown". An unknown id and an
+     * out-of-range kind are ignored, and counting is not a
+     * gossip-visible change. */
+    for (int k = 0; k < PULSE_TRAFFIC_KINDS; k++) {
+        CHECK(m2->traffic_sent[k] == 0);
+        CHECK(m2->traffic_recv[k] == 0);
+    }
+    CHECK(member_traffic_total(m2) == 0);
+    CHECK(strcmp(pulse_traffic_kind_name(PULSE_TRAFFIC_PING),
+                 "ping") == 0);
+    CHECK(strcmp(pulse_traffic_kind_name(PULSE_TRAFFIC_ACK),
+                 "ack") == 0);
+    CHECK(strcmp(pulse_traffic_kind_name(PULSE_TRAFFIC_PING_REQ),
+                 "ping_req") == 0);
+    CHECK(strcmp(pulse_traffic_kind_name(PULSE_TRAFFIC_JOIN),
+                 "join") == 0);
+    CHECK(strcmp(pulse_traffic_kind_name(PULSE_TRAFFIC_GOSSIP),
+                 "gossip") == 0);
+    CHECK(strcmp(pulse_traffic_kind_name(PULSE_TRAFFIC_SYNC),
+                 "sync") == 0);
+    CHECK(strcmp(pulse_traffic_kind_name(-1), "unknown") == 0);
+    CHECK(strcmp(pulse_traffic_kind_name(PULSE_TRAFFIC_KINDS),
+                 "unknown") == 0);
+    member_note_traffic(&t, "127.0.0.1:17102", PULSE_TRAFFIC_PING, 1);
+    member_note_traffic(&t, "127.0.0.1:17102", PULSE_TRAFFIC_PING, 1);
+    member_note_traffic(&t, "127.0.0.1:17102", PULSE_TRAFFIC_PING, 0);
+    member_note_traffic(&t, "127.0.0.1:17102", PULSE_TRAFFIC_ACK, 1);
+    member_note_traffic(&t, "127.0.0.1:17102", PULSE_TRAFFIC_GOSSIP, 0);
+    member_note_traffic(&t, "127.0.0.1:17102", PULSE_TRAFFIC_GOSSIP, 0);
+    member_note_traffic(&t, "127.0.0.1:17102", PULSE_TRAFFIC_SYNC, 1);
+    CHECK(m2->traffic_sent[PULSE_TRAFFIC_PING] == 2);
+    CHECK(m2->traffic_recv[PULSE_TRAFFIC_PING] == 1);
+    CHECK(m2->traffic_sent[PULSE_TRAFFIC_ACK] == 1);
+    CHECK(m2->traffic_recv[PULSE_TRAFFIC_ACK] == 0);
+    CHECK(m2->traffic_sent[PULSE_TRAFFIC_PING_REQ] == 0);
+    CHECK(m2->traffic_recv[PULSE_TRAFFIC_JOIN] == 0);
+    CHECK(m2->traffic_recv[PULSE_TRAFFIC_GOSSIP] == 2);
+    CHECK(m2->traffic_sent[PULSE_TRAFFIC_SYNC] == 1);
+    CHECK(member_traffic_total(m2) == 7);
+    CHECK(t.version == v_before); /* counts are local, not gossip */
+    member_note_traffic(&t, "127.0.0.1:17999", PULSE_TRAFFIC_PING,
+                        1); /* unknown: ignored */
+    member_note_traffic(&t, "127.0.0.1:17102", -1, 1);
+    member_note_traffic(&t, "127.0.0.1:17102", PULSE_TRAFFIC_KINDS, 0);
+    CHECK(member_traffic_total(m2) == 7);
+    CHECK(member_traffic_total(NULL) == 0);
+
     /* suspicion age (0.58.0): -1 unless the member is SUSPECT, then
      * now minus when it went SUSPECT; the age resets when the member
      * revives, and a DEAD member reports -1 — its suspicion is over. */

@@ -797,6 +797,64 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
             if (send_all(fd, flaprateline) != 0) return;
         }
     }
+    /* Gossip traffic counters (0.80.0): how many messages of
+     * each kind this node sent to each member and received from
+     * it, as one "TRAFFIC <id>
+     * sent=ping:N,ack:N,ping_req:N,join:N,gossip:N,sync:N
+     * recv=ping:N,ack:N,ping_req:N,join:N,gossip:N,sync:N" line
+     * per member with any traffic at all, after the FLAPRATE
+     * lines — the same values JSON reports as the "traffic"
+     * object and PROMETHEUS as
+     * pulse_member_traffic_sent_total /
+     * pulse_member_traffic_recv_total, so a text-protocol
+     * consumer can see the traffic mix without parsing JSON or
+     * scraping Prometheus. All six kinds ride on every line, in
+     * the same order, even when a kind is 0 — the line is a
+     * fixed schema, parsed by position within each direction —
+     * so a missing kind means "never exchanged", never "the
+     * field was left out". Self exchanges nothing with itself
+     * except a startup JOIN and its SYNC reply, when it lists
+     * itself as a seed — a shared peer file lists the node's own
+     * id — so self's line, when present, carries only join and
+     * sync; a peer never exchanged with has none, and a DEAD
+     * member keeps its counts until GC, like its probe counts,
+     * so the traffic that killed it stays visible after it is
+     * gone. */
+    for (int i = 0; i < t.count; i++) {
+        const member_t *mem = &t.members[i];
+        if (member_traffic_total(mem) == 0) continue;
+        char trafficline[512];
+        size_t used = 0;
+        int w = snprintf(trafficline, sizeof trafficline,
+                         "\nTRAFFIC %s sent=", mem->id);
+        if (w < 0) continue;
+        used = (size_t)w;
+        for (int k = 0; k < PULSE_TRAFFIC_KINDS; k++) {
+            w = snprintf(trafficline + used,
+                         sizeof trafficline - used, "%s%s:%lld",
+                         k == 0 ? "" : ",",
+                         pulse_traffic_kind_name(k),
+                         (long long)mem->traffic_sent[k]);
+            if (w < 0 || (size_t)w >= sizeof trafficline - used)
+                break;
+            used += (size_t)w;
+        }
+        w = snprintf(trafficline + used, sizeof trafficline - used,
+                     " recv=");
+        if (w < 0 || (size_t)w >= sizeof trafficline - used) continue;
+        used += (size_t)w;
+        for (int k = 0; k < PULSE_TRAFFIC_KINDS; k++) {
+            w = snprintf(trafficline + used,
+                         sizeof trafficline - used, "%s%s:%lld",
+                         k == 0 ? "" : ",",
+                         pulse_traffic_kind_name(k),
+                         (long long)mem->traffic_recv[k]);
+            if (w < 0 || (size_t)w >= sizeof trafficline - used)
+                break;
+            used += (size_t)w;
+        }
+        if (send_all(fd, trafficline) != 0) return;
+    }
     send_all(fd, "\nEND\n");
 }
 
@@ -1008,6 +1066,56 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
          * when the peer is SUSPECT or DEAD. Self is always
          * false: it never suspects itself, so it has no flaps
          * to judge. */
+        /* Gossip traffic counters (0.80.0): how many messages of
+         * each kind this node sent to the peer and received from
+         * it, as a "traffic" object with "sent" and "recv" maps
+         * keyed by kind — ping, ack, ping_req, join, gossip,
+         * sync — always present, always numbers, never null: 0
+         * for a peer never exchanged with, and a DEAD member
+         * keeps its counts until GC, like its probe counts. Self
+         * never probes or gossips with itself, so its ping, ack,
+         * ping_req and gossip are 0 — but it can carry join and
+         * sync when it lists itself as a seed, since the startup
+         * JOIN goes to every seed including itself and the JOIN
+         * handler answers with a SYNC. All six kinds ride on
+         * every member, even when a kind is 0, so a consumer can
+         * read a kind without checking for its presence first. */
+        char trafficbuf[512];
+        {
+            size_t tused = 0;
+            int tw = snprintf(trafficbuf, sizeof trafficbuf,
+                              "{\"sent\":{");
+            if (tw < 0) tw = 0;
+            tused = (size_t)tw;
+            for (int k = 0; k < PULSE_TRAFFIC_KINDS; k++) {
+                tw = snprintf(trafficbuf + tused,
+                             sizeof trafficbuf - tused, "%s\"%s\":%lld",
+                             k == 0 ? "" : ",",
+                             pulse_traffic_kind_name(k),
+                             (long long)mem->traffic_sent[k]);
+                if (tw < 0 || (size_t)tw >= sizeof trafficbuf - tused)
+                    break;
+                tused += (size_t)tw;
+            }
+            tw = snprintf(trafficbuf + tused,
+                          sizeof trafficbuf - tused, "},\"recv\":{");
+            if (tw >= 0 && (size_t)tw < sizeof trafficbuf - tused)
+                tused += (size_t)tw;
+            for (int k = 0; k < PULSE_TRAFFIC_KINDS; k++) {
+                tw = snprintf(trafficbuf + tused,
+                             sizeof trafficbuf - tused, "%s\"%s\":%lld",
+                             k == 0 ? "" : ",",
+                             pulse_traffic_kind_name(k),
+                             (long long)mem->traffic_recv[k]);
+                if (tw < 0 || (size_t)tw >= sizeof trafficbuf - tused)
+                    break;
+                tused += (size_t)tw;
+            }
+            tw = snprintf(trafficbuf + tused,
+                          sizeof trafficbuf - tused, "}}");
+            if (tw < 0 || (size_t)tw >= sizeof trafficbuf - tused)
+                snprintf(trafficbuf, sizeof trafficbuf, "{}");
+        }
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
@@ -1018,7 +1126,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                      "\"probes_answered\":%lld,\"low_probe_rate\":%s,"
                      "\"probe_rate\":%s,\"probe_rate_history\":%s,"
                      "\"flap_count\":%lld,\"flaps_10m\":%d,"
-                     "\"flap_rate\":%s}",
+                     "\"flap_rate\":%s,\"traffic\":%s}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
                      rttbuf, rttmeanbuf, rttmaxbuf,
@@ -1047,7 +1155,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                                           hooks->flap_rate_threshold,
                                           now))
                          ? "true"
-                         : "false");
+                         : "false",
+                     trafficbuf);
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }
@@ -1759,6 +1868,47 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             "pulse_member_probes_answered_total{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].probes_answered) == 0;
+    }
+    /* Gossip traffic counters (0.80.0): how many messages of each
+     * kind this node sent to each member and received from it, as
+     * two counter families labelled by member and kind — one
+     * sample per member and kind with a count above 0, so a kind
+     * never exchanged has no series: an absent series is how
+     * Prometheus says "never exchanged", the same as the probe
+     * counters say "never probed". A scraper sums over kind for
+     * the per-member total, or over member for the node total.
+     * Self has series only for join and sync, when it lists
+     * itself as a seed — the startup JOIN and its SYNC reply —
+     * and a DEAD member keeps its series until GC, like its probe
+     * counters, so the traffic that killed it stays visible after
+     * it is gone. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_traffic_sent_total Gossip-protocol "
+        "messages sent to a member, by kind.\n"
+        "# TYPE pulse_member_traffic_sent_total counter\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        for (int k = 0; k < PULSE_TRAFFIC_KINDS; k++) {
+            if (t.members[i].traffic_sent[k] == 0) continue;
+            ok &= prom_add(buf, sizeof buf, &used,
+                "pulse_member_traffic_sent_total{member=\"%s\","
+                "kind=\"%s\"} %lld\n",
+                t.members[i].id, pulse_traffic_kind_name(k),
+                (long long)t.members[i].traffic_sent[k]) == 0;
+        }
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_traffic_recv_total Gossip-protocol "
+        "messages received from a member, by kind.\n"
+        "# TYPE pulse_member_traffic_recv_total counter\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        for (int k = 0; k < PULSE_TRAFFIC_KINDS; k++) {
+            if (t.members[i].traffic_recv[k] == 0) continue;
+            ok &= prom_add(buf, sizeof buf, &used,
+                "pulse_member_traffic_recv_total{member=\"%s\","
+                "kind=\"%s\"} %lld\n",
+                t.members[i].id, pulse_traffic_kind_name(k),
+                (long long)t.members[i].traffic_recv[k]) == 0;
+        }
     }
     /* Recent probe success rate per member (0.68.0): the answered
      * / sent ratio over the last PULSE_PROBE_WINDOW direct probes

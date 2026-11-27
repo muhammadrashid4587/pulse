@@ -41,6 +41,21 @@
 #define PULSE_FLAP_HISTORY 16
 #define PULSE_FLAP_WINDOW_MS (10 * 60 * 1000)
 
+/* Gossip traffic counters (0.80.0): the message kinds counted
+ * per member, in wire order — the same order as gmsg_type_t in
+ * gossip.h minus GMSG_UNKNOWN, so node.c maps a parsed message
+ * to its kind with a switch, not by assuming the orders stay in
+ * step. */
+#define PULSE_TRAFFIC_KINDS 6
+typedef enum {
+    PULSE_TRAFFIC_PING = 0,
+    PULSE_TRAFFIC_ACK = 1,
+    PULSE_TRAFFIC_PING_REQ = 2,
+    PULSE_TRAFFIC_JOIN = 3,
+    PULSE_TRAFFIC_GOSSIP = 4,
+    PULSE_TRAFFIC_SYNC = 5
+} pulse_traffic_kind_t;
+
 /* Member metadata/annotations (0.20.0): a small set of key=value pairs
  * a node carries about itself — role=worker, zone=us-east-1,
  * version=1.2.3 — gossiped with its membership entry, shown in the
@@ -133,6 +148,25 @@ typedef struct {
      * not a table-version change, like the RTT itself. */
     int64_t probes_sent;
     int64_t probes_answered;
+    /* Gossip traffic counters (0.80.0): how many messages of
+     * each kind this node sent to the peer and received from it
+     * — PING, ACK, PING_REQ, JOIN, GOSSIP, SYNC — the whole
+     * gossip-protocol traffic with that peer, not just the direct
+     * probes probes_sent/probes_answered count. Sent counts on
+     * the attempt, like probes_sent: a failed send still went out
+     * as far as this node knows. Received counts only messages
+     * that passed the secret gate and parsed: a dropped or
+     * malformed datagram is not traffic with the peer, it is
+     * noise. A member that was never a peer here has no entry to
+     * count against — a PING_REQ from a stranger this node never
+     * heard of is the only message that can arrive from an
+     * unknown sender, since PING/ACK/JOIN/GOSSIP/SYNC all add
+     * the sender first — so that one recv is missed, not
+     * invented. Local measurement only — never gossiped, never
+     * persisted, and not a table-version change, like the probe
+     * counts. */
+    int64_t traffic_sent[PULSE_TRAFFIC_KINDS];
+    int64_t traffic_recv[PULSE_TRAFFIC_KINDS];
     /* Recent-probe window (0.68.0): the outcomes of the last
      * PULSE_PROBE_WINDOW direct probes to this peer — the recent
      * probe success rate, answered / sent over the window,
@@ -406,6 +440,26 @@ void member_note_probe_sent(member_table_t *t, const char *id,
  * is not recent evidence. Unknown ids are ignored too. */
 void member_note_probe_answered(member_table_t *t, const char *id,
                                 uint32_t seq);
+/* The short name of a traffic kind (0.80.0): "ping", "ack",
+ * "ping_req", "join", "gossip" or "sync" — the wire verb in
+ * lowercase, for the METRICS TRAFFIC line, the JSON traffic
+ * object and the Prometheus kind label. An out-of-range kind
+ * returns "unknown", never NULL. */
+const char *pulse_traffic_kind_name(int kind);
+/* Record one gossip-protocol message exchanged with a peer
+ * (0.80.0): is_sent counts a message this node sent to the
+ * peer, otherwise one it received from the peer. Unknown ids
+ * and out-of-range kinds are ignored: a message from a sender
+ * with no table entry has nowhere to count. Does not bump the
+ * table version: traffic is local measurement, not gossip
+ * content. */
+void member_note_traffic(member_table_t *t, const char *id, int kind,
+                         int is_sent);
+/* How many gossip-protocol messages this node has exchanged with
+ * the member in total — sent plus received, all kinds — 0 for a
+ * member never exchanged with. The control plane uses it to
+ * decide whether the member gets a TRAFFIC line at all. */
+int64_t member_traffic_total(const member_t *m);
 /* The recent probe success rate (0.68.0): answered / sent over
  * the last PULSE_PROBE_WINDOW direct probes to this peer, or -1
  * when no probe to the peer is in the window yet — an absent
