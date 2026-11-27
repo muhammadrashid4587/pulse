@@ -619,6 +619,29 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
             if (send_all(fd, seenline) != 0) return;
         }
     }
+    /* Per-member probe RTT (0.63.0): the last and mean direct-probe
+     * round-trip time JSON and PROMETHEUS already report per member,
+     * as one "RTT <id> <last_ms> <mean_ms>" line per member that has
+     * answered a probe, after the LASTSEEN lines, under the same rule
+     * as JSON's "rtt_ms" / "rtt_mean_ms" and PROMETHEUS's
+     * pulse_member_rtt_ms / pulse_member_rtt_mean_ms gauges —
+     * rtt_ms is -1 until a probe has been answered, so self (which
+     * never probes itself) and a peer never heard from have no line:
+     * an absent line is how the text protocol says "never probed".
+     * A value of 0 is a real sub-millisecond probe, not a missing
+     * one. A DEAD member keeps its last RTT until GC, the same as
+     * JSON reports it, so a text-protocol consumer can see the last
+     * measured RTT of a peer that just died instead of only the
+     * global probe_rtt_ms histogram. */
+    for (int i = 0; i < t.count; i++) {
+        const member_t *mem = &t.members[i];
+        if (mem->rtt_ms < 0 || mem->rtt_samples == 0) continue;
+        char rttline[128];
+        snprintf(rttline, sizeof rttline, "\nRTT %s %lld %lld",
+                 mem->id, (long long)mem->rtt_ms,
+                 (long long)member_rtt_mean_ms(mem));
+        if (send_all(fd, rttline) != 0) return;
+    }
     send_all(fd, "\nEND\n");
 }
 

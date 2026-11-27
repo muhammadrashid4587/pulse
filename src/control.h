@@ -189,6 +189,19 @@
  *       last_seen is just startup time) and a peer never heard
  *       from has none either; a DEAD member keeps its line
  *       until GC, the age growing — how long it has been silent.
+ *       Per-member probe RTT (0.63.0): after the LASTSEEN
+ *       lines, one "RTT <id> <last_ms> <mean_ms>" line per
+ *       member that has answered a probe — the last and mean
+ *       direct-probe round-trip time in ms, the same values
+ *       JSON reports as "rtt_ms" / "rtt_mean_ms" and
+ *       PROMETHEUS as pulse_member_rtt_ms /
+ *       pulse_member_rtt_mean_ms, so the RTT trio is complete:
+ *       an operator polling the text protocol can watch a
+ *       peer's RTT climb without parsing JSON or scraping
+ *       Prometheus. Self and a peer never heard from have no
+ *       line (rtt_ms is -1 until a probe is answered); a 0 is
+ *       a real sub-millisecond probe, not a missing one; a
+ *       DEAD member keeps its last RTT until GC.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number

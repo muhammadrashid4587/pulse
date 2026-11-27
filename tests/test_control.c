@@ -89,7 +89,13 @@
  * and with no hook it reports the default 8.00. The same
  * threshold in JSON (0.46.0) is covered here too: the JSON
  * object carries a top-level "phi_threshold" number from the
- * hook, and with no hook it reports the default 8.00. */
+ * hook, and with no hook it reports the default 8.00. Per-member
+ * probe RTT in METRICS (0.63.0) is covered here too: one "RTT
+ * <id> <last> <mean>" line rides after the LASTSEEN lines for
+ * each member that answered a probe — the canned 17901 (last 3,
+ * mean 2) and 17903 (last 0, mean 0) — with self and the
+ * never-heard-from peer absent; the RTT end to end is covered by
+ * tests/test_rtt_metrics.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -863,7 +869,13 @@ int main(void) {
      * table's two heard-from peers, 17901 and 17903, in table
      * order, with timing-dependent values checked as all digits
      * like PEERS does; self (17999) and the never-heard-from peer
-     * (17902) have no line — then END. */
+     * (17902) have no line. Per-member probe RTT (0.63.0) rides
+     * after the LASTSEEN lines as one "RTT <id> <last> <mean>"
+     * line per member that answered a probe — the canned table's
+     * 17901 (last 3, mean 2 over 4 samples) and 17903 (last 0,
+     * mean 0, a real sub-millisecond probe) in table order, exact
+     * values since they are canned; self and the never-heard-from
+     * peer (17902, rtt_ms -1) have no line — then END. */
     g_peerfile_mode = 0;
     CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
     {
@@ -888,13 +900,14 @@ int main(void) {
         CHECK(strncmp(reply, metrics_line, sizeof metrics_line - 1) == 0);
         const char *want_seen_id[2] = {"127.0.0.1:17901",
                                        "127.0.0.1:17903"};
-        int nseen = 0;
+        const char *want_rtt[2] = {"RTT 127.0.0.1:17901 3 2",
+                                   "RTT 127.0.0.1:17903 0 0"};
+        int nseen = 0, nrtt = 0;
         char *save = NULL;
         char *line = strtok_r(reply + sizeof metrics_line - 1, "\n",
                               &save);
         while (line) {
             if (strcmp(line, "END") == 0) break;
-            CHECK(nseen < 2);
             if (nseen < 2) {
                 char id[64], ms[32];
                 CHECK(sscanf(line, "LASTSEEN %63s %31s", id, ms) == 2);
@@ -903,11 +916,16 @@ int main(void) {
                 for (int i = 0; ms[i]; i++)
                     if (!isdigit((unsigned char)ms[i])) all_digits = 0;
                 CHECK(all_digits);
+                nseen++;
+            } else {
+                CHECK(nrtt < 2);
+                if (nrtt < 2) CHECK(strcmp(line, want_rtt[nrtt]) == 0);
+                nrtt++;
             }
-            nseen++;
             line = strtok_r(NULL, "\n", &save);
         }
         CHECK(nseen == 2);
+        CHECK(nrtt == 2);
         CHECK(line != NULL && strcmp(line, "END") == 0);
     }
 
