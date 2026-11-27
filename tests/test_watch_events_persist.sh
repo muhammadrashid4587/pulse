@@ -10,17 +10,18 @@
 #     of node 3's lifecycle: JOINED when it joins through --seed
 #     only (a peer-file peer is already in the table at startup,
 #     so it never generates a JOINED), SUSPECTED then DEAD when it
-#     is killed.
+#     is killed — and a FLAP event right after the DEAD (0.79.0),
+#     since the ALIVE -> SUSPECT -> DEAD leg completes a flap.
 #  2. Node 1 is stopped cleanly (SIGTERM): the shutdown compacts the
-#     persisted log, and <data-dir>/events holds exactly the three
+#     persisted log, and <data-dir>/events holds exactly the four
 #     events the ring held.
 #  3. Node 1 restarts from the same data dir: it logs
-#     "EVENTS 3 restored", and the restored SUSPECT entry for node 3
+#     "EVENTS 4 restored", and the restored SUSPECT entry for node 3
 #     goes DEAD again on its own suspect timeout — a new event, with
 #     a sequence number past the pre-restart ones.
 #  4. Node 3 restarts: node 1 streams REVIVED live, with a sequence
 #     number past the pre-restart DEAD, and a WATCH FROM 1 opened
-#     after the restart replays JOINED, SUSPECTED, DEAD with the
+#     after the restart replays JOINED, SUSPECTED, DEAD and FLAP with the
 #     same sequence numbers the live stream carried before the
 #     restart — and no GAP line, since nothing was evicted.
 # The watchers run under stdbuf -o0: pulse-ctl's stdout is
@@ -120,15 +121,17 @@ fi
 JOIN_SEQ="$(grep '^EVENT .* JOINED 127\.0\.0\.1:17853 ' "$TMP/watch1.out" | head -n 1 | awk '{print $2}')"
 SUSPECT_SEQ="$(grep '^EVENT .* SUSPECTED 127\.0\.0\.1:17853 ' "$TMP/watch1.out" | head -n 1 | awk '{print $2}')"
 DEAD_SEQ="$(grep '^EVENT .* DEAD 127\.0\.0\.1:17853 ' "$TMP/watch1.out" | head -n 1 | awk '{print $2}')"
+FLAP_SEQ="$(grep '^EVENT .* FLAP 127\.0\.0\.1:17853 ' "$TMP/watch1.out" | head -n 1 | awk '{print $2}')"
 
 # 2. Node 1 stops cleanly: the shutdown compacts the persisted
 # log to exactly the events the ring held.
 kill -TERM "$(cat "$TMP/n1.pid")"
 for i in $(seq 1 50); do kill -0 "$(cat "$TMP/n1.pid")" 2>/dev/null || break; sleep 0.2; done
-if [ -f "$TMP/n1/events" ] && [ "$(wc -l < "$TMP/n1/events")" -eq 3 ]; then
-    note ok "clean shutdown leaves <data-dir>/events with the 3 recorded events"
+if [ -f "$TMP/n1/events" ] && [ "$(wc -l < "$TMP/n1/events")" -eq 4 ] \
+   && grep -Eq " FLAP 127.0.0.1:17853 [0-9]+ [0-9]+ .* flaps_10m=1 flap_count=1\$" "$TMP/n1/events"; then
+    note ok "clean shutdown leaves <data-dir>/events with the 4 recorded events, FLAP last with flap_count 1"
 else
-    note fail "clean shutdown leaves <data-dir>/events with the 3 recorded events"
+    note fail "clean shutdown leaves <data-dir>/events with the 4 recorded events, FLAP last with flap_count 1"
     ls -l "$TMP/n1/" 2>/dev/null; cat "$TMP/n1/events" 2>/dev/null
 fi
 
@@ -136,10 +139,10 @@ fi
 # events, and the restored SUSPECT entry for node 3 goes DEAD
 # again — a new event past the pre-restart sequences.
 (cd "$TMP/n1" && exec "$BIN" --port 17851 --peer-file "$TMP/peers" --control-port 18851 --dead-retention 120 > "$TMP/n1.log" 2>&1 & echo $! > "$TMP/n1.pid")
-if wait_for "$TMP/n1.log" "EVENTS 3 restored" 10; then
-    note ok "restarted node 1 restores 3 events from <data-dir>/events"
+if wait_for "$TMP/n1.log" "EVENTS 4 restored" 10; then
+    note ok "restarted node 1 restores 4 events from <data-dir>/events"
 else
-    note fail "restarted node 1 restores 3 events from <data-dir>/events"
+    note fail "restarted node 1 restores 4 events from <data-dir>/events"
     tail -5 "$TMP/n1.log"
 fi
 # The DEAD line for node 3 appears again in the fresh log: the
@@ -161,12 +164,13 @@ fi
 if wait_for "$TMP/watch2.out" "^END$" 10 \
    && wait_for "$TMP/watch2.out" "^EVENT $JOIN_SEQ JOINED 127\\.0\\.0\\.1:17853 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$" 10 \
    && wait_for "$TMP/watch2.out" "^EVENT $SUSPECT_SEQ SUSPECTED 127\\.0\\.0\\.1:17853 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$" 10 \
-   && wait_for "$TMP/watch2.out" "^EVENT $DEAD_SEQ DEAD 127\\.0\\.0\\.1:17853 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$" 10; then
-    note ok "WATCH FROM 1 after restart replays JOINED, SUSPECTED, DEAD with the original sequence numbers"
+   && wait_for "$TMP/watch2.out" "^EVENT $DEAD_SEQ DEAD 127\\.0\\.0\\.1:17853 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$" 10 \
+   && wait_for "$TMP/watch2.out" "^EVENT $FLAP_SEQ FLAP 127\\.0\\.0\\.1:17853 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)? flaps_10m=1 flap_count=1$" 10; then
+    note ok "WATCH FROM 1 after restart replays JOINED, SUSPECTED, DEAD, FLAP with the original sequence numbers"
 else
-    note fail "WATCH FROM 1 after restart replays JOINED, SUSPECTED, DEAD with the original sequence numbers"
+    note fail "WATCH FROM 1 after restart replays JOINED, SUSPECTED, DEAD, FLAP with the original sequence numbers"
     echo "--- watch2.out"; cat "$TMP/watch2.out"
-    echo "join=$JOIN_SEQ suspect=$SUSPECT_SEQ dead=$DEAD_SEQ"
+    echo "join=$JOIN_SEQ suspect=$SUSPECT_SEQ dead=$DEAD_SEQ flap=$FLAP_SEQ"
 fi
 sleep 1
 if [ "$(grep -c '^GAP ' "$TMP/watch2.out")" -eq 0 ]; then

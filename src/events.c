@@ -71,6 +71,8 @@ const char *pulse_event_type_name(pulse_event_type_t type) {
             return "FLAPRATE";
         case PULSE_EVENT_FLAPOK:
             return "FLAPOK";
+        case PULSE_EVENT_FLAP:
+            return "FLAP";
         default:
             return "UNKNOWN";
     }
@@ -81,8 +83,8 @@ int pulse_event_type_parse(const char *name, pulse_event_type_t *out) {
                                   "REVIVED",  "DROPPED",   "REFUTED",
                                   "QUIET",    "LOWRATE",   "RATEOK",
                                   "QUIETOK",  "SLOW",      "SLOWOK",
-                                  "FLAPRATE", "FLAPOK"};
-    for (int i = 0; i < 14; i++) {
+                                  "FLAPRATE", "FLAPOK",    "FLAP"};
+    for (int i = 0; i < 15; i++) {
         if (strcmp(name, names[i]) == 0) {
             *out = (pulse_event_type_t)i;
             return 0;
@@ -98,8 +100,13 @@ int pulse_event_type_parse(const char *name, pulse_event_type_t *out) {
  * verdict about itself — SUSPECTED lands on SUSPECT and DEAD on
  * DEAD. DROPPED has no state to land on: the member left the
  * table, so it never matches a state filter — a watcher that wants
- * removals subscribes to the DROPPED type instead. Returns 1 with
- * *out filled, or 0 for DROPPED. */
+ * removals subscribes to the DROPPED type instead. FLAP (0.79.0)
+ * has none either: a flap completes at the same transition as a
+ * REVIVED or DEAD event, which already carry the landing state,
+ * so the state filter sees the outcome through those — a watcher
+ * that wants flap completions subscribes to the FLAP type
+ * instead. Returns 1 with
+ * *out filled, or 0 for DROPPED and FLAP. */
 int pulse_event_result_state(pulse_event_type_t type, member_state_t *out) {
     switch (type) {
         case PULSE_EVENT_JOINED:
@@ -122,6 +129,7 @@ int pulse_event_result_state(pulse_event_type_t type, member_state_t *out) {
             *out = MEMBER_DEAD;
             return 1;
         case PULSE_EVENT_DROPPED:
+        case PULSE_EVENT_FLAP:
             return 0;
         default:
             return 0;
@@ -138,7 +146,7 @@ static void log_insert(pulse_event_log_t *log, uint64_t seq,
                        int64_t last_seen_ms, int64_t probes_sent,
                        int64_t probes_answered, double probe_rate,
                        int64_t suspect_ms, int64_t rtt_mean_ms,
-                       int64_t flaps_10m) {
+                       int64_t flaps_10m, int64_t flap_count) {
     pulse_event_t *slot = &log->events[log->head];
     slot->seq = seq;
     slot->type = type;
@@ -153,6 +161,7 @@ static void log_insert(pulse_event_log_t *log, uint64_t seq,
     slot->suspect_ms = suspect_ms;
     slot->rtt_mean_ms = rtt_mean_ms;
     slot->flaps_10m = flaps_10m;
+    slot->flap_count = flap_count;
     log->head = (log->head + 1) % log->cap;
     if (log->count < log->cap) log->count++;
 }
@@ -251,11 +260,31 @@ uint64_t pulse_event_record_flap_rate(pulse_event_log_t *log,
                                       int64_t suspect_ms,
                                       int64_t rtt_mean_ms,
                                       int64_t flaps_10m) {
+    return pulse_event_record_flap_count(log, type, id, incarnation,
+                                         unix_ts, phi, last_seen_ms,
+                                         probes_sent, probes_answered,
+                                         probe_rate, suspect_ms,
+                                         rtt_mean_ms, flaps_10m, -1);
+}
+
+uint64_t pulse_event_record_flap_count(pulse_event_log_t *log,
+                                       pulse_event_type_t type,
+                                       const char *id,
+                                       uint32_t incarnation,
+                                       int64_t unix_ts, double phi,
+                                       int64_t last_seen_ms,
+                                       int64_t probes_sent,
+                                       int64_t probes_answered,
+                                       double probe_rate,
+                                       int64_t suspect_ms,
+                                       int64_t rtt_mean_ms,
+                                       int64_t flaps_10m,
+                                       int64_t flap_count) {
     pthread_mutex_lock(&log->lock);
     uint64_t seq = log->next_seq++;
     log_insert(log, seq, type, id, incarnation, unix_ts, phi,
                last_seen_ms, probes_sent, probes_answered, probe_rate,
-               suspect_ms, rtt_mean_ms, flaps_10m);
+               suspect_ms, rtt_mean_ms, flaps_10m, flap_count);
     /* A waiter may be waiting for exactly this event; a broadcast
      * wakes it, and it re-checks under the lock. */
     pthread_cond_broadcast(&log->cond);
@@ -293,7 +322,10 @@ uint64_t pulse_event_record_flap_rate(pulse_event_log_t *log,
  * — how many of the peer's flap cycles fall inside the recent
  * window when the threshold was crossed, or when the count
  * fell back below it — after the mean probe RTT when it is
- * present; the loader accepts lines
+ * present; and a FLAP event (0.79.0) carries a trailing
+ * " flap_count=<n>" — how many flap cycles the peer has
+ * completed in total when the cycle completed — after the
+ * flaps_10m when it is present; the loader accepts lines
  * with any of the trailing fields, or none of them. An event
  * with none writes the plain five fields, so existing consumers
  * see byte-identical lines. */
@@ -357,6 +389,9 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path) {
         if (held[i].flaps_10m >= 0)
             fprintf(f, " flaps_10m=%lld",
                     (long long)held[i].flaps_10m);
+        if (held[i].flap_count >= 0)
+            fprintf(f, " flap_count=%lld",
+                    (long long)held[i].flap_count);
         fputc('\n', f);
     }
     free(held);
@@ -396,11 +431,13 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
          * event — after the suspicion duration when it is
          * present, and a FLAPRATE event carries a trailing
          * " flaps_10m=<n>" (0.76.0) — or a FLAPOK event —
-         * after the mean probe RTT when it is present.
+         * after the mean probe RTT when it is present, and a
+         * FLAP event carries a trailing " flap_count=<n>"
+         * (0.79.0) — after the flaps_10m when it is present.
          * The fields are parsed independently — any of them may
          * be present without the others — so a line without one,
          * or without all five (written before 0.60.0/0.61.0/
-         * 0.67.0/0.68.0/0.70.0/0.73.0/0.76.0, or an event with nothing measured),
+         * 0.67.0/0.68.0/0.70.0/0.73.0/0.76.0/0.79.0, or an event with nothing measured),
          * loads with -1 for the missing ones. Ids carry no
          * spaces, so the strstr cannot match inside an id. */
         double phi = -1;
@@ -411,6 +448,7 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
         int64_t suspect_ms = -1;
         int64_t rtt_mean_ms = -1;
         int64_t flaps_10m = -1;
+        int64_t flap_count = -1;
         const char *phi_at = strstr(line, " phi=");
         if (phi_at) sscanf(phi_at + 5, "%lf", &phi);
         const char *seen_at = strstr(line, " last_seen_ms=");
@@ -451,6 +489,12 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
             if (sscanf(flaps_at + 11, "%lld", &v) == 1)
                 flaps_10m = (int64_t)v;
         }
+        const char *flap_count_at = strstr(line, " flap_count=");
+        if (flap_count_at) {
+            long long v;
+            if (sscanf(flap_count_at + 12, "%lld", &v) == 1)
+                flap_count = (int64_t)v;
+        }
         if (seq == 0) continue;
         pulse_event_type_t type;
         if (pulse_event_type_parse(type_name, &type) != 0) continue;
@@ -461,7 +505,8 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
         if (seq >= log->next_seq) {
             log_insert(log, seq, type, id, inc, (int64_t)ts, phi,
                        last_seen_ms, probes_sent, probes_answered,
-                       probe_rate, suspect_ms, rtt_mean_ms, flaps_10m);
+                       probe_rate, suspect_ms, rtt_mean_ms, flaps_10m,
+                       flap_count);
             log->next_seq = seq + 1;
             loaded++;
         }

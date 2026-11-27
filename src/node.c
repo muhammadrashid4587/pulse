@@ -443,6 +443,7 @@ static void record_event_phi_suspect(pulse_event_type_t type,
      * and a member never answered a probe, or already gone from
      * the table when the event was recorded, has none: -1, never
      * a fabricated zero. */
+    int64_t rtt_mean_ms = -1;
     /* Flap count at record time (0.76.0): how many of the
      * member's completed flap cycles fall inside the recent
      * window when the event was recorded — the same value JSON
@@ -456,8 +457,19 @@ static void record_event_phi_suspect(pulse_event_type_t type,
      * suspects itself and a member never flapped, or already
      * gone from the table when the event was recorded, has
      * none: -1, never a fabricated zero. */
-    int64_t rtt_mean_ms = -1;
     int64_t flaps_10m = -1;
+    /* Lifetime flap count at record time (0.79.0): how many flap
+     * cycles the member has completed in total when the event
+     * was recorded — the same value JSON reports as
+     * "flap_count", frozen at the event instead of recomputed
+     * at replay time, so a replayed FLAP event still shows
+     * which flap this was instead of only that one happened.
+     * Carried only on a FLAP event, with the recent count
+     * above: every other event has no completed cycle to
+     * count. Self never suspects itself and a member never
+     * flapped, or already gone from the table when the event
+     * was recorded, has none: -1, never a fabricated zero. */
+    int64_t flap_count = -1;
     if (strcmp(id, g_self_id) != 0) {
         int64_t now = pulse_now_ms();
         pthread_mutex_lock(&g_lock);
@@ -477,10 +489,14 @@ static void record_event_phi_suspect(pulse_event_type_t type,
             if (type == PULSE_EVENT_FLAPRATE ||
                 type == PULSE_EVENT_FLAPOK)
                 flaps_10m = member_flaps_recent(m, now);
+            if (type == PULSE_EVENT_FLAP) {
+                flap_count = m->flap_count;
+                flaps_10m = member_flaps_recent(m, now);
+            }
         }
         pthread_mutex_unlock(&g_lock);
     }
-    uint64_t seq = pulse_event_record_flap_rate(&g_event_log, type, id,
+    uint64_t seq = pulse_event_record_flap_count(&g_event_log, type, id,
                                                 incarnation, ts, phi,
                                                 last_seen_age,
                                                 probes_sent,
@@ -488,7 +504,8 @@ static void record_event_phi_suspect(pulse_event_type_t type,
                                                 probe_rate,
                                                 suspect_ms,
                                                 rtt_mean_ms,
-                                                flaps_10m);
+                                                flaps_10m,
+                                                flap_count);
     if (g_events_path[0] == '\0') return;
     pthread_mutex_lock(&g_events_file_lock);
     FILE *f = fopen(g_events_path, "a");
@@ -515,7 +532,9 @@ static void record_event_phi_suspect(pulse_event_type_t type,
          * event (0.76.0) — or a FLAPOK event — carries its flap
          * count in the recent window as a trailing
          * " flaps_10m=<n>", after the mean probe RTT when it is
-         * present — so all seven values
+         * present — and a FLAP event (0.79.0) carries its
+         * lifetime flap count as a trailing " flap_count=<n>",
+         * after the flaps_10m when it is present — so all eight values
          * survive a restart and a replay exactly as the WATCH
          * stream shows them; an event with none writes the plain
          * five fields. */
@@ -538,6 +557,8 @@ static void record_event_phi_suspect(pulse_event_type_t type,
             fprintf(f, " rtt_mean_ms=%lld", (long long)rtt_mean_ms);
         if (flaps_10m >= 0)
             fprintf(f, " flaps_10m=%lld", (long long)flaps_10m);
+        if (flap_count >= 0)
+            fprintf(f, " flap_count=%lld", (long long)flap_count);
         fputc('\n', f);
         fclose(f);
     }
@@ -581,8 +602,14 @@ static void note_contact(const gmsg_t *msg,
      * is a restart, not a refutation, so only SUSPECT counts. */
     member_state_t prev = before ? before->state : MEMBER_ALIVE;
     int64_t since = before ? before->state_since_ms : 0;
+    /* A flap completes here when a SUSPECT peer answers again:
+     * the lifetime count moves under the lock, so snapshot it
+     * before the mark and compare after — the count is the only
+     * witness, since the armed flag lives inside member.c. */
+    int64_t flaps_before = before ? before->flap_count : 0;
     revived = member_mark_alive(&g_table, msg->from_id, addr,
                                 msg->from_inc, now);
+    int64_t flaps_after = before ? before->flap_count : 0;
     if (is_new) metrics_note_join(&g_metrics);
     if (revived && prev == MEMBER_SUSPECT)
         metrics_note_suspect_refuted(&g_metrics, now - since);
@@ -606,6 +633,16 @@ static void note_contact(const gmsg_t *msg,
         else
             log_line("ALIVE %s", msg->from_id);
         record_event_revived(msg->from_id, msg->from_inc, suspect_ms);
+        /* A flap event on the WATCH stream (0.79.0): the
+         * SUSPECT -> ALIVE leg completes a flap cycle the
+         * suspicion started from ALIVE on this node, so the
+         * stream carries one FLAP event right after the
+         * REVIVED, with the lifetime and recent counts frozen
+         * on it — a DEAD peer coming back is a restart, not a
+         * flap, so its count never moves and it gets none. */
+        if (flaps_after > flaps_before)
+            record_event(PULSE_EVENT_FLAP, msg->from_id,
+                         msg->from_inc);
     }
 }
 
@@ -649,6 +686,13 @@ static void handle_membership_msg(const gmsg_t *msg,
      * that revived it — the same refute latency the direct-contact
      * path measures, frozen on the REVIVED event. */
     int64_t changed_suspect_ms[8];
+    /* Whether a gossip-learned change completed a flap cycle
+     * (0.79.0): the lifetime flap count after the merge, or -1
+     * when the merge completed no cycle — a flap completes on
+     * the SUSPECT -> ALIVE or SUSPECT -> DEAD leg, so the FLAP
+     * event rides right after the REVIVED or DEAD event for the
+     * same entry. */
+    int64_t changed_flap_count[8];
     int changed_count = 0;
     pthread_mutex_lock(&g_lock);
     member_t *sender_before = member_find(&g_table, msg->from_id);
@@ -661,8 +705,15 @@ static void handle_membership_msg(const gmsg_t *msg,
     int64_t sender_since =
         sender_before ? sender_before->state_since_ms : 0;
     int64_t now = pulse_now_ms();
+    /* A flap completes here when a SUSPECT sender answers again:
+     * snapshot the lifetime count before the mark (see
+     * note_contact) — the count is the only witness. */
+    int64_t sender_flaps_before =
+        sender_before ? sender_before->flap_count : 0;
     int revived = member_mark_alive(&g_table, msg->from_id, from_addr,
                                     msg->from_inc, now);
+    int64_t sender_flaps_after =
+        sender_before ? sender_before->flap_count : 0;
     if (is_new) metrics_note_join(&g_metrics);
     if (revived && sender_prev == MEMBER_SUSPECT)
         metrics_note_suspect_refuted(&g_metrics, now - sender_since);
@@ -672,6 +723,10 @@ static void handle_membership_msg(const gmsg_t *msg,
         member_t *before = member_find(&g_table, e->id);
         member_state_t prev = before ? before->state : MEMBER_ALIVE;
         int64_t since = before ? before->state_since_ms : 0;
+        /* Snapshot the lifetime flap count before the merge
+         * (0.79.0): the merge is the only place a gossip-learned
+         * cycle completes, and the count moving is the witness. */
+        int64_t flaps_before = before ? before->flap_count : 0;
         int r = member_merge(&g_table, g_self_id, e->id, &e->addr,
                              e->incarnation, e->state, pulse_now_ms());
         if ((r & MERGE_SELF_SUSPECTED) && !refute) {
@@ -728,6 +783,10 @@ static void handle_membership_msg(const gmsg_t *msg,
                      after->state == MEMBER_ALIVE)
                         ? now - since
                         : -1;
+                changed_flap_count[changed_count] =
+                    (after->flap_count > flaps_before)
+                        ? after->flap_count
+                        : -1;
                 changed_count++;
             }
         }
@@ -761,6 +820,15 @@ static void handle_membership_msg(const gmsg_t *msg,
         else
             log_line("ALIVE %s", msg->from_id);
         record_event_revived(msg->from_id, msg->from_inc, suspect_ms);
+        /* A flap event on the WATCH stream (0.79.0): the sender
+         * answering again completes a flap cycle exactly like a
+         * direct-contact revival, so the FLAP event rides right
+         * after the REVIVED — a DEAD sender coming back is a
+         * restart, not a flap, so its count never moves and it
+         * gets none. */
+        if (sender_flaps_after > sender_flaps_before)
+            record_event(PULSE_EVENT_FLAP, msg->from_id,
+                         msg->from_inc);
     }
     for (int i = 0; i < new_count; i++) {
         log_line("JOIN %s", new_ids[i]);
@@ -790,6 +858,15 @@ static void handle_membership_msg(const gmsg_t *msg,
             record_event(PULSE_EVENT_SUSPECTED, changed_ids[i],
                          changed_inc[i]);
         }
+        /* A flap event on the WATCH stream (0.79.0): the change
+         * above completed a flap cycle — SUSPECT -> DEAD or
+         * SUSPECT -> ALIVE — so the FLAP event rides right after
+         * the DEAD or REVIVED for the same entry, with the
+         * lifetime and recent counts frozen on it. A change that
+         * completed no cycle carries -1 and gets none. */
+        if (changed_flap_count[i] >= 0)
+            record_event(PULSE_EVENT_FLAP, changed_ids[i],
+                         changed_inc[i]);
     }
     if (refute) {
         log_line("REFUTE %s inc=%u", g_self_id, g_incarnation);
@@ -1644,17 +1721,33 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
     /* 3. Sweep stale suspects to dead. */
     char newly_dead[8][PULSE_ID_LEN];
     uint32_t newly_dead_inc[8];
+    /* Whether the sweep completed a flap cycle for each newly
+     * dead peer (0.79.0): the lifetime flap count after the
+     * mark, or -1 when the death completed no cycle — a peer
+     * that died without ever being suspected on this node has
+     * no cycle to complete, so the FLAP event rides only after
+     * the DEAD events that did. */
+    int64_t newly_dead_flap[8];
     int n_dead = 0;
     for (int i = 0; i < g_table.count; i++) {
         member_t *m = &g_table.members[i];
         if (m->state == MEMBER_SUSPECT &&
             now - m->state_since_ms >= g_cfg.suspect_timeout_ms) {
             int64_t duration = now - m->state_since_ms;
+            /* Snapshot the lifetime flap count before the mark
+             * (0.79.0): the SUSPECT -> DEAD leg completes a flap
+             * cycle the suspicion started from ALIVE on this
+             * node, and the count moving is the witness. */
+            int64_t flaps_before = m->flap_count;
             if (member_mark_dead(&g_table, m->id, now)) {
                 metrics_note_dead(&g_metrics, duration);
                 if (n_dead < 8) {
                     snprintf(newly_dead[n_dead], PULSE_ID_LEN, "%s", m->id);
                     newly_dead_inc[n_dead] = m->incarnation;
+                    newly_dead_flap[n_dead] =
+                        (m->flap_count > flaps_before)
+                            ? m->flap_count
+                            : -1;
                     n_dead++;
                 }
             }
@@ -2073,6 +2166,14 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
     for (int i = 0; i < n_dead; i++) {
         log_line("DEAD %s", newly_dead[i]);
         record_event(PULSE_EVENT_DEAD, newly_dead[i], newly_dead_inc[i]);
+        /* A flap event on the WATCH stream (0.79.0): the
+         * SUSPECT -> DEAD leg completes a flap cycle, so the
+         * FLAP event rides right after the DEAD, with the
+         * lifetime and recent counts frozen on it — a death
+         * that completed no cycle gets none. */
+        if (newly_dead_flap[i] >= 0)
+            record_event(PULSE_EVENT_FLAP, newly_dead[i],
+                         newly_dead_inc[i]);
     }
     /* Quiet-peer warning (0.62.0): the QUIET line says how quiet
      * the peer was when the threshold was crossed, and the QUIET

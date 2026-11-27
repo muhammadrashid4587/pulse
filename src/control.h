@@ -439,7 +439,7 @@
  *       SNAPSHOT line per member — id, incarnation, state,
  *       last-seen-ms (or '-') and source, the PEERS shape — then
  *       END, then one EVENT line per membership event as it happens:
- *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE|RATEOK|QUIETOK|SLOW|SLOWOK|FLAPRATE|FLAPOK>
+ *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE|RATEOK|QUIETOK|SLOW|SLOWOK|FLAPRATE|FLAPOK|FLAP>
  *       <id> <incarnation> <unix-seconds>. JOINED is a peer
  *       appearing in the table, SUSPECTED is ALIVE -> SUSPECT, DEAD
  *       is SUSPECT -> DEAD, REVIVED is a SUSPECT/DEAD peer coming
@@ -473,7 +473,13 @@
  *       an ALIVE peer whose flap count in the last 10 minutes
  *       fell back below the flap-rate threshold after a FLAPRATE
  *       episode — the peer is still alive, it has stopped
- *       flapping fast enough to warn about.
+ *       flapping fast enough to warn about — and FLAP (0.79.0)
+ *       is a member completing one flap cycle, ALIVE -> SUSPECT
+ *       -> ALIVE or ALIVE -> SUSPECT -> DEAD — the cycle is
+ *       over, and the event rides right after the REVIVED or
+ *       DEAD event for the same transition, carrying how many
+ *       flap cycles the peer has completed in total and how
+ *       many fall inside the last 10 minutes.
  *       The connection
  *       stays open until the client closes it (or falls too far
  *       behind: the event log is a bounded ring, so a slow consumer
@@ -545,7 +551,15 @@
  *       same trailing field — the count when it fell back below
  *       the threshold, frozen at the event so a replay still
  *       shows how far the count had fallen — and no other event
- *       carries one. An event with
+ *       carries one. A FLAP event carries trailing
+ *       " flaps_10m=<n> flap_count=<n>" (0.79.0) — how many of
+ *       the peer's flap cycles fall inside the recent window and
+ *       how many it has completed in total when the cycle
+ *       completed, the same values JSON reports as "flaps_10m"
+ *       and "flap_count", frozen at the event so a replay still
+ *       shows which flap this was — after the mean probe RTT
+ *       when it is present; no other event carries the lifetime
+ *       field. An event with
  *       no trailing field writes the plain five fields, so
  *       existing consumers see byte-identical lines.
  *       A filter (0.30.0) narrows the stream server-side: an
@@ -572,7 +586,12 @@
  *       SUSPECTED on SUSPECT, DEAD on DEAD, and DROPPED lands on
  *       no state — the member left the table — so it never
  *       matches a state filter; a watcher that wants removals
- *       subscribes to the DROPPED type instead. The state filter
+ *       subscribes to the DROPPED type instead. FLAP (0.79.0)
+ *       lands on no state either: a flap completes at the same
+ *       transition as a REVIVED or DEAD event, which already
+ *       carry the landing state, so the state filter sees the
+ *       outcome through those — a watcher that wants flap
+ *       completions subscribes to the FLAP type instead. The state filter
  *       narrows the snapshot too, by the member's current state,
  *       and composes with the type/id filters and FROM, in any
  *       order. A second STATE is refused, like a second FROM,

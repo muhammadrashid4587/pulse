@@ -2877,7 +2877,14 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
              * was flapping — after the mean probe RTT when it is
              * present; a FLAPOK event carries the same field
              * with the count when it fell back below the
-             * threshold; no other event carries one. */
+             * threshold; no other event carries one. Flap count
+             * (0.79.0): a FLAP event carries how many flap
+             * cycles the peer has completed in total when the
+             * cycle completed, as a trailing " flap_count=<n>"
+             * — the same value JSON reports as "flap_count",
+             * frozen at the event so a replay still shows which
+             * flap this was — after the flaps_10m field when it
+             * is present; no other event carries one. */
             size_t used = (size_t)snprintf(
                 line, sizeof line, "EVENT %llu %s %s %u %lld",
                 (unsigned long long)ev.seq,
@@ -2922,6 +2929,12 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
                 snprintf(line + used, sizeof line - used,
                          " flaps_10m=%lld",
                          (long long)ev.flaps_10m);
+                used = strlen(line);
+            }
+            if (ev.flap_count >= 0) {
+                snprintf(line + used, sizeof line - used,
+                         " flap_count=%lld",
+                         (long long)ev.flap_count);
                 used = strlen(line);
             }
             if (used < sizeof line - 1) {

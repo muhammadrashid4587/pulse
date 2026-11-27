@@ -109,6 +109,7 @@ test: pulse-node pulse-ctl test_member test_phi test_secret test_ipv6 test_gossi
 	bash tests/test_flap_counter.sh
 	bash tests/test_flaprate.sh
 	bash tests/test_flapok.sh
+	bash tests/test_flap_event.sh
 	bash tests/test_quiet_peer.sh
 	bash tests/test_quietok.sh
 	bash tests/test_low_probe_rate.sh

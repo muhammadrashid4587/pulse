@@ -744,7 +744,7 @@ static void test_event_log(void) {
      * continues the sequence instead of restarting at 1. */
     const char *ev_path = "/tmp/pulse-event-log-test.txt";
     pulse_event_log_t saved;
-    pulse_event_log_init(&saved, 13);
+    pulse_event_log_init(&saved, 14);
     pulse_event_record(&saved, PULSE_EVENT_JOINED, "127.0.0.1:17904", 1,
                        1700000300);
     pulse_event_record(&saved, PULSE_EVENT_SUSPECTED, "127.0.0.1:17904",
@@ -846,13 +846,22 @@ static void test_event_log(void) {
     pulse_event_record_flap_rate(&saved, PULSE_EVENT_FLAPOK,
                                  "127.0.0.1:17904", 1, 1700000312, -1,
                                  4, 61, 58, -1, -1, -1, 2);
-    CHECK(pulse_event_log_save(&saved, ev_path) == 13);
+    /* Flap completion (0.79.0): a FLAP event recorded with the
+     * lifetime count at the completion — the third flap in
+     * total, 2 of them inside the recent window — and the probe
+     * counts at the completion, 71 sent and 68 answered,
+     * round-trips with all of it, so a restart restores which
+     * flap this was, not just that one happened. */
+    pulse_event_record_flap_count(&saved, PULSE_EVENT_FLAP,
+                                  "127.0.0.1:17904", 1, 1700000313, -1,
+                                  5, 71, 68, -1, -1, -1, 2, 3);
+    CHECK(pulse_event_log_save(&saved, ev_path) == 14);
     pulse_event_log_free(&saved);
 
     pulse_event_log_t restored;
-    pulse_event_log_init(&restored, 13);
-    CHECK(pulse_event_log_load(&restored, ev_path) == 13);
-    CHECK(pulse_event_latest_seq(&restored) == 13);
+    pulse_event_log_init(&restored, 14);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 14);
+    CHECK(pulse_event_latest_seq(&restored) == 14);
     CHECK(pulse_event_oldest_seq(&restored) == 1);
     CHECK(pulse_event_wait(&restored, 0, &ev, 20) == 1);
     CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
@@ -1003,10 +1012,31 @@ static void test_event_log(void) {
     CHECK(ev.probe_rate == -1);
     CHECK(ev.phi == -1);
     CHECK(ev.suspect_ms == -1);
+    /* A FLAP event carries no lifetime count before 0.79.0, so
+     * the FLAPOK above loads with none (0.79.0): the two flap
+     * fields are independent. */
+    CHECK(ev.flap_count == -1);
+    /* The FLAP event recorded after it comes back with the
+     * lifetime count at the completion and the recent count
+     * (0.79.0): the restart restores which flap this was, not
+     * just that one happened. */
+    CHECK(pulse_event_wait(&restored, 13, &ev, 20) == 1);
+    CHECK(ev.seq == 14 && ev.type == PULSE_EVENT_FLAP &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000313);
+    CHECK(ev.last_seen_ms == 5);
+    CHECK(ev.probes_sent == 71);
+    CHECK(ev.probes_answered == 68);
+    CHECK(ev.flaps_10m == 2);
+    CHECK(ev.flap_count == 3);
+    CHECK(ev.rtt_mean_ms == -1);
+    CHECK(ev.probe_rate == -1);
+    CHECK(ev.phi == -1);
+    CHECK(ev.suspect_ms == -1);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
-                       2, 1700000313);
-    CHECK(pulse_event_latest_seq(&restored) == 14);
+                       2, 1700000314);
+    CHECK(pulse_event_latest_seq(&restored) == 15);
     pulse_event_log_free(&restored);
 
     /* The QUIET word (0.62.0) parses back to the QUIET type, so a
@@ -1105,10 +1135,24 @@ static void test_event_log(void) {
     CHECK(pulse_event_result_state(PULSE_EVENT_FLAPOK, &k2state) == 1);
     CHECK(k2state == MEMBER_ALIVE);
 
+    /* The FLAP word (0.79.0) parses back to the FLAP type, so a
+     * WATCH filter can subscribe to it by name, and it lands on
+     * no state for the state filter — a flap completes at the
+     * same transition as a REVIVED or DEAD event, which already
+     * carry the landing state, so the state filter sees the
+     * outcome through those. */
+    pulse_event_type_t fltype;
+    CHECK(pulse_event_type_parse("FLAP", &fltype) == 0);
+    CHECK(fltype == PULSE_EVENT_FLAP);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_FLAP), "FLAP") == 0);
+    member_state_t flstate;
+    CHECK(pulse_event_result_state(PULSE_EVENT_FLAP, &flstate) == 0);
+
     /* A missing file loads zero events, and a malformed line is
      * skipped while the good lines around it still load. */
-    /* Ten events load into a cap-10 ring (0.76.0), so all of them
-     * survive, including the plain pre-0.60.0 DEAD line. */
+    /* Eleven events load into a cap-10 ring (0.79.0), so the
+     * oldest one scrolls out — seq 7 is gone, seqs 8-17 survive
+     * — including the plain pre-0.60.0 DEAD line. */
     pulse_event_log_init(&restored, 10);
     CHECK(pulse_event_log_load(&restored,
                                "/tmp/pulse-event-log-no-such-file.txt") == 0);
@@ -1165,11 +1209,18 @@ static void test_event_log(void) {
                 "16 FLAPRATE 127.0.0.1:17905 2 1700000409 "
                 "last_seen_ms=3 probes_sent=51 probes_answered=44 "
                 "flaps_10m=5\n");
+        /* A FLAP event line (0.79.0) loads as FLAP with its
+         * lifetime and recent flap counts and probe counts and
+         * no phi. */
+        fprintf(mf,
+                "17 FLAP 127.0.0.1:17905 2 1700000410 "
+                "last_seen_ms=5 probes_sent=71 probes_answered=68 "
+                "flaps_10m=2 flap_count=3\n");
         fclose(mf);
     }
-    CHECK(pulse_event_log_load(&restored, ev_path) == 10);
-    CHECK(pulse_event_latest_seq(&restored) == 16);
-    CHECK(pulse_event_oldest_seq(&restored) == 7);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 11);
+    CHECK(pulse_event_latest_seq(&restored) == 17);
+    CHECK(pulse_event_oldest_seq(&restored) == 8);
     CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
     CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_DEAD);
     /* A line without the trailing phi field — the pre-0.60.0
@@ -1244,6 +1295,22 @@ static void test_event_log(void) {
     CHECK(ev.probes_sent == 51);
     CHECK(ev.probes_answered == 44);
     CHECK(ev.flaps_10m == 5);
+    CHECK(ev.rtt_mean_ms == -1);
+    /* A FLAPRATE event carries no lifetime count (0.79.0): only
+     * a FLAP event does. */
+    CHECK(ev.flap_count == -1);
+    /* The FLAP event recorded after it comes back with the
+     * lifetime and recent counts at the completion and the probe
+     * counts (0.79.0): the completion survives the load with
+     * which flap it was. */
+    CHECK(pulse_event_wait(&restored, 16, &ev, 20) == 1);
+    CHECK(ev.seq == 17 && ev.type == PULSE_EVENT_FLAP &&
+          ev.last_seen_ms == 5);
+    CHECK(ev.phi == -1);
+    CHECK(ev.probes_sent == 71);
+    CHECK(ev.probes_answered == 68);
+    CHECK(ev.flaps_10m == 2);
+    CHECK(ev.flap_count == 3);
     CHECK(ev.rtt_mean_ms == -1);
     pulse_event_log_free(&restored);
     unlink(ev_path);
