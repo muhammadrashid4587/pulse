@@ -125,7 +125,7 @@ fi
 # the snapshot already covers that pre-existing state.)
 (cd "$TMP/n3" && exec "$BIN" --port 17823 --seed 127.0.0.1:17821 --control-port 18823 --dead-retention 120 > "$TMP/n3.log" 2>&1 & echo $! > "$TMP/n3.pid")
 if wait_for "$TMP/n1.log" "STATUS alive=3" 10 \
-   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17823 1 [0-9]+$' 10; then
+   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17823 1 [0-9]+ last_seen_ms=[0-9]+$' 10; then
     note ok "WATCH streams JOINED when node 3 joins"
 else
     note fail "WATCH streams JOINED when node 3 joins"
@@ -138,14 +138,14 @@ fi
 # before the resume, node 3 hears itself DEAD and refutes, bumping
 # its incarnation to 2 — still a SUSPECTED/REVIVED pair.
 kill -STOP "$(cat "$TMP/n3.pid")"
-if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17823 [0-9]+ [0-9]+$' 10; then
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17823 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
     note ok "WATCH streams SUSPECTED when node 3 stops answering"
 else
     note fail "WATCH streams SUSPECTED when node 3 stops answering"
     echo "--- watch1.out"; cat "$TMP/watch1.out"
 fi
 kill -CONT "$(cat "$TMP/n3.pid")"
-if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ REVIVED 127\.0\.0\.1:17823 [0-9]+ [0-9]+$' 10; then
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ REVIVED 127\.0\.0\.1:17823 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
     note ok "WATCH streams REVIVED when node 3 answers again"
 else
     note fail "WATCH streams REVIVED when node 3 answers again"
@@ -155,7 +155,7 @@ fi
 # 4. Kill node 3: the stream carries DEAD for it.
 kill -9 "$(cat "$TMP/n3.pid")"
 if wait_for "$TMP/n1.log" "DEAD 127.0.0.1:17823" 10 \
-   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ DEAD 127\.0\.0\.1:17823 [0-9]+ [0-9]+$' 10; then
+   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ DEAD 127\.0\.0\.1:17823 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
     note ok "WATCH streams DEAD when node 3 is killed"
 else
     note fail "WATCH streams DEAD when node 3 is killed"

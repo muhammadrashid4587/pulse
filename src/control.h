@@ -352,6 +352,21 @@
  *       sequence number. WATCH runs on its own thread, so other
  *       control-plane commands keep answering while a client
  *       watches. No watch hooks: ERR watch not supported.
+ *       A SUSPECTED event this node raised in phi-accrual mode
+ *       carries a trailing " phi=<value>" (0.60.0) — the phi that
+ *       crossed the threshold, two decimals. An event whose member
+ *       was heard from carries a trailing " last_seen_ms=<ms>"
+ *       (0.61.0) — the ms since this node last heard from the
+ *       member when the event was recorded, the same value JSON
+ *       reports as "last_seen_ms", frozen at the event so a
+ *       replay still shows how quiet the peer was when the
+ *       transition happened — after the phi field when both are
+ *       present. Self, a member never heard from, and a member
+ *       already gone from the table when the event was recorded
+ *       carry no field: an absent value, never a fabricated
+ *       zero. An event with neither trailing field writes the
+ *       plain five fields, so existing consumers see
+ *       byte-identical lines.
  *       A filter (0.30.0) narrows the stream server-side: an
  *       optional type list, an id list, or both, in any order —
  *       "WATCH JOINED,DEAD" (only those event types),

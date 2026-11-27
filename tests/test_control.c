@@ -538,8 +538,11 @@ static void test_event_log(void) {
           strcmp(ev.id, "127.0.0.1:17901") == 0 &&
           ev.incarnation == 1 && ev.unix_ts == 1700000000);
     /* A plain record carries no phi (0.60.0): only a phi-mode
-     * threshold crossing does. */
+     * threshold crossing does. It carries no last-contact age
+     * either (0.61.0): only an event recorded by the node for a
+     * member it heard from does. */
     CHECK(ev.phi == -1);
+    CHECK(ev.last_seen_ms == -1);
     CHECK(pulse_event_wait(&log, 1, &ev, 20) == 1);
     CHECK(ev.seq == 2 && ev.type == PULSE_EVENT_SUSPECTED);
     CHECK(pulse_event_wait(&log, 2, &ev, 20) == 1);
@@ -613,9 +616,14 @@ static void test_event_log(void) {
     /* Phi at threshold crossing (0.60.0): a SUSPECTED event
      * recorded with a phi round-trips through the file with it,
      * so a restart restores the crossing value, not just the
-     * suspicion. */
-    pulse_event_record_phi(&saved, PULSE_EVENT_SUSPECTED,
-                           "127.0.0.1:17904", 1, 1700000303, 8.42);
+     * suspicion. Last-contact age (0.61.0): the same event
+     * recorded with an age — 512 ms since the node last heard
+     * from the member when it was suspected — round-trips with
+     * it too, so a restart restores how quiet the peer was when
+     * the transition happened. */
+    pulse_event_record_full(&saved, PULSE_EVENT_SUSPECTED,
+                            "127.0.0.1:17904", 1, 1700000303, 8.42,
+                            512);
     CHECK(pulse_event_log_save(&saved, ev_path) == 4);
     pulse_event_log_free(&saved);
 
@@ -635,6 +643,9 @@ static void test_event_log(void) {
     CHECK(pulse_event_wait(&restored, 3, &ev, 20) == 1);
     CHECK(ev.seq == 4 && ev.type == PULSE_EVENT_SUSPECTED &&
           ev.phi == 8.42);
+    /* The last-contact age recorded with the crossing comes back
+     * with it (0.61.0). */
+    CHECK(ev.last_seen_ms == 512);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
                        2, 1700000304);
@@ -653,10 +664,16 @@ static void test_event_log(void) {
         fprintf(mf, "not an event line\n");
         fprintf(mf, "7 REVIVED 127.0.0.1:17905 2 1700000400\n");
         fprintf(mf, "8 DEAD 127.0.0.1:17905 2 1700000401\n");
+        /* An event with only a last-contact age — no phi — loads
+         * with the age and phi -1 (0.61.0): the two trailing
+         * fields are independent. */
+        fprintf(mf,
+                "9 JOINED 127.0.0.1:17905 2 1700000402 "
+                "last_seen_ms=437\n");
         fclose(mf);
     }
-    CHECK(pulse_event_log_load(&restored, ev_path) == 2);
-    CHECK(pulse_event_latest_seq(&restored) == 8);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 3);
+    CHECK(pulse_event_latest_seq(&restored) == 9);
     CHECK(pulse_event_oldest_seq(&restored) == 7);
     CHECK(pulse_event_wait(&restored, 6, &ev, 20) == 1);
     CHECK(ev.seq == 7 && ev.type == PULSE_EVENT_REVIVED &&
@@ -664,8 +681,16 @@ static void test_event_log(void) {
     /* A line without the trailing phi field — the pre-0.60.0
      * format — loads with phi -1, so an old log still loads. */
     CHECK(ev.phi == -1);
+    /* ...and without a last_seen_ms field either — the
+     * pre-0.61.0 format — it loads with last_seen_ms -1. */
+    CHECK(ev.last_seen_ms == -1);
     CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
     CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_DEAD);
+    CHECK(ev.phi == -1);
+    CHECK(ev.last_seen_ms == -1);
+    CHECK(pulse_event_wait(&restored, 8, &ev, 20) == 1);
+    CHECK(ev.seq == 9 && ev.type == PULSE_EVENT_JOINED &&
+          ev.last_seen_ms == 437);
     CHECK(ev.phi == -1);
     pulse_event_log_free(&restored);
     unlink(ev_path);

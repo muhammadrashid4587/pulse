@@ -366,26 +366,50 @@ static void peer_set_known_version(const char *id, uint64_t version) {
 static void record_event_phi(pulse_event_type_t type, const char *id,
                              uint32_t incarnation, double phi) {
     int64_t ts = (int64_t)time(NULL);
-    uint64_t seq = pulse_event_record_phi(&g_event_log, type, id,
-                                          incarnation, ts, phi);
+    /* Last-contact age in the event log (0.61.0): the ms since
+     * this node last heard from the member, measured now — at
+     * record time, not at replay time — so a replayed SUSPECTED
+     * event still shows how quiet the peer was when it was
+     * suspected, and a DEAD event shows a larger age than the
+     * SUSPECTED event before it. Self has no age (its last_seen
+     * is just startup time, so the age would be uptime) and a
+     * member never heard from, or already gone from the table
+     * when the event is recorded (a GC'd DROPPED, a LEAVE), has
+     * none either: -1, never a fabricated zero. Every record
+     * site runs after the table lock is released, so taking it
+     * briefly here cannot deadlock. */
+    int64_t last_seen_age = -1;
+    if (strcmp(id, g_self_id) != 0) {
+        int64_t now = pulse_now_ms();
+        pthread_mutex_lock(&g_lock);
+        member_t *m = member_find(&g_table, id);
+        if (m) last_seen_age = member_last_seen_age_ms(m, now);
+        pthread_mutex_unlock(&g_lock);
+    }
+    uint64_t seq = pulse_event_record_full(&g_event_log, type, id,
+                                           incarnation, ts, phi,
+                                           last_seen_age);
     if (g_events_path[0] == '\0') return;
     pthread_mutex_lock(&g_events_file_lock);
     FILE *f = fopen(g_events_path, "a");
     if (f) {
         /* The persisted line mirrors the ring (0.38.0): a phi-mode
          * SUSPECTED event (0.60.0) carries its phi at the crossing
-         * as a trailing " phi=<value>", so the value survives a
-         * restart and a replay exactly as the WATCH stream shows
-         * it; every other event writes the plain five fields. */
-        if (phi >= 0)
-            fprintf(f, "%llu %s %s %u %lld phi=%.2f\n",
-                    (unsigned long long)seq,
-                    pulse_event_type_name(type), id, incarnation,
-                    (long long)ts, phi);
-        else
-            fprintf(f, "%llu %s %s %u %lld\n", (unsigned long long)seq,
-                    pulse_event_type_name(type), id, incarnation,
-                    (long long)ts);
+         * as a trailing " phi=<value>", and an event whose member
+         * was heard from (0.61.0) carries its last-contact age as
+         * a trailing " last_seen_ms=<ms>", after the phi when both
+         * are present — so both values survive a restart and a
+         * replay exactly as the WATCH stream shows them; an event
+         * with neither writes the plain five fields. */
+        fprintf(f, "%llu %s %s %u %lld",
+                (unsigned long long)seq,
+                pulse_event_type_name(type), id, incarnation,
+                (long long)ts);
+        if (phi >= 0) fprintf(f, " phi=%.2f", phi);
+        if (last_seen_age >= 0)
+            fprintf(f, " last_seen_ms=%lld",
+                    (long long)last_seen_age);
+        fputc('\n', f);
         fclose(f);
     }
     pthread_mutex_unlock(&g_events_file_lock);

@@ -69,6 +69,22 @@ typedef struct {
      * line, and the persisted log carries the same trailing field,
      * so the crossing survives a restart and a replay. */
     double phi;
+    /* Last-contact age at record time (0.61.0): the ms since this
+     * node last heard from the member when the event was recorded
+     * — the same value JSON reports as "last_seen_ms" and METRICS
+     * as a LASTSEEN line, frozen at the event instead of recomputed
+     * at replay time, so a replayed SUSPECTED event still shows
+     * how quiet the peer was when it was suspected, and a DEAD
+     * event shows a larger age than the SUSPECTED event before
+     * it. -1 when the member was never heard from (last_seen_ms
+     * 0), for self (its last_seen is just startup time, so the
+     * age would be uptime), or when the member had already left
+     * the table when the event was recorded: an absent value,
+     * never a fabricated zero. A WATCH consumer reads it as a
+     * trailing " last_seen_ms=<ms>" on the EVENT line, after the
+     * phi field when both are present, and the persisted log
+     * carries the same trailing field. */
+    int64_t last_seen_ms;
 } pulse_event_t;
 
 typedef struct {
@@ -112,23 +128,39 @@ int pulse_event_result_state(pulse_event_type_t type, member_state_t *out);
  * any waiter. Thread-safe; never blocks. Returns the sequence
  * number assigned, so the caller can append the same event to the
  * persisted log (0.38.0). The phi is -1: no phi was measured for
- * this event. */
+ * this event. The last-contact age is -1: the member was never
+ * heard from, is self, or had already left the table. */
 uint64_t pulse_event_record(pulse_event_log_t *log, pulse_event_type_t type,
                             const char *id, uint32_t incarnation,
                             int64_t unix_ts);
 
 /* The same, carrying the phi at a threshold crossing (0.60.0):
  * the caller passes the phi the probe cycle measured when it
- * suspected the peer, or -1 when no phi was measured. */
+ * suspected the peer, or -1 when no phi was measured. The
+ * last-contact age is -1, as in pulse_event_record. */
 uint64_t pulse_event_record_phi(pulse_event_log_t *log,
                                 pulse_event_type_t type, const char *id,
                                 uint32_t incarnation, int64_t unix_ts,
                                 double phi);
 
+/* The same, carrying both the phi at a threshold crossing and the
+ * last-contact age at record time (0.61.0): the caller passes the
+ * ms since this node last heard from the member when the event was
+ * recorded, or -1 when the member was never heard from, is self,
+ * or had already left the table. The age is frozen at the event:
+ * a replayed event shows how quiet the peer was when the
+ * transition happened, not how quiet it is now. */
+uint64_t pulse_event_record_full(pulse_event_log_t *log,
+                                 pulse_event_type_t type, const char *id,
+                                 uint32_t incarnation, int64_t unix_ts,
+                                 double phi, int64_t last_seen_ms);
+
 /* Write every event the ring currently holds, in sequence order,
  * to path (one "<seq> <TYPE> <id> <incarnation> <unix_ts>" line per
  * event, with a trailing " phi=<value>" on a phi-mode SUSPECTED
- * event — 0.60.0), atomically via a tmp file + rename, so a crash
+ * event — 0.60.0 — and a trailing " last_seen_ms=<ms>" on an event
+ * whose member was heard from — 0.61.0, after the phi field when
+ * both are present), atomically via a tmp file + rename, so a crash
  * mid-write never leaves a half-written file. Returns the number
  * of events written, or -1 if the file could not be written. Used
  * to compact the persisted log on startup and on clean shutdown
@@ -144,7 +176,11 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path);
  * file exists but could not be read at all. Malformed lines are
  * skipped, never fatal (0.38.0). A line without the trailing
  * " phi=<value>" — written before 0.60.0, or any event with no phi
- * measured — loads with phi -1, so an old log still loads. */
+ * measured — loads with phi -1, so an old log still loads, and a
+ * line without the trailing " last_seen_ms=<ms>" — written before
+ * 0.61.0, or any event whose member was never heard from — loads
+ * with last_seen_ms -1; the two trailing fields are parsed
+ * independently, so either may be present without the other. */
 int pulse_event_log_load(pulse_event_log_t *log, const char *path);
 
 /* The latest sequence number recorded so far (0 when the log is

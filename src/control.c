@@ -2230,21 +2230,38 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
              * " phi=<value>" — two decimals, the same value the
              * "SUSPECT ... phi=" log line printed — so a watcher
              * sees why the suspicion fired without polling
-             * METRICS for a phi that has already moved on. Every
-             * other event writes the plain five fields, so
-             * existing consumers see byte-identical lines. */
-            if (ev.phi >= 0)
-                snprintf(line, sizeof line,
-                         "EVENT %llu %s %s %u %lld phi=%.2f\n",
-                         (unsigned long long)ev.seq,
-                         pulse_event_type_name(ev.type), ev.id,
-                         ev.incarnation, (long long)ev.unix_ts,
-                         ev.phi);
-            else
-                snprintf(line, sizeof line, "EVENT %llu %s %s %u %lld\n",
-                         (unsigned long long)ev.seq,
-                         pulse_event_type_name(ev.type), ev.id,
-                         ev.incarnation, (long long)ev.unix_ts);
+             * METRICS for a phi that has already moved on.
+             * Last-contact age (0.61.0): an event whose member was
+             * heard from carries the ms since this node last
+             * heard from it when the event was recorded, as a
+             * trailing " last_seen_ms=<ms>" — the same value
+             * JSON reports as "last_seen_ms", frozen at the
+             * event so a replay still shows how quiet the peer
+             * was when the transition happened, and a DEAD event
+             * shows a larger age than the SUSPECTED event before
+             * it — after the phi field when both are present. An
+             * event with neither writes the plain five fields,
+             * so existing consumers see byte-identical lines. */
+            size_t used = (size_t)snprintf(
+                line, sizeof line, "EVENT %llu %s %s %u %lld",
+                (unsigned long long)ev.seq,
+                pulse_event_type_name(ev.type), ev.id,
+                ev.incarnation, (long long)ev.unix_ts);
+            if (ev.phi >= 0) {
+                snprintf(line + used, sizeof line - used,
+                         " phi=%.2f", ev.phi);
+                used = strlen(line);
+            }
+            if (ev.last_seen_ms >= 0) {
+                snprintf(line + used, sizeof line - used,
+                         " last_seen_ms=%lld",
+                         (long long)ev.last_seen_ms);
+                used = strlen(line);
+            }
+            if (used < sizeof line - 1) {
+                line[used++] = '\n';
+                line[used] = '\0';
+            }
             if (send_all(fd, line) != 0) break;
             watch_stream_add(slot, 1, 0, 0);
             last_sent_ms = pulse_now_ms();

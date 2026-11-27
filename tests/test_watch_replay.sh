@@ -101,7 +101,7 @@ fi
 # JOINED for it. Then it is killed: SUSPECTED, then DEAD.
 (cd "$TMP/n3" && exec "$BIN" --port 17843 --seed 127.0.0.1:17841 --control-port 18843 --dead-retention 120 > "$TMP/n3.log" 2>&1 & echo $! > "$TMP/n3.pid")
 if wait_for "$TMP/n1.log" "STATUS alive=3" 10 \
-   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17843 1 [0-9]+$' 10; then
+   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17843 1 [0-9]+ last_seen_ms=[0-9]+$' 10; then
     note ok "live WATCH streams JOINED when node 3 joins"
 else
     note fail "live WATCH streams JOINED when node 3 joins"
@@ -109,8 +109,8 @@ else
 fi
 kill -9 "$(cat "$TMP/n3.pid")"
 if wait_for "$TMP/n1.log" "DEAD 127.0.0.1:17843" 10 \
-   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17843 [0-9]+ [0-9]+$' 10 \
-   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ DEAD 127\.0\.0\.1:17843 [0-9]+ [0-9]+$' 10; then
+   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17843 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10 \
+   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ DEAD 127\.0\.0\.1:17843 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
     note ok "live WATCH streams SUSPECTED then DEAD when node 3 is killed"
 else
     note fail "live WATCH streams SUSPECTED then DEAD when node 3 is killed"
@@ -128,9 +128,9 @@ DEAD_SEQ="$(grep '^EVENT .* DEAD 127\.0\.0\.1:17843 ' "$TMP/watch1.out" | head -
 # sequence numbers — and no GAP line, since nothing was evicted.
 (timeout 60 stdbuf -o0 -e0 "$CTL" "127.0.0.1:18841" WATCH FROM "$JOIN_SEQ" > "$TMP/watch2.out" 2>&1 & echo $! > "$TMP/watch2.pid")
 if wait_for "$TMP/watch2.out" "^END$" 10 \
-   && wait_for "$TMP/watch2.out" "^EVENT $JOIN_SEQ JOINED 127\\.0\\.0\\.1:17843 1 [0-9]+$" 10 \
-   && wait_for "$TMP/watch2.out" "^EVENT $SUSPECT_SEQ SUSPECTED 127\\.0\\.0\\.1:17843 [0-9]+ [0-9]+$" 10 \
-   && wait_for "$TMP/watch2.out" "^EVENT $DEAD_SEQ DEAD 127\\.0\\.0\\.1:17843 [0-9]+ [0-9]+$" 10; then
+   && wait_for "$TMP/watch2.out" "^EVENT $JOIN_SEQ JOINED 127\\.0\\.0\\.1:17843 1 [0-9]+ last_seen_ms=[0-9]+$" 10 \
+   && wait_for "$TMP/watch2.out" "^EVENT $SUSPECT_SEQ SUSPECTED 127\\.0\\.0\\.1:17843 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$" 10 \
+   && wait_for "$TMP/watch2.out" "^EVENT $DEAD_SEQ DEAD 127\\.0\\.0\\.1:17843 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$" 10; then
     note ok "WATCH FROM <join-seq> replays JOINED, SUSPECTED, DEAD with the same sequence numbers"
 else
     note fail "WATCH FROM <join-seq> replays JOINED, SUSPECTED, DEAD with the same sequence numbers"
@@ -149,7 +149,7 @@ fi
 # after the replay.
 (cd "$TMP/n3" && exec "$BIN" --port 17843 --seed 127.0.0.1:17841 --control-port 18843 --dead-retention 120 > "$TMP/n3.log" 2>&1 & echo $! > "$TMP/n3.pid")
 if wait_for "$TMP/n1.log" "STATUS alive=3" 10 \
-   && wait_for "$TMP/watch2.out" '^EVENT [0-9]+ REVIVED 127\.0\.0\.1:17843 [0-9]+ [0-9]+$' 10; then
+   && wait_for "$TMP/watch2.out" '^EVENT [0-9]+ REVIVED 127\.0\.0\.1:17843 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
     note ok "resumed WATCH streams REVIVED live after the replay"
 else
     note fail "resumed WATCH streams REVIVED live after the replay"
@@ -168,7 +168,7 @@ fi
 # carries the JOINED for node 3 too.
 (timeout 60 stdbuf -o0 -e0 "$CTL" "127.0.0.1:18841" WATCH FROM 0 > "$TMP/watch3.out" 2>&1 & echo $! > "$TMP/watch3.pid")
 if wait_for "$TMP/watch3.out" "^END$" 10 \
-   && wait_for "$TMP/watch3.out" "^EVENT $JOIN_SEQ JOINED 127\\.0\\.0\\.1:17843 1 [0-9]+$" 10; then
+   && wait_for "$TMP/watch3.out" "^EVENT $JOIN_SEQ JOINED 127\\.0\\.0\\.1:17843 1 [0-9]+ last_seen_ms=[0-9]+$" 10; then
     note ok "WATCH FROM 0 replays from the oldest buffered event"
 else
     note fail "WATCH FROM 0 replays from the oldest buffered event"

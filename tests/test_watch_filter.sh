@@ -132,7 +132,7 @@ fi
 # JOINED for it, the second carries nothing.
 (cd "$TMP/n3" && exec "$BIN" --port 17833 --seed 127.0.0.1:17831 --control-port 18833 --dead-retention 120 > "$TMP/n3.log" 2>&1 & echo $! > "$TMP/n3.pid")
 if wait_for "$TMP/n1.log" "STATUS alive=3" 10 \
-   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17833 1 [0-9]+$' 10; then
+   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17833 1 [0-9]+ last_seen_ms=[0-9]+$' 10; then
     note ok "filtered WATCH streams JOINED when the filtered peer joins"
 else
     note fail "filtered WATCH streams JOINED when the filtered peer joins"
@@ -194,7 +194,7 @@ fi
 # still carries nothing.
 kill -9 "$(cat "$TMP/n3.pid")"
 if wait_for "$TMP/n1.log" "DEAD 127.0.0.1:17833" 10 \
-   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ DEAD 127\.0\.0\.1:17833 [0-9]+ [0-9]+$' 10; then
+   && wait_for "$TMP/watch1.out" '^EVENT [0-9]+ DEAD 127\.0\.0\.1:17833 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
     note ok "filtered WATCH streams DEAD when the filtered peer is killed"
 else
     note fail "filtered WATCH streams DEAD when the filtered peer is killed"
