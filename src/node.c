@@ -1449,6 +1449,21 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
     int n_suspect = 0;
     for (int i = 0; i < 8; i++) suspect_phi[i] = -1;
     pthread_mutex_lock(&g_lock);
+    /* Probe-rate history (0.71.0): sample the windowed probe
+     * success rate every probe cycle for ALIVE and SUSPECT peers,
+     * so JSON can show how a peer's rate fell instead of only its
+     * live value — the same cadence phi_history samples at, but
+     * not gated on phi-accrual: the rate exists whether phi mode
+     * is on or not. A DEAD peer's history is frozen at suspicion:
+     * it is gone, its window no longer changes, and sampling it
+     * would only push the interesting fall out of the bounded
+     * ring. */
+    for (int i = 0; i < g_table.count; i++) {
+        member_t *m = &g_table.members[i];
+        if (strcmp(m->id, g_self_id) == 0) continue;
+        if (m->state == MEMBER_ALIVE || m->state == MEMBER_SUSPECT)
+            member_sample_probe_rate(m, now);
+    }
     if (g_cfg.phi_accrual) {
         for (int i = 0; i < g_table.count; i++) {
             member_t *m = &g_table.members[i];

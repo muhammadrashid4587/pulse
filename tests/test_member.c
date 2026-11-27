@@ -443,6 +443,61 @@ int main(void) {
     CHECK(member_probe_rate(NULL) == -1);
     CHECK(member_is_low_probe_rate(NULL, 0.5) == 0);
 
+    /* Probe-rate history (0.71.0): the last 16 sampled windowed
+     * rates as [[age_ms, rate], ...] pairs, oldest first — the
+     * same shape as phi_history. A peer never probed has no rate
+     * to sample, so sampling records nothing; a sample in the
+     * same millisecond as the last one is skipped, so the ring
+     * holds distinct times; and once 16 samples are in, the
+     * oldest slides out, so the ring always holds the most
+     * recent windowed rates. */
+    member_table_t t7;
+    member_table_init(&t7);
+    member_t *m7 = member_add(&t7, "127.0.0.1:17107", &a4, 1);
+    char rhbuf[512];
+    CHECK(member_probe_rate_history_json(m7, now, rhbuf, sizeof rhbuf) == 2);
+    CHECK(strcmp(rhbuf, "[]") == 0);
+    member_sample_probe_rate(m7, now + 100);
+    CHECK(member_probe_rate_history_json(m7, now, rhbuf, sizeof rhbuf) == 2);
+    CHECK(strcmp(rhbuf, "[]") == 0); /* never probed: no rate to sample */
+    /* Four probes, all answered: rate 1.00, sampled at +100. */
+    for (uint32_t s = 1; s <= 4; s++) {
+        member_note_probe_sent(&t7, "127.0.0.1:17107", s);
+        member_note_probe_answered(&t7, "127.0.0.1:17107", s);
+    }
+    member_sample_probe_rate(m7, now + 100);
+    CHECK(m7->probe_rate_hist_count == 1);
+    CHECK(member_probe_rate_history_json(m7, now, rhbuf, sizeof rhbuf) > 2);
+    CHECK(strcmp(rhbuf, "[[100,1.00]]") == 0);
+    /* Same-millisecond sample: skipped, not duplicated. */
+    member_sample_probe_rate(m7, now + 100);
+    CHECK(m7->probe_rate_hist_count == 1);
+    /* A fifth probe, unanswered: 4/5 = 0.80, sampled at +200. */
+    member_note_probe_sent(&t7, "127.0.0.1:17107", 5);
+    member_sample_probe_rate(m7, now + 200);
+    CHECK(m7->probe_rate_hist_count == 2);
+    CHECK(strcmp(rhbuf, "[[100,1.00]]") == 0); /* rhbuf not re-written */
+    CHECK(member_probe_rate_history_json(m7, now, rhbuf, sizeof rhbuf) > 2);
+    CHECK(strcmp(rhbuf, "[[100,1.00],[200,0.80]]") == 0);
+    /* Twenty more samples, one per 100 ms, each at the current
+     * rate (still 0.80 — no new probes): 22 samples in all, so
+     * the ring holds the last 16 — the six earliest (100..600)
+     * slide out and the oldest kept is the one at +700. */
+    for (int k = 0; k < 20; k++)
+        member_sample_probe_rate(m7, now + 300 + k * 100);
+    CHECK(m7->probe_rate_hist_count == 16);
+    CHECK(member_probe_rate_history_json(m7, now, rhbuf, sizeof rhbuf) > 2);
+    CHECK(strstr(rhbuf, "[700,0.80]") == rhbuf + 1); /* oldest first */
+    CHECK(strstr(rhbuf, "[100,1.00]") == NULL);      /* slid out */
+    CHECK(strstr(rhbuf, "[200,0.80]") == NULL);      /* slid out */
+    CHECK(strstr(rhbuf, "[600,0.80]") == NULL);      /* slid out */
+    CHECK(strstr(rhbuf, "[2200,0.80]") != NULL);     /* newest kept */
+    /* A buffer too small for even one pair, and a NULL member,
+     * both fail instead of writing a truncated array. */
+    CHECK(member_probe_rate_history_json(m7, now, rhbuf, 4) == -1);
+    CHECK(member_probe_rate_history_json(NULL, now, rhbuf, sizeof rhbuf) == -1);
+    member_sample_probe_rate(NULL, now + 3000); /* no crash */
+
     /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
     CHECK(member_gossip_fanout(0) == 1);
     CHECK(member_gossip_fanout(1) == 1);

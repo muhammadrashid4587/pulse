@@ -716,7 +716,8 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
  * null otherwise (including self). Latency means are null when there
  * are no samples. Built into a fixed buffer: 64 members at ~120
  * bytes each plus up to ~520 bytes of annotations each plus up to
- * ~360 bytes of phi history each is under 64 KB, so 128 KB has ample
+ * ~360 bytes of phi history each plus up to ~360 bytes of
+ * probe-rate history each is under 64 KB, so 128 KB has ample
  * headroom. */
 static void handle_json(int fd, const control_hooks_t *hooks) {
     member_table_t t;
@@ -858,13 +859,39 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
          * two decimals — null until the first probe to the peer
          * goes out, and always null for self: an absent value,
          * never a fabricated zero. A DEAD member keeps its last
-         * window rate until GC, like its RTT and probe counts. */
+         * window rate until GC, like its RTT and probe counts.
+         * "probe_rate_history" (0.71.0) is the last 16 sampled
+         * windowed rates as [[age_ms, rate], ...] pairs, oldest
+         * first — the same shape as "phi_history" — sampled
+         * once per probe cycle, null for self, "[]" until the
+         * first sample lands, and frozen for a DEAD member
+         * until GC, so a JSON consumer can see the rate fall
+         * over time instead of only its live value. */
         char ratebuf[32];
         double rate = member_probe_rate(mem);
         if (rate < 0)
             snprintf(ratebuf, sizeof ratebuf, "null");
         else
             snprintf(ratebuf, sizeof ratebuf, "%.2f", rate);
+        /* Probe-rate history (0.71.0): the last 16 sampled
+         * windowed probe success rates as [[age_ms, rate], ...]
+         * pairs, oldest first — the same shape as phi_history,
+         * so a JSON consumer can see a peer's rate fall over
+         * time instead of only its live probe_rate. Null for
+         * self (it never probes itself, so it has no window to
+         * sample); "[]" for a peer no probe cycle has sampled
+         * yet; a DEAD member keeps its frozen history until
+         * GC, like its phi history. The samples are taken by
+         * the prober thread, never by a control-plane read:
+         * polling JSON must not move the history it is
+         * reading. */
+        char ratehistbuf[512];
+        if (strcmp(mem->id, hooks->self_id) == 0)
+            snprintf(ratehistbuf, sizeof ratehistbuf, "null");
+        else if (member_probe_rate_history_json(mem, hooks->start_ms,
+                                                ratehistbuf,
+                                                sizeof ratehistbuf) < 0)
+            snprintf(ratehistbuf, sizeof ratehistbuf, "[]");
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
@@ -873,7 +900,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                      "\"last_seen_ms\":%s,"
                      "\"source\":\"%s\",\"probes_sent\":%lld,"
                      "\"probes_answered\":%lld,\"low_probe_rate\":%s,"
-                     "\"probe_rate\":%s}",
+                     "\"probe_rate\":%s,\"probe_rate_history\":%s}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
                      rttbuf, rttmeanbuf, rttmaxbuf,
@@ -894,7 +921,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                                                hooks->low_probe_rate_frac))
                          ? "true"
                          : "false",
-                     ratebuf);
+                     ratebuf, ratehistbuf);
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }

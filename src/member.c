@@ -527,6 +527,54 @@ double member_probe_rate(const member_t *m) {
     return (double)answered / (double)m->probe_window_count;
 }
 
+void member_sample_probe_rate(member_t *m, int64_t now) {
+    if (!m) return;
+    double rate = member_probe_rate(m);
+    if (rate < 0) return; /* no probe in the window yet: no rate */
+    /* Same-millisecond repeat: the probe cycle is at least 25 ms,
+     * so this only fires when two callers sample in one instant —
+     * the ring must hold distinct times, not duplicates. */
+    if (m->probe_rate_hist_count > 0) {
+        int last = (m->probe_rate_hist_head - 1 +
+                    PULSE_PROBE_RATE_HISTORY) %
+                   PULSE_PROBE_RATE_HISTORY;
+        if (m->probe_rate_hist_ms[last] == now) return;
+    }
+    m->probe_rate_hist[m->probe_rate_hist_head] = rate;
+    m->probe_rate_hist_ms[m->probe_rate_hist_head] = now;
+    m->probe_rate_hist_head =
+        (m->probe_rate_hist_head + 1) % PULSE_PROBE_RATE_HISTORY;
+    if (m->probe_rate_hist_count < PULSE_PROBE_RATE_HISTORY)
+        m->probe_rate_hist_count++;
+}
+
+int member_probe_rate_history_json(const member_t *m, int64_t start_ms,
+                                   char *buf, size_t len) {
+    if (!m) return -1;
+    size_t used = 0;
+    int w = snprintf(buf + used, len - used, "[");
+    if (w < 0 || (size_t)w >= len - used) return -1;
+    used += (size_t)w;
+    /* Oldest first: the ring's oldest slot is hist_head -
+     * hist_count (wrapped), then forward — the same walk
+     * phi_history_json uses. */
+    int start = m->probe_rate_hist_head - m->probe_rate_hist_count;
+    if (start < 0) start += PULSE_PROBE_RATE_HISTORY;
+    for (int k = 0; k < m->probe_rate_hist_count; k++) {
+        int idx = (start + k) % PULSE_PROBE_RATE_HISTORY;
+        w = snprintf(buf + used, len - used, "%s[%lld,%.2f]",
+                     k == 0 ? "" : ",",
+                     (long long)(m->probe_rate_hist_ms[idx] - start_ms),
+                     m->probe_rate_hist[idx]);
+        if (w < 0 || (size_t)w >= len - used) return -1;
+        used += (size_t)w;
+    }
+    w = snprintf(buf + used, len - used, "]");
+    if (w < 0 || (size_t)w >= len - used) return -1;
+    used += (size_t)w;
+    return (int)used;
+}
+
 int member_is_low_probe_rate(const member_t *m, double threshold_frac) {
     if (!m || threshold_frac <= 0) return 0;
     if (m->state != MEMBER_ALIVE) return 0;

@@ -18,6 +18,14 @@
 #define PULSE_PROBE_WINDOW 20
 #define PULSE_PROBE_WINDOW_MIN 5
 
+/* Per-member probe-rate history (0.71.0): how many of the last
+ * sampled windowed probe success rates to keep per peer — the
+ * same 16-sample ring phi_history uses, so a JSON consumer can
+ * see a peer's rate fall over time instead of only its live
+ * value. */
+
+#define PULSE_PROBE_RATE_HISTORY 16
+
 /* Member metadata/annotations (0.20.0): a small set of key=value pairs
  * a node carries about itself — role=worker, zone=us-east-1,
  * version=1.2.3 — gossiped with its membership entry, shown in the
@@ -131,6 +139,26 @@ typedef struct {
     int probe_window_answered[PULSE_PROBE_WINDOW];
     int probe_window_head;
     int probe_window_count;
+    /* Probe-rate history (0.71.0): the last
+     * PULSE_PROBE_RATE_HISTORY sampled windowed probe success
+     * rates for this peer — the recent rate (answered / sent
+     * over the last PULSE_PROBE_WINDOW direct probes) as it
+     * stood at each probe cycle — as [[age_ms, rate], ...]
+     * pairs in JSON, oldest first, age_ms the ms since this
+     * node started. The ring mirrors phi's history: the
+     * prober thread samples once per probe cycle, never a
+     * control-plane read, so polling JSON never moves the
+     * history it is reading. A sample is only taken while the
+     * peer has at least one probe in its window — a peer never
+     * probed has no rate to sample — and a DEAD peer's history
+     * is frozen at the value it reached at suspicion, like
+     * its phi history. Local measurement only — never
+     * gossiped, never persisted, and not a table-version
+     * change, like the window it samples. */
+    double probe_rate_hist[PULSE_PROBE_RATE_HISTORY];
+    int64_t probe_rate_hist_ms[PULSE_PROBE_RATE_HISTORY];
+    int probe_rate_hist_count;
+    int probe_rate_hist_head;
     /* Low-probe-rate warning (0.68.0): whether a LOWRATE log
      * line and event have already been emitted for the current
      * low-rate episode — an ALIVE peer whose windowed probe
@@ -320,6 +348,24 @@ void member_note_probe_answered(member_table_t *t, const char *id,
  * probes_sent / probes_answered: an indirect probe's ACK goes
  * to the requester and adds no sample here either. */
 double member_probe_rate(const member_t *m);
+/* Sample the peer's current windowed probe success rate into
+ * its probe-rate history (0.71.0): one sample per probe cycle,
+ * taken by the prober thread. Nothing is recorded when the peer
+ * has no probe in its window yet (member_probe_rate < 0) — a
+ * peer never probed has no rate to sample — and a second sample
+ * in the same millisecond is skipped, so the ring holds
+ * distinct times, not duplicates (the same guard phi_sample
+ * uses). */
+void member_sample_probe_rate(member_t *m, int64_t now);
+/* The probe-rate history as JSON (0.71.0): the last
+ * PULSE_PROBE_RATE_HISTORY sampled rates as [[age_ms, rate],
+ * ...] pairs, oldest first, age_ms the ms since this node
+ * started, rates to two decimals like probe_rate itself.
+ * Returns the bytes written, or -1 when the buffer is too
+ * small. An empty history writes "[]": the peer has been
+ * probed but no probe cycle has sampled it yet. */
+int member_probe_rate_history_json(const member_t *m, int64_t start_ms,
+                                   char *buf, size_t len);
 /* 1 when the peer counts as low-probe-rate (0.68.0): the
  * low-probe-rate warning is enabled (threshold > 0), the peer
  * is ALIVE, at least PULSE_PROBE_WINDOW_MIN probes are in its
