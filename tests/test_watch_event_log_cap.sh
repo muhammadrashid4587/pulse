@@ -9,10 +9,22 @@
 #     on node 2 watch_event_log_cap=128; JSON carries
 #     "event_log_cap":4 / 128 in the "watch" object, and PROMETHEUS
 #     carries "pulse_watch_event_log_cap 4" on node 1.
-#  2. The small ring actually evicts: killing node 2 twice (with a
-#     restart between) records more than 4 events on node 1, so a
-#     WATCH FROM 1 on node 1 answers with a GAP line instead of
-#     replaying from seq 1.
+#  2. The small ring actually evicts: killing node 2 twice with
+#     SIGKILL (with a restart between) records more than 4 events
+#     on node 1 — SUSPECTED + DEAD, REVIVED, SUSPECTED + DEAD — so
+#     a WATCH FROM 1 on node 1 answers with a GAP line instead of
+#     replaying from seq 1. The kills must be SIGKILL, not a plain
+#     SIGTERM: a clean shutdown sends a LEAVE announcement and node
+#     1 marks the peer DEAD at once with no SUSPECTED first, so two
+#     graceful kills record only DEAD, REVIVED, DEAD — three events,
+#     which never evict the 4-event ring, and the GAP never fires
+#     (the test then passes only when a restart transient adds a
+#     SUSPECTED + REVIVED pair of its own, which is timing, not a
+#     guarantee). SIGKILL is an unclean death, so the probe timeout
+#     suspects the peer and the suspect timeout declares it dead —
+#     one SUSPECTED + DEAD per kill, deterministically. No JOINED
+#     is recorded for node 2 either: it arrives from the shared
+#     peer file, so it is already in node 1's table at startup.
 #  3. A bad cap is a clean startup error: --event-log-cap 0 and
 #     --event-log-cap 100001 both exit 2 with an error message.
 set -u
@@ -56,7 +68,12 @@ wait_for() {
 wait_count() {
     local log="$1" pat="$2" min="$3" timeout="$4" i n
     for i in $(seq 1 $((timeout * 5))); do
-        n=$(grep -Ec "$pat" "$log" 2>/dev/null || echo 0)
+        # grep -c prints 0 on no match but exits 1, so a plain
+        # "|| echo 0" would append a second 0 and break the -ge
+        # test; swallow the exit status and default an empty
+        # count (missing log file) to 0 instead.
+        n=$(grep -Ec "$pat" "$log" 2>/dev/null || true)
+        n=${n:-0}
         if [ "$n" -ge "$min" ]; then return 0; fi
         sleep 0.2
     done
@@ -124,11 +141,16 @@ else
     ctl 18881 PROMETHEUS
 fi
 
-# 2. The small ring evicts: kill node 2 twice, with a restart
-# between, so node 1 records more than 4 events (JOINED, then
-# SUSPECTED + DEAD, REVIVED, SUSPECTED + DEAD). A WATCH FROM 1
-# then answers with a GAP line instead of replaying from seq 1.
-kill "$(cat "$TMP/n2.pid")" 2>/dev/null
+# 2. The small ring evicts: kill node 2 twice with SIGKILL, with
+# a restart between, so node 1 records more than 4 events
+# (SUSPECTED + DEAD, REVIVED, SUSPECTED + DEAD — five at least;
+# a slow restart can add a transient SUSPECTED + REVIVED of its
+# own, which only helps). A WATCH FROM 1 then answers with a GAP
+# line instead of replaying from seq 1. SIGKILL, not SIGTERM:
+# a graceful kill sends LEAVE and node 1 marks the peer DEAD at
+# once with no SUSPECTED first, so two graceful kills record
+# only three events and never evict the ring (see the header).
+kill -9 "$(cat "$TMP/n2.pid")" 2>/dev/null
 rm -f "$TMP/n2.pid"
 if wait_for "$TMP/n1.log" "DEAD 127.0.0.1:17882" 10; then
     note ok "node 1 marks node 2 DEAD after the first kill"
@@ -146,7 +168,7 @@ else
     note fail "node 2 restarts and the cluster converges again"
     tail -5 "$TMP/n1.log"
 fi
-kill "$(cat "$TMP/n2.pid")" 2>/dev/null
+kill -9 "$(cat "$TMP/n2.pid")" 2>/dev/null
 rm -f "$TMP/n2.pid"
 if wait_count "$TMP/n1.log" "DEAD 127.0.0.1:17882" 2 10; then
     note ok "node 1 marks node 2 DEAD after the second kill"
