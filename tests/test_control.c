@@ -95,7 +95,13 @@
  * each member that answered a probe — the canned 17901 (last 3,
  * mean 2) and 17903 (last 0, mean 0) — with self and the
  * never-heard-from peer absent; the RTT end to end is covered by
- * tests/test_rtt_metrics.sh. */
+ * tests/test_rtt_metrics.sh. Per-member worst probe RTT (0.64.0)
+ * is covered here too: each member carries "rtt_max_ms" in JSON
+ * (7 for the canned 17901, 0 for 17903, null for self and the
+ * never-heard-from peer) and a pulse_member_rtt_max_ms gauge in
+ * PROMETHEUS under the same rule as the last and mean gauges;
+ * the worst RTT end to end is covered by
+ * tests/test_prometheus.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -169,10 +175,12 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         m->last_seen_ms = now;
         /* Probe RTT (0.40.0): answered probes, last 3 ms, mean 2
          * over 4 samples — so PROMETHEUS has a real rtt gauge to
-         * check for this peer. */
+         * check for this peer. Worst RTT (0.64.0): 7 ms, the
+         * largest of the four samples (3, 7, 0, 0 sum to 10). */
         m->rtt_ms = 3;
         m->rtt_sum_ms = 10;
         m->rtt_samples = 4;
+        m->rtt_max_ms = 7;
         /* Phi history (0.42.0): two 100 ms intervals, last
          * heartbeat ~9.8 s ago — so the live phi at scrape time
          * is pinned at the 30.00 cap (the gap is ~97 floored
@@ -193,10 +201,12 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
     if (m) {
         m->last_seen_ms = now;
         /* A sub-millisecond probe: last and mean both 0, which is
-         * a real value, not a missing one. */
+         * a real value, not a missing one — and the worst is 0
+         * too (0.64.0), a real worst case, not a missing one. */
         m->rtt_ms = 0;
         m->rtt_sum_ms = 0;
         m->rtt_samples = 1;
+        m->rtt_max_ms = 0;
     }
     m = member_add(out, "127.0.0.1:17902", &addr, 1);
     if (m) {
@@ -1012,6 +1022,26 @@ int main(void) {
         CHECK(never != NULL && seen_null != NULL &&
               (next_id == NULL || seen_null < next_id));
     }
+    /* Worst probe RTT (0.64.0): each member carries "rtt_max_ms"
+     * in JSON — a number for a peer that answered a probe, null
+     * for self and for a peer never heard from. Check the canned
+     * 17901 carries 7 (its worst sample) and the never-heard-from
+     * 17902 carries null, each inside its own member object. */
+    {
+        const char *peer = strstr(reply, "\"id\":\"127.0.0.1:17901\"");
+        const char *max7 =
+            peer ? strstr(peer, "\"rtt_max_ms\":7") : NULL;
+        const char *next_id =
+            peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && max7 != NULL &&
+              (next_id == NULL || max7 < next_id));
+        const char *never = strstr(reply, "\"id\":\"127.0.0.1:17902\"");
+        const char *max_null =
+            never ? strstr(never, "\"rtt_max_ms\":null") : NULL;
+        next_id = never ? strstr(never + 1, "\"id\":") : NULL;
+        CHECK(never != NULL && max_null != NULL &&
+              (next_id == NULL || max_null < next_id));
+    }
     /* The peer_file object sits at the top level, after metrics. */
     {
         const char *metrics = strstr(reply, "\"metrics\":{");
@@ -1207,6 +1237,15 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17903\"} 0\n") != NULL);
         CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17999\"}") == NULL);
         CHECK(strstr(preply, "pulse_member_rtt_mean_ms{member=\"127.0.0.1:17902\"}") == NULL);
+        /* Worst probe RTT (0.64.0): the same rule as the last and
+         * mean gauges — 7 for 17901 (its worst sample), 0 for
+         * 17903 (a real worst case, not a missing one), and no
+         * line at all for self or the never-heard-from peer. */
+        CHECK(strstr(preply, "# TYPE pulse_member_rtt_max_ms gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_max_ms{member=\"127.0.0.1:17901\"} 7\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_max_ms{member=\"127.0.0.1:17903\"} 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_max_ms{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_rtt_max_ms{member=\"127.0.0.1:17902\"}") == NULL);
         /* Time since last contact per member (0.59.0): one
          * pulse_member_last_seen_ms gauge sample per member heard
          * from — the seed peer and the peer-file peer, both heard

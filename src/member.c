@@ -308,6 +308,7 @@ member_t *member_add(member_table_t *t, const char *id,
     m->rtt_ms = -1;
     m->rtt_sum_ms = 0;
     m->rtt_samples = 0;
+    m->rtt_max_ms = -1;
     phi_init(&m->phi);
     note_change(t, m);
     return m;
@@ -491,6 +492,8 @@ int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,
     m->rtt_ms = rtt_ms;
     m->rtt_sum_ms += rtt_ms;
     m->rtt_samples++;
+    if (m->rtt_max_ms < 0 || rtt_ms > m->rtt_max_ms)
+        m->rtt_max_ms = rtt_ms;
     /* Slow-peer warning (0.22.0): a first crossing above the threshold
      * returns 2 so the caller warns once for the episode; the flag
      * clears when the mean recovers, so a later crossing warns again.
@@ -507,6 +510,11 @@ int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,
 int64_t member_rtt_mean_ms(const member_t *m) {
     if (!m || m->rtt_samples == 0) return -1;
     return m->rtt_sum_ms / m->rtt_samples;
+}
+
+int64_t member_rtt_max_ms(const member_t *m) {
+    if (!m || m->rtt_samples == 0) return -1;
+    return m->rtt_max_ms;
 }
 
 int member_is_slow(const member_t *m, int64_t slow_threshold_ms) {

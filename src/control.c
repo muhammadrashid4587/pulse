@@ -709,16 +709,23 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
          * itself, so self stays null. "slow" (0.22.0) is true when
          * the peer's mean RTT is above the configured slow-peer
          * threshold (false when the warning is disabled, or the peer
-         * has answered no probe yet). */
-        char rttbuf[32], rttmeanbuf[32];
+         * has answered no probe yet). The worst RTT (0.64.0) is the
+         * largest single probe round trip over all answered probes —
+         * null under the same rule as the last and mean — so one
+         * 60 ms probe among sub-millisecond ones is visible instead
+         * of averaged away. */
+        char rttbuf[32], rttmeanbuf[32], rttmaxbuf[32];
         if (mem->rtt_ms < 0 || mem->rtt_samples == 0) {
             snprintf(rttbuf, sizeof rttbuf, "null");
             snprintf(rttmeanbuf, sizeof rttmeanbuf, "null");
+            snprintf(rttmaxbuf, sizeof rttmaxbuf, "null");
         } else {
             snprintf(rttbuf, sizeof rttbuf, "%lld",
                      (long long)mem->rtt_ms);
             snprintf(rttmeanbuf, sizeof rttmeanbuf, "%lld",
                      (long long)(mem->rtt_sum_ms / mem->rtt_samples));
+            snprintf(rttmaxbuf, sizeof rttmaxbuf, "%lld",
+                     (long long)member_rtt_max_ms(mem));
         }
         /* Suspicion age (0.58.0): how long this member has been
          * SUSPECT, in ms — now minus when its current state started.
@@ -769,13 +776,13 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
-                     "\"rtt_mean_ms\":%s,\"slow\":%s,\"quiet\":%s,"
+                     "\"rtt_mean_ms\":%s,\"rtt_max_ms\":%s,\"slow\":%s,\"quiet\":%s,"
                      "\"suspect_ms\":%s,"
                      "\"last_seen_ms\":%s,"
                      "\"source\":\"%s\"}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
-                     rttbuf, rttmeanbuf,
+                     rttbuf, rttmeanbuf, rttmaxbuf,
                      member_is_slow(mem, hooks->slow_rtt_threshold_ms)
                          ? "true"
                          : "false",
@@ -1410,6 +1417,27 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             "pulse_member_rtt_mean_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)member_rtt_mean_ms(&t.members[i])) == 0;
+    }
+    /* Worst probe RTT per member (0.64.0): the largest single
+     * direct-probe round-trip time JSON now reports as
+     * rtt_max_ms, as a gauge a scraper can alert on — one line
+     * per member that has answered a probe, under the same rule
+     * as the last and mean gauges. The mean can hide one 60 ms
+     * probe among sub-millisecond ones; the max cannot. A value
+     * of 0 is a real worst case of sub-millisecond probes, not a
+     * missing one, and a dead member keeps its worst RTT until
+     * GC, like its last and mean. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_rtt_max_ms Worst direct-probe "
+        "round-trip time in ms, per member.\n"
+        "# TYPE pulse_member_rtt_max_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].rtt_ms < 0 ||
+            t.members[i].rtt_samples == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_rtt_max_ms{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)member_rtt_max_ms(&t.members[i])) == 0;
     }
     /* Suspicion age per member (0.58.0): how long each SUSPECT
      * member has been suspected, in ms — the same value JSON

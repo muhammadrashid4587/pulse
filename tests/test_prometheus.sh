@@ -128,8 +128,11 @@ if [ -n "$P1" ] \
    && printf '%s' "$P1" | grep -q '^pulse_member_rtt_ms{member="127.0.0.1:17882"} [0-9][0-9]*$' \
    && printf '%s' "$P1" | grep -q '^# TYPE pulse_member_rtt_mean_ms gauge$' \
    && printf '%s' "$P1" | grep -q '^pulse_member_rtt_mean_ms{member="127.0.0.1:17882"} [0-9][0-9]*$' \
+   && printf '%s' "$P1" | grep -q '^# TYPE pulse_member_rtt_max_ms gauge$' \
+   && printf '%s' "$P1" | grep -q '^pulse_member_rtt_max_ms{member="127.0.0.1:17882"} [0-9][0-9]*$' \
    && ! printf '%s' "$P1" | grep -q 'pulse_member_rtt_ms{member="127.0.0.1:17881"' \
    && ! printf '%s' "$P1" | grep -q 'pulse_member_rtt_mean_ms{member="127.0.0.1:17881"' \
+   && ! printf '%s' "$P1" | grep -q 'pulse_member_rtt_max_ms{member="127.0.0.1:17881"' \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_peers 2$' \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_added 2$' \
    && printf '%s' "$P1" | grep -q '^pulse_peer_file_dropped 0$' \
@@ -170,6 +173,7 @@ if wait_prom 18881 '^pulse_suspected_total [1-9][0-9]*$' 5 \
    && wait_prom 18881 '^pulse_member_info\{member="127.0.0.1:17882",state="DEAD",source="peer-file"\} 1$' 5 \
    && wait_prom 18881 '^pulse_member_rtt_ms\{member="127.0.0.1:17882"\} [0-9][0-9]*$' 5 \
    && wait_prom 18881 '^pulse_member_rtt_mean_ms\{member="127.0.0.1:17882"\} [0-9][0-9]*$' 5 \
+   && wait_prom 18881 '^pulse_member_rtt_max_ms\{member="127.0.0.1:17882"\} [0-9][0-9]*$' 5 \
    && wait_prom 18881 '^pulse_detect_latency_ms_count 1$' 5 \
    && wait_prom 18881 '^pulse_detect_latency_ms_sum [1-9][0-9]*$' 5 \
    && wait_prom 18881 '^pulse_detect_latency_ms_bucket\{le="\+Inf"\} 1$' 5; then

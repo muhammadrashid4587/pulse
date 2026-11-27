@@ -75,6 +75,13 @@ typedef struct {
     int64_t rtt_ms;
     int64_t rtt_sum_ms;
     int64_t rtt_samples;
+    /* Worst probe round-trip time for this peer (0.64.0): the
+     * largest single direct-probe PING->ACK round trip in ms over
+     * all answered probes — the mean can hide one 60 ms probe
+     * among sub-millisecond ones, the max cannot. -1 until a probe
+     * has been answered, like rtt_ms. Local measurement only —
+     * never gossiped, never persisted. */
+    int64_t rtt_max_ms;
     /* Slow-peer warning (0.22.0): whether a SLOW log line has already
      * been emitted for the current slow episode — a peer whose mean
      * RTT is above the configured threshold. Set when the mean first
@@ -223,7 +230,7 @@ int member_mark_alive(member_table_t *t, const char *id,
 
 /* Record a probe round-trip time for a peer: the ms between sending a
  * PING (direct, or via PING_REQ) and receiving its ACK. Updates the
- * last RTT and the running mean. slow_threshold_ms is the slow-peer
+ * last RTT, the running mean and the worst RTT (0.64.0). slow_threshold_ms is the slow-peer
  * threshold in ms (0 = disabled): when the peer's mean RTT first
  * crosses above it, returns 2 so the caller can warn once for the
  * episode (see rtt_slow_warned); the warning clears when the mean
@@ -237,6 +244,9 @@ int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,
 /* Mean probe RTT in ms over all answered probes, or -1 when the peer
  * has answered none. */
 int64_t member_rtt_mean_ms(const member_t *m);
+/* Worst probe RTT in ms over all answered probes (0.64.0), or -1
+ * when the peer has answered none. */
+int64_t member_rtt_max_ms(const member_t *m);
 /* 1 when the peer counts as slow: the slow-peer warning is enabled
  * (threshold > 0), the peer has answered at least one probe, and its
  * mean RTT is above the threshold. Self never probes itself, so self

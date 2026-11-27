@@ -177,19 +177,26 @@ int main(void) {
 
     /* probe RTT (0.21.0): -1 until a probe is answered, then last and
      * mean; unknown ids and negative samples are ignored, and
-     * recording an RTT is not a gossip-visible change */
+     * recording an RTT is not a gossip-visible change. Worst RTT
+     * (0.64.0): the largest single sample so far — it only ever
+     * grows, never falls when a later probe is faster. */
     member_t *m2 = member_find(&t, "127.0.0.1:17102");
     CHECK(m2->rtt_ms == -1);
     CHECK(m2->rtt_samples == 0);
+    CHECK(m2->rtt_max_ms == -1);
+    CHECK(member_rtt_max_ms(m2) == -1);
     uint64_t v_before = t.version;
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 3, 0) == 1);
     CHECK(m2->rtt_ms == 3);
     CHECK(m2->rtt_samples == 1);
     CHECK(m2->rtt_sum_ms == 3);
+    CHECK(m2->rtt_max_ms == 3);
+    CHECK(member_rtt_max_ms(m2) == 3);
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 7, 0) == 1);
     CHECK(m2->rtt_ms == 7);
     CHECK(m2->rtt_samples == 2);
     CHECK(m2->rtt_sum_ms == 10);
+    CHECK(m2->rtt_max_ms == 7);
     CHECK(t.version == v_before); /* RTT is local, not gossip content */
     CHECK(member_note_rtt(&t, "127.0.0.1:17999", 5, 0) == 0);
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", -1, 0) == 0);
@@ -213,26 +220,32 @@ int main(void) {
      * to 6, above a threshold of 5: first crossing returns 2. */
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 10, 5) == 2);
     CHECK(member_rtt_mean_ms(m2) == 6);
+    CHECK(member_rtt_max_ms(m2) == 10);
     CHECK(member_is_slow(m2, 5) == 1);
     /* Still slow, already warned: no second warning. */
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 10, 5) == 1);
     CHECK(member_rtt_mean_ms(m2) == 7);
+    CHECK(member_rtt_max_ms(m2) == 10);
     /* Four 0 ms samples drag the mean to (30+0)/8 = 3, back below
-     * the threshold: the warning clears. */
+     * the threshold: the warning clears. The max stays 10: a fast
+     * probe never erases the worst one. */
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
     CHECK(member_rtt_mean_ms(m2) == 3);
+    CHECK(member_rtt_max_ms(m2) == 10);
     CHECK(member_is_slow(m2, 5) == 0);
     CHECK(member_count_slow(&t, 5) == 0);
     /* A fresh crossing after recovery warns again. */
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 100, 5) == 2);
+    CHECK(member_rtt_max_ms(m2) == 100);
     CHECK(member_is_slow(m2, 5) == 1);
     /* A peer with no samples is never slow, whatever the threshold. */
     member_t *m3 = member_find(&t, "127.0.0.1:17103");
     CHECK(m3->rtt_samples == 0);
     CHECK(member_rtt_mean_ms(m3) == -1);
+    CHECK(member_rtt_max_ms(m3) == -1);
     CHECK(member_is_slow(m3, 1) == 0);
 
     /* suspicion age (0.58.0): -1 unless the member is SUSPECT, then
