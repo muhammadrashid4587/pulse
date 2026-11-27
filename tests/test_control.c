@@ -683,7 +683,7 @@ static void test_event_log(void) {
      * continues the sequence instead of restarting at 1. */
     const char *ev_path = "/tmp/pulse-event-log-test.txt";
     pulse_event_log_t saved;
-    pulse_event_log_init(&saved, 8);
+    pulse_event_log_init(&saved, 9);
     pulse_event_record(&saved, PULSE_EVENT_JOINED, "127.0.0.1:17904", 1,
                        1700000300);
     pulse_event_record(&saved, PULSE_EVENT_SUSPECTED, "127.0.0.1:17904",
@@ -740,13 +740,23 @@ static void test_event_log(void) {
     pulse_event_record_suspect_ms(&saved, PULSE_EVENT_REVIVED,
                                   "127.0.0.1:17904", 1, 1700000307,
                                   -1, 95, 20, 19, -1, 412);
-    CHECK(pulse_event_log_save(&saved, ev_path) == 8);
+    /* Quiet-peer recovery (0.72.0): a QUIETOK event recorded with
+     * a last-contact age — 88 ms since the node last heard from
+     * the member when it was heard from again — and the probe
+     * counts at the recovery, 21 sent and 20 answered,
+     * round-trips with all of it, so a restart restores how
+     * quickly the peer came back, not just that the episode
+     * ended. */
+    pulse_event_record_probes(&saved, PULSE_EVENT_QUIETOK,
+                              "127.0.0.1:17904", 1, 1700000308, -1,
+                              88, 21, 20);
+    CHECK(pulse_event_log_save(&saved, ev_path) == 9);
     pulse_event_log_free(&saved);
 
     pulse_event_log_t restored;
-    pulse_event_log_init(&restored, 8);
-    CHECK(pulse_event_log_load(&restored, ev_path) == 8);
-    CHECK(pulse_event_latest_seq(&restored) == 8);
+    pulse_event_log_init(&restored, 9);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 9);
+    CHECK(pulse_event_latest_seq(&restored) == 9);
     CHECK(pulse_event_oldest_seq(&restored) == 1);
     CHECK(pulse_event_wait(&restored, 0, &ev, 20) == 1);
     CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
@@ -821,10 +831,24 @@ static void test_event_log(void) {
     CHECK(ev.probe_rate == -1);
     CHECK(ev.phi == -1);
     CHECK(ev.suspect_ms == 412);
+    /* The QUIETOK event recorded after it comes back with the
+     * age at the recovery and the probe counts (0.72.0): the
+     * recovery survives the restart with how quickly the peer
+     * came back, not just the fact that it did. */
+    CHECK(pulse_event_wait(&restored, 8, &ev, 20) == 1);
+    CHECK(ev.seq == 9 && ev.type == PULSE_EVENT_QUIETOK &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000308);
+    CHECK(ev.last_seen_ms == 88);
+    CHECK(ev.probes_sent == 21);
+    CHECK(ev.probes_answered == 20);
+    CHECK(ev.probe_rate == -1);
+    CHECK(ev.phi == -1);
+    CHECK(ev.suspect_ms == -1);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
-                       2, 1700000308);
-    CHECK(pulse_event_latest_seq(&restored) == 9);
+                       2, 1700000309);
+    CHECK(pulse_event_latest_seq(&restored) == 10);
     pulse_event_log_free(&restored);
 
     /* The QUIET word (0.62.0) parses back to the QUIET type, so a
@@ -863,11 +887,23 @@ static void test_event_log(void) {
     CHECK(pulse_event_result_state(PULSE_EVENT_RATEOK, &rstate) == 1);
     CHECK(rstate == MEMBER_ALIVE);
 
+    /* The QUIETOK word (0.72.0) parses back to the QUIETOK type,
+     * so a WATCH filter can subscribe to it by name, and it lands
+     * on ALIVE for the state filter — the peer is still alive,
+     * it has just been heard from again after going quiet. */
+    pulse_event_type_t ktype;
+    CHECK(pulse_event_type_parse("QUIETOK", &ktype) == 0);
+    CHECK(ktype == PULSE_EVENT_QUIETOK);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_QUIETOK), "QUIETOK") == 0);
+    member_state_t kstate;
+    CHECK(pulse_event_result_state(PULSE_EVENT_QUIETOK, &kstate) == 1);
+    CHECK(kstate == MEMBER_ALIVE);
+
     /* A missing file loads zero events, and a malformed line is
      * skipped while the good lines around it still load. */
-    /* Six events load into a cap-6 ring (0.69.0), so all of them
+    /* Seven events load into a cap-7 ring (0.72.0), so all of them
      * survive, including the plain pre-0.60.0 DEAD line. */
-    pulse_event_log_init(&restored, 6);
+    pulse_event_log_init(&restored, 7);
     CHECK(pulse_event_log_load(&restored,
                                "/tmp/pulse-event-log-no-such-file.txt") == 0);
     CHECK(pulse_event_latest_seq(&restored) == 0);
@@ -900,10 +936,15 @@ static void test_event_log(void) {
                 "12 RATEOK 127.0.0.1:17905 2 1700000405 "
                 "last_seen_ms=120 probes_sent=20 probes_answered=16 "
                 "probe_rate=0.80\n");
+        /* A QUIETOK event line (0.72.0) loads as QUIETOK with
+         * its age and probe counts and no phi. */
+        fprintf(mf,
+                "13 QUIETOK 127.0.0.1:17905 2 1700000406 "
+                "last_seen_ms=88 probes_sent=21 probes_answered=20\n");
         fclose(mf);
     }
-    CHECK(pulse_event_log_load(&restored, ev_path) == 6);
-    CHECK(pulse_event_latest_seq(&restored) == 12);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 7);
+    CHECK(pulse_event_latest_seq(&restored) == 13);
     CHECK(pulse_event_oldest_seq(&restored) == 7);
     CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
     CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_DEAD);
@@ -938,6 +979,17 @@ static void test_event_log(void) {
     CHECK(ev.probes_sent == 20);
     CHECK(ev.probes_answered == 16);
     CHECK(ev.probe_rate == 0.80);
+    /* The QUIETOK event recorded after it comes back with the
+     * age at the recovery and the probe counts (0.72.0): the
+     * recovery survives the load with how quickly the peer came
+     * back. */
+    CHECK(pulse_event_wait(&restored, 12, &ev, 20) == 1);
+    CHECK(ev.seq == 13 && ev.type == PULSE_EVENT_QUIETOK &&
+          ev.last_seen_ms == 88);
+    CHECK(ev.phi == -1);
+    CHECK(ev.probes_sent == 21);
+    CHECK(ev.probes_answered == 20);
+    CHECK(ev.probe_rate == -1);
     pulse_event_log_free(&restored);
     unlink(ev_path);
 }

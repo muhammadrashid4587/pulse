@@ -170,8 +170,8 @@ typedef struct {
      * again warns again. Clearing the flag is the recovery:
      * the probe cycle logs a RATEOK line and records a RATEOK
      * event for the peer (0.69.0), so the episode ends in the
-     * log and on the WATCH stream instead of silently. Unlike
-     * quiet_warned it is NOT cleared
+     * log and on the WATCH stream instead of silently. Like
+     * quiet_warned since 0.72.0 it is NOT cleared
      * on direct contact: one answered probe barely moves a
      * 20-probe window, so clearing on contact would re-fire
      * almost at once for a peer answering one probe in ten. */
@@ -188,10 +188,22 @@ typedef struct {
      * event have already been emitted for the current quiet
      * episode — an ALIVE peer whose last-contact age crossed the
      * configured threshold. Set when the age first crosses the
-     * threshold, cleared on the next direct contact (see
-     * member_mark_alive), so a persistently quiet peer warns once
+     * threshold, cleared by the probe cycle when the peer is
+     * heard from again — its age back at or below the threshold
+     * (see node.c) — so a persistently quiet peer warns once
      * per episode instead of once per probe cycle, and a peer
-     * that answers again and goes quiet again warns again. */
+     * that answers again and goes quiet again warns again.
+     * Clearing the flag is the recovery: the probe cycle logs a
+     * QUIETOK line and records a QUIETOK event for the peer
+     * (0.72.0), so the episode ends in the log and on the WATCH
+     * stream instead of silently — the mirror of RATEOK for the
+     * low-probe-rate warning. Unlike low_rate_warned it is
+     * cleared on contact age, not on a windowed rate: one
+     * answered probe drops the age at once, so the recovery
+     * fires on the next probe cycle after the peer answers. A
+     * peer that goes SUSPECT while quiet keeps its flag until
+     * it revives to ALIVE, so its QUIETOK fires only once the
+     * recovery stuck. */
     int quiet_warned;
     /* Metadata the member carries about itself (role, zone, version,
      * ...): set at startup with --meta, changeable at runtime with

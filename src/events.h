@@ -62,6 +62,10 @@ typedef enum {
                                   low-probe-rate threshold or
                                   above after a LOWRATE episode
                                   (0.69.0) */
+    PULSE_EVENT_QUIETOK,       /* an ALIVE peer's last-contact age
+                                  dropped back to the quiet-peer
+                                  threshold or below after a QUIET
+                                  episode (0.72.0) */
 } pulse_event_type_t;
 
 typedef struct {
@@ -174,7 +178,7 @@ void pulse_event_log_free(pulse_event_log_t *log);
 int pulse_event_log_cap(pulse_event_log_t *log);
 
 /* "JOINED", "SUSPECTED", "DEAD", "REVIVED", "DROPPED", "REFUTED",
- * "QUIET", "LOWRATE", "RATEOK": the word that rides in the EVENT line for a
+ * "QUIET", "LOWRATE", "RATEOK", "QUIETOK": the word that rides in the EVENT line for a
  * type. */
 const char *pulse_event_type_name(pulse_event_type_t type);
 
@@ -187,9 +191,10 @@ int pulse_event_type_parse(const char *name, pulse_event_type_t *out);
  * REVIVED and REFUTED land on ALIVE, SUSPECTED on SUSPECT, DEAD on
  * DEAD. DROPPED leaves no state — the member left the table — so
  * it returns 0 and never matches a state filter. QUIET (0.62.0),
- * LOWRATE (0.68.0) and RATEOK (0.69.0) land on ALIVE: the peer is still alive,
+ * LOWRATE (0.68.0), RATEOK (0.69.0) and QUIETOK (0.72.0) land on ALIVE: the peer is still alive,
  * it has just gone quiet, or just started answering too few of
- * its probes, or just recovered to answering enough of them.
+ * its probes, or just recovered to answering enough of them, or
+ * just been heard from again after going quiet.
  * Used by the WATCH state filter (0.39.0), which subscribes
  * to events by the state they land on. */
 int pulse_event_result_state(pulse_event_type_t type, member_state_t *out);

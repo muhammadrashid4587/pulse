@@ -412,7 +412,7 @@
  *       SNAPSHOT line per member — id, incarnation, state,
  *       last-seen-ms (or '-') and source, the PEERS shape — then
  *       END, then one EVENT line per membership event as it happens:
- *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE|RATEOK>
+ *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE|RATEOK|QUIETOK>
  *       <id> <incarnation> <unix-seconds>. JOINED is a peer
  *       appearing in the table, SUSPECTED is ALIVE -> SUSPECT, DEAD
  *       is SUSPECT -> DEAD, REVIVED is a SUSPECT/DEAD peer coming
@@ -428,7 +428,11 @@
  *       probes — and RATEOK (0.69.0) is an ALIVE peer whose recent
  *       probe success rate recovered to the low-probe-rate
  *       threshold or above after a LOWRATE episode — the peer is
- *       still alive, it is answering enough of its probes again.
+ *       still alive, it is answering enough of its probes again —
+ *       and QUIETOK (0.72.0) is an ALIVE peer whose last-contact
+ *       age dropped back to the quiet-peer threshold or below
+ *       after a QUIET episode — the peer is still alive, it has
+ *       been heard from again.
  *       The connection
  *       stays open until the client closes it (or falls too far
  *       behind: the event log is a bounded ring, so a slow consumer
@@ -502,7 +506,8 @@
  *       A state filter (0.39.0) narrows the stream by the member
  *       state an event leaves its member in: "WATCH STATE
  *       SUSPECT,DEAD" carries only events that land on SUSPECT
- *       or DEAD. JOINED, REVIVED, REFUTED and QUIET land on ALIVE,
+ *       or DEAD. JOINED, REVIVED, REFUTED, QUIET, QUIETOK,
+ *       LOWRATE and RATEOK land on ALIVE,
  *       SUSPECTED on SUSPECT, DEAD on DEAD, and DROPPED lands on
  *       no state — the member left the table — so it never
  *       matches a state filter; a watcher that wants removals

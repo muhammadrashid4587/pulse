@@ -61,6 +61,8 @@ const char *pulse_event_type_name(pulse_event_type_t type) {
             return "LOWRATE";
         case PULSE_EVENT_RATEOK:
             return "RATEOK";
+        case PULSE_EVENT_QUIETOK:
+            return "QUIETOK";
         default:
             return "UNKNOWN";
     }
@@ -69,8 +71,9 @@ const char *pulse_event_type_name(pulse_event_type_t type) {
 int pulse_event_type_parse(const char *name, pulse_event_type_t *out) {
     static const char *names[] = {"JOINED",   "SUSPECTED", "DEAD",
                                   "REVIVED",  "DROPPED",   "REFUTED",
-                                  "QUIET",    "LOWRATE",   "RATEOK"};
-    for (int i = 0; i < 9; i++) {
+                                  "QUIET",    "LOWRATE",   "RATEOK",
+                                  "QUIETOK"};
+    for (int i = 0; i < 10; i++) {
         if (strcmp(name, names[i]) == 0) {
             *out = (pulse_event_type_t)i;
             return 0;
@@ -96,6 +99,7 @@ int pulse_event_result_state(pulse_event_type_t type, member_state_t *out) {
         case PULSE_EVENT_QUIET:
         case PULSE_EVENT_LOWRATE:
         case PULSE_EVENT_RATEOK:
+        case PULSE_EVENT_QUIETOK:
             *out = MEMBER_ALIVE;
             return 1;
         case PULSE_EVENT_SUSPECTED:

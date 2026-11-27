@@ -725,11 +725,13 @@ int member_mark_alive(member_table_t *t, const char *id,
     if (inc_raised) m->incarnation = incarnation;
     if (addr) m->addr = *addr;
     m->last_seen_ms = now;
-    /* Direct contact re-arms the quiet-peer warning (0.62.0): the
-     * peer answered again, so a later silence is a fresh episode
-     * and warns again instead of staying silent because the first
-     * crossing already fired. */
-    m->quiet_warned = 0;
+    /* The quiet-peer warning is NOT re-armed here any more: the
+     * probe cycle owns quiet_warned (0.72.0), so a peer that was
+     * quiet and answers again gets its QUIETOK line and event
+     * from the cycle that sees its age back below the threshold,
+     * instead of the flag clearing silently on contact. Clearing
+     * it here would lose the recovery — the cycle would never
+     * see a flagged peer that recovered. */
     if (changed) m->state_since_ms = now;
     /* A state change or a higher incarnation is gossip-visible, so it
      * bumps the table version; a routine heartbeat that only moves

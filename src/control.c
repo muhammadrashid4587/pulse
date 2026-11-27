@@ -1967,7 +1967,7 @@ typedef struct {
     int n_ids;
     /* State filter (0.39.0): "STATE <list>" narrows the stream to
      * events that leave their member in one of these states —
-     * JOINED/REVIVED/REFUTED/QUIET land on ALIVE, SUSPECTED on SUSPECT,
+     * JOINED/REVIVED/REFUTED/QUIET/QUIETOK/LOWRATE/RATEOK land on ALIVE, SUSPECTED on SUSPECT,
      * DEAD on DEAD — and narrows the snapshot the same way, so a
      * watcher subscribed to DEAD snapshots only the dead members.
      * One bit per member_state_t; DROPPED lands on no state, so it
@@ -1985,7 +1985,7 @@ typedef struct {
 /* Parse one comma-separated filter token. A token containing ':' is
  * a peer-id list: every part must parse as a host:port address
  * (IPv6 bracketed), and is stored canonicalised. A token without
- * ':' is an event-type list: every part must be one of the six
+ * ':' is an event-type list: every part must be one of the ten
  * EVENT words. Returns 0 on success, -1 with err filled on a bad
  * token (unknown type, unparsable id, or too many ids). */
 static int parse_watch_filter_token(const char *token, watch_filter_t *f,
@@ -2305,7 +2305,7 @@ static int watch_wait_paused(int fd, watch_pause_entry_t *pause_entry,
  * an event leaves its member in: "WATCH STATE SUSPECT,DEAD"
  * carries only events that land on SUSPECT or DEAD, so a watcher
  * that only cares about trouble never sees joins or revivals.
- * JOINED, REVIVED, REFUTED and QUIET land on ALIVE, SUSPECTED on SUSPECT,
+ * JOINED, REVIVED, REFUTED, QUIET, QUIETOK, LOWRATE and RATEOK land on ALIVE, SUSPECTED on SUSPECT,
  * DEAD on DEAD, and DROPPED lands on no state at all — the member
  * left the table — so it never matches a state filter; a watcher
  * that wants removals subscribes to the DROPPED type instead.

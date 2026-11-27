@@ -1591,10 +1591,11 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
      * runs here, after the suspect-to-dead sweep, so a peer that
      * just went DEAD this cycle is never warned as quiet — the
      * DEAD line already says it is gone. The warning is once per
-     * crossing: quiet_warned is set here and cleared on the next
-     * direct contact (member_mark_alive), so a persistently quiet
-     * peer warns once instead of once per probe cycle, and a peer
-     * that answers again and goes quiet again warns again. A peer
+     * crossing: quiet_warned is set here and cleared by the
+     * QUIETOK check below (0.72.0) when the peer is heard from
+     * again, so a persistently quiet peer warns once instead of
+     * once per probe cycle, and a peer that answers again and
+     * goes quiet again warns again. A peer
      * never heard from has no age (-1), so it never warns: a seed
      * that never answered is not a peer going quiet. The age is
      * captured for the log line; the event re-measures it at
@@ -1619,7 +1620,48 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
             n_quiet++;
         }
     }
-    /* 3a-b. Low-probe-rate warning (0.68.0): an ALIVE peer whose
+    /* 3a-b. Quiet-peer recovery (0.72.0): an ALIVE peer that was
+     * flagged quiet and has been heard from again — its
+     * last-contact age back at or below the threshold — gets one
+     * QUIETOK log line and one QUIETOK event per episode. The
+     * check runs here, right after the QUIET check, so the two
+     * are decided on the same age in the same cycle: a peer
+     * whose age is still above the threshold stays flagged and
+     * warns nothing, and a peer whose age dropped below it
+     * recovers instead of warning again. The flag is cleared
+     * here, not on direct contact (member_mark_alive): clearing
+     * it there would lose the recovery, since the cycle would
+     * never see a flagged peer that answered again. A peer that
+     * went SUSPECT while quiet keeps its flag — it is not ALIVE,
+     * so no QUIETOK fires for it here — and gets its QUIETOK
+     * only once it revives to ALIVE, so the recovery marks an
+     * episode that ended with the peer back, not a flicker on
+     * the way to DEAD. The age is captured for the log line;
+     * the event re-measures it at record time (record_event),
+     * the same value within a millisecond. A full batch (8)
+     * leaves the flag set, so the recovery is collected on the
+     * next cycle instead of lost. */
+    char quietok_ids[8][PULSE_ID_LEN];
+    uint32_t quietok_inc[8];
+    int64_t quietok_age[8];
+    int n_quietok = 0;
+    if (g_cfg.quiet_peer_ms > 0) {
+        for (int i = 0; i < g_table.count && n_quietok < 8; i++) {
+            member_t *m = &g_table.members[i];
+            if (strcmp(m->id, g_self_id) == 0) continue;
+            if (m->state != MEMBER_ALIVE) continue;
+            if (!m->quiet_warned) continue;
+            int64_t age = member_last_seen_age_ms(m, now);
+            if (age < 0 || age > g_cfg.quiet_peer_ms) continue;
+            m->quiet_warned = 0;
+            snprintf(quietok_ids[n_quietok], PULSE_ID_LEN, "%s",
+                     m->id);
+            quietok_inc[n_quietok] = m->incarnation;
+            quietok_age[n_quietok] = age;
+            n_quietok++;
+        }
+    }
+    /* 3a-c. Low-probe-rate warning (0.68.0): an ALIVE peer whose
      * recent probe success rate fell below the configured
      * fraction gets one LOWRATE log line and one LOWRATE event
      * per episode. The check runs here, after the suspect-to-dead
@@ -1630,8 +1672,8 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
      * to the threshold or above, so a persistently low peer warns
      * once instead of once per probe cycle, and a peer that
      * recovers and drops again warns again. The re-arm is on
-     * recovery, not on direct contact the way quiet_warned is:
-     * one answered probe barely moves a 20-probe window, so
+     * recovery, like quiet_warned since 0.72.0: one answered
+     * probe barely moves a 20-probe window, so
      * clearing on contact would re-fire almost at once for a
      * peer answering one probe in ten. A peer with too few
      * probes in its window is never warned and never re-armed:
@@ -1874,6 +1916,21 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
                  (long long)quiet_age[i],
                  (long long)g_cfg.quiet_peer_ms);
         record_event(PULSE_EVENT_QUIET, quiet_ids[i], quiet_inc[i]);
+    }
+    /* Quiet-peer recovery (0.72.0): the QUIETOK line says how
+     * quiet the peer was when it was heard from again — its age
+     * back at or below the threshold — and the QUIETOK event
+     * carries the same age frozen as its last_seen_ms, so a
+     * WATCH replay shows it too. The peer is still ALIVE at
+     * this point — that is the point of the recovery: the flag
+     * cleared because the peer is answering again, not because
+     * it was suspected. */
+    for (int i = 0; i < n_quietok; i++) {
+        log_line("QUIETOK %s age=%lldms threshold=%lldms",
+                 quietok_ids[i], (long long)quietok_age[i],
+                 (long long)g_cfg.quiet_peer_ms);
+        record_event(PULSE_EVENT_QUIETOK, quietok_ids[i],
+                     quietok_inc[i]);
     }
     /* Low-probe-rate warning (0.68.0): the LOWRATE line says how
      * low the peer's recent probe success rate was when the

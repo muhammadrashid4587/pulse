@@ -349,13 +349,17 @@ int main(void) {
     CHECK(member_mark_dead(&t5, "127.0.0.1:17105", now + 1500) == 1);
     CHECK(member_is_quiet(m5, 499, now + 2500) == 0);
     CHECK(member_is_quiet(NULL, 499, now) == 0);
-    /* Re-arm: direct contact clears quiet_warned (the per-episode
-     * flag the probe cycle sets on the first crossing), so a peer
-     * that answers again and goes quiet again warns again instead
-     * of staying silent because the first crossing already fired. */
+    /* Re-arm (0.72.0): direct contact does NOT clear quiet_warned
+     * any more — the probe cycle owns the flag, so a peer that was
+     * quiet and answers again keeps it set until the cycle sees
+     * its age back below the threshold and clears it with a
+     * QUIETOK line and event. Clearing it here would lose the
+     * recovery: the cycle would never see a flagged peer that
+     * answered again. The age still drops to 0 on contact, so the
+     * peer reads not-quiet the moment it answers. */
     m5->quiet_warned = 1;
     CHECK(member_mark_alive(&t5, "127.0.0.1:17105", &a4, 1, now + 2600) == 1);
-    CHECK(m5->quiet_warned == 0);
+    CHECK(m5->quiet_warned == 1);
     CHECK(member_is_quiet(m5, 499, now + 2600) == 0); /* just heard from */
 
     /* Low-probe-rate warning (0.68.0): a peer is low when it is
