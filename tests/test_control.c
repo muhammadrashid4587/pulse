@@ -683,7 +683,7 @@ static void test_event_log(void) {
      * continues the sequence instead of restarting at 1. */
     const char *ev_path = "/tmp/pulse-event-log-test.txt";
     pulse_event_log_t saved;
-    pulse_event_log_init(&saved, 9);
+    pulse_event_log_init(&saved, 11);
     pulse_event_record(&saved, PULSE_EVENT_JOINED, "127.0.0.1:17904", 1,
                        1700000300);
     pulse_event_record(&saved, PULSE_EVENT_SUSPECTED, "127.0.0.1:17904",
@@ -750,13 +750,30 @@ static void test_event_log(void) {
     pulse_event_record_probes(&saved, PULSE_EVENT_QUIETOK,
                               "127.0.0.1:17904", 1, 1700000308, -1,
                               88, 21, 20);
-    CHECK(pulse_event_log_save(&saved, ev_path) == 9);
+    /* Slow-peer warning (0.73.0): a SLOW event recorded with the
+     * mean RTT at the crossing — 12 ms against a 5 ms threshold —
+     * and the probe counts at the crossing, 31 sent and 30
+     * answered, round-trips with all of it, so a restart restores
+     * how slow the peer was, not just that it was slow. */
+    pulse_event_record_rtt_mean_ms(&saved, PULSE_EVENT_SLOW,
+                                   "127.0.0.1:17904", 1, 1700000309, -1,
+                                   2, 31, 30, -1, -1, 12);
+    /* Slow-peer recovery (0.73.0): a SLOWOK event recorded with
+     * the mean RTT at the recovery — 4 ms, back at or below the
+     * 5 ms threshold — and the probe counts at the recovery, 41
+     * sent and 40 answered, round-trips with all of it, so a
+     * restart restores how far the mean had come back, not just
+     * that the episode ended. */
+    pulse_event_record_rtt_mean_ms(&saved, PULSE_EVENT_SLOWOK,
+                                   "127.0.0.1:17904", 1, 1700000310, -1,
+                                   1, 41, 40, -1, -1, 4);
+    CHECK(pulse_event_log_save(&saved, ev_path) == 11);
     pulse_event_log_free(&saved);
 
     pulse_event_log_t restored;
-    pulse_event_log_init(&restored, 9);
-    CHECK(pulse_event_log_load(&restored, ev_path) == 9);
-    CHECK(pulse_event_latest_seq(&restored) == 9);
+    pulse_event_log_init(&restored, 11);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 11);
+    CHECK(pulse_event_latest_seq(&restored) == 11);
     CHECK(pulse_event_oldest_seq(&restored) == 1);
     CHECK(pulse_event_wait(&restored, 0, &ev, 20) == 1);
     CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
@@ -845,10 +862,40 @@ static void test_event_log(void) {
     CHECK(ev.probe_rate == -1);
     CHECK(ev.phi == -1);
     CHECK(ev.suspect_ms == -1);
+    /* The SLOW event recorded after it comes back with the mean
+     * at the crossing and the probe counts (0.73.0): the warning
+     * survives the restart with the number that fired it, not
+     * just the fact that it fired. */
+    CHECK(pulse_event_wait(&restored, 9, &ev, 20) == 1);
+    CHECK(ev.seq == 10 && ev.type == PULSE_EVENT_SLOW &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000309);
+    CHECK(ev.last_seen_ms == 2);
+    CHECK(ev.probes_sent == 31);
+    CHECK(ev.probes_answered == 30);
+    CHECK(ev.rtt_mean_ms == 12);
+    CHECK(ev.probe_rate == -1);
+    CHECK(ev.phi == -1);
+    CHECK(ev.suspect_ms == -1);
+    /* The SLOWOK event recorded after it comes back with the mean
+     * at the recovery and the probe counts (0.73.0): the recovery
+     * survives the restart with how far the mean had come back,
+     * not just that the episode ended. */
+    CHECK(pulse_event_wait(&restored, 10, &ev, 20) == 1);
+    CHECK(ev.seq == 11 && ev.type == PULSE_EVENT_SLOWOK &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000310);
+    CHECK(ev.last_seen_ms == 1);
+    CHECK(ev.probes_sent == 41);
+    CHECK(ev.probes_answered == 40);
+    CHECK(ev.rtt_mean_ms == 4);
+    CHECK(ev.probe_rate == -1);
+    CHECK(ev.phi == -1);
+    CHECK(ev.suspect_ms == -1);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
-                       2, 1700000309);
-    CHECK(pulse_event_latest_seq(&restored) == 10);
+                       2, 1700000311);
+    CHECK(pulse_event_latest_seq(&restored) == 12);
     pulse_event_log_free(&restored);
 
     /* The QUIET word (0.62.0) parses back to the QUIET type, so a
@@ -899,11 +946,35 @@ static void test_event_log(void) {
     CHECK(pulse_event_result_state(PULSE_EVENT_QUIETOK, &kstate) == 1);
     CHECK(kstate == MEMBER_ALIVE);
 
+    /* The SLOW word (0.73.0) parses back to the SLOW type,
+     * so a WATCH filter can subscribe to it by name, and it lands
+     * on ALIVE for the state filter — the peer is still alive,
+     * it has just started answering its probes slowly. */
+    pulse_event_type_t stype;
+    CHECK(pulse_event_type_parse("SLOW", &stype) == 0);
+    CHECK(stype == PULSE_EVENT_SLOW);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_SLOW), "SLOW") == 0);
+    member_state_t sstate;
+    CHECK(pulse_event_result_state(PULSE_EVENT_SLOW, &sstate) == 1);
+    CHECK(sstate == MEMBER_ALIVE);
+
+    /* The SLOWOK word (0.73.0) parses back to the SLOWOK type,
+     * so a WATCH filter can subscribe to it by name, and it lands
+     * on ALIVE for the state filter — the peer is still alive,
+     * it is answering fast enough again. */
+    pulse_event_type_t otype;
+    CHECK(pulse_event_type_parse("SLOWOK", &otype) == 0);
+    CHECK(otype == PULSE_EVENT_SLOWOK);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_SLOWOK), "SLOWOK") == 0);
+    member_state_t ostate;
+    CHECK(pulse_event_result_state(PULSE_EVENT_SLOWOK, &ostate) == 1);
+    CHECK(ostate == MEMBER_ALIVE);
+
     /* A missing file loads zero events, and a malformed line is
      * skipped while the good lines around it still load. */
-    /* Seven events load into a cap-7 ring (0.72.0), so all of them
+    /* Nine events load into a cap-9 ring (0.73.0), so all of them
      * survive, including the plain pre-0.60.0 DEAD line. */
-    pulse_event_log_init(&restored, 7);
+    pulse_event_log_init(&restored, 9);
     CHECK(pulse_event_log_load(&restored,
                                "/tmp/pulse-event-log-no-such-file.txt") == 0);
     CHECK(pulse_event_latest_seq(&restored) == 0);
@@ -941,10 +1012,22 @@ static void test_event_log(void) {
         fprintf(mf,
                 "13 QUIETOK 127.0.0.1:17905 2 1700000406 "
                 "last_seen_ms=88 probes_sent=21 probes_answered=20\n");
+        /* A SLOW event line (0.73.0) loads as SLOW with its mean
+         * RTT and probe counts and no phi. */
+        fprintf(mf,
+                "14 SLOW 127.0.0.1:17905 2 1700000407 "
+                "last_seen_ms=2 probes_sent=31 probes_answered=30 "
+                "rtt_mean_ms=12\n");
+        /* A SLOWOK event line (0.73.0) loads as SLOWOK with its
+         * mean RTT and probe counts and no phi. */
+        fprintf(mf,
+                "15 SLOWOK 127.0.0.1:17905 2 1700000408 "
+                "last_seen_ms=1 probes_sent=41 probes_answered=40 "
+                "rtt_mean_ms=4\n");
         fclose(mf);
     }
-    CHECK(pulse_event_log_load(&restored, ev_path) == 7);
-    CHECK(pulse_event_latest_seq(&restored) == 13);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 9);
+    CHECK(pulse_event_latest_seq(&restored) == 15);
     CHECK(pulse_event_oldest_seq(&restored) == 7);
     CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
     CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_DEAD);
@@ -990,6 +1073,26 @@ static void test_event_log(void) {
     CHECK(ev.probes_sent == 21);
     CHECK(ev.probes_answered == 20);
     CHECK(ev.probe_rate == -1);
+    /* The SLOW event recorded after it comes back with the mean
+     * at the crossing and the probe counts (0.73.0): the warning
+     * survives the load with the number that fired it. */
+    CHECK(pulse_event_wait(&restored, 13, &ev, 20) == 1);
+    CHECK(ev.seq == 14 && ev.type == PULSE_EVENT_SLOW &&
+          ev.last_seen_ms == 2);
+    CHECK(ev.phi == -1);
+    CHECK(ev.probes_sent == 31);
+    CHECK(ev.probes_answered == 30);
+    CHECK(ev.rtt_mean_ms == 12);
+    /* The SLOWOK event recorded after it comes back with the mean
+     * at the recovery and the probe counts (0.73.0): the recovery
+     * survives the load with how far the mean had come back. */
+    CHECK(pulse_event_wait(&restored, 14, &ev, 20) == 1);
+    CHECK(ev.seq == 15 && ev.type == PULSE_EVENT_SLOWOK &&
+          ev.last_seen_ms == 1);
+    CHECK(ev.phi == -1);
+    CHECK(ev.probes_sent == 41);
+    CHECK(ev.probes_answered == 40);
+    CHECK(ev.rtt_mean_ms == 4);
     pulse_event_log_free(&restored);
     unlink(ev_path);
 }

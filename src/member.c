@@ -616,8 +616,17 @@ int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,
     /* Slow-peer warning (0.22.0): a first crossing above the threshold
      * returns 2 so the caller warns once for the episode; the flag
      * clears when the mean recovers, so a later crossing warns again.
-     * A threshold of 0 disables the warning entirely. */
+     * Clearing a warned flag returns 3 (0.73.0), so the caller can
+     * log the recovery once too — a plain 1 would leave the
+     * recovery silent, and the caller cannot tell a recovery from
+     * an ordinary sample. A threshold of 0 disables the warning
+     * entirely, so a sample with no threshold never returns 3:
+     * the flag can only be set while a threshold is configured. */
     if (!member_is_slow(m, slow_threshold_ms)) {
+        if (m->rtt_slow_warned && slow_threshold_ms > 0) {
+            m->rtt_slow_warned = 0;
+            return 3;
+        }
         m->rtt_slow_warned = 0;
         return 1;
     }

@@ -402,8 +402,10 @@ int member_count_low_probe_rate(const member_table_t *t,
  * crosses above it, returns 2 so the caller can warn once for the
  * episode (see rtt_slow_warned); the warning clears when the mean
  * drops back to or below the threshold, so a recovery followed by a
- * new crossing warns again. Returns 1 when the member exists and the
- * sample was recorded without a new crossing, 0 otherwise. Does not
+ * new crossing warns again — the sample that clears a warned episode
+ * returns 3, so the caller can log the recovery once too (0.73.0).
+ * Returns 1 when the member exists and the sample was recorded
+ * without a new crossing or a recovery, 0 otherwise. Does not
  * bump the table version: RTT is local measurement, not gossip
  * content. A negative sample is ignored. */
 int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,

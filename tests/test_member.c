@@ -207,8 +207,10 @@ int main(void) {
      * (mean == threshold is not slow), 0 disables the warning, and a
      * peer with no samples is never slow. member_note_rtt returns 2
      * on the first crossing above the threshold (the caller warns
-     * once per episode), 1 while already warned, and 1 again once
-     * the mean recovers — a second crossing then returns 2 again. */
+     * once per episode), 1 while already warned, and 3 on the sample
+     * that clears a warned episode (0.73.0, so the caller can log
+     * the recovery once too) — a second crossing then returns 2
+     * again. */
     CHECK(member_rtt_mean_ms(m2) == 5);
     CHECK(member_is_slow(m2, 0) == 0);  /* disabled */
     CHECK(member_is_slow(m2, 5) == 0);  /* mean == threshold: not slow */
@@ -228,9 +230,12 @@ int main(void) {
     CHECK(member_rtt_max_ms(m2) == 10);
     /* Four 0 ms samples drag the mean to (30+0)/8 = 3, back below
      * the threshold: the warning clears. The max stays 10: a fast
-     * probe never erases the worst one. */
+     * probe never erases the worst one. The first 0 leaves the
+     * mean at 6, still slow; the second brings it to exactly 5 —
+     * not slow, so that sample returns 3, the recovery, and the
+     * two after it are ordinary samples again. */
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
-    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 3);
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
     CHECK(member_note_rtt(&t, "127.0.0.1:17102", 0, 5) == 1);
     CHECK(member_rtt_mean_ms(m2) == 3);

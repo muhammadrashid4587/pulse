@@ -1967,7 +1967,7 @@ typedef struct {
     int n_ids;
     /* State filter (0.39.0): "STATE <list>" narrows the stream to
      * events that leave their member in one of these states —
-     * JOINED/REVIVED/REFUTED/QUIET/QUIETOK/LOWRATE/RATEOK land on ALIVE, SUSPECTED on SUSPECT,
+     * JOINED/REVIVED/REFUTED/QUIET/QUIETOK/LOWRATE/RATEOK/SLOW/SLOWOK land on ALIVE, SUSPECTED on SUSPECT,
      * DEAD on DEAD — and narrows the snapshot the same way, so a
      * watcher subscribed to DEAD snapshots only the dead members.
      * One bit per member_state_t; DROPPED lands on no state, so it
@@ -2305,7 +2305,7 @@ static int watch_wait_paused(int fd, watch_pause_entry_t *pause_entry,
  * an event leaves its member in: "WATCH STATE SUSPECT,DEAD"
  * carries only events that land on SUSPECT or DEAD, so a watcher
  * that only cares about trouble never sees joins or revivals.
- * JOINED, REVIVED, REFUTED, QUIET, QUIETOK, LOWRATE and RATEOK land on ALIVE, SUSPECTED on SUSPECT,
+ * JOINED, REVIVED, REFUTED, QUIET, QUIETOK, LOWRATE, RATEOK, SLOW and SLOWOK land on ALIVE, SUSPECTED on SUSPECT,
  * DEAD on DEAD, and DROPPED lands on no state at all — the member
  * left the table — so it never matches a state filter; a watcher
  * that wants removals subscribes to the DROPPED type instead.
@@ -2557,7 +2557,16 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
              * shows how long the false suspicion lasted — after
              * the probe rate when it is present; a REVIVED for a
              * DEAD peer (a restart) and every other event carry
-             * no field. */
+             * no field. Mean probe RTT (0.73.0): a SLOW event
+             * carries the peer's mean probe RTT when the
+             * threshold was crossed, as a trailing
+             * " rtt_mean_ms=<ms>" — the same value JSON reports
+             * as "rtt_mean_ms", frozen at the event so a replay
+             * still shows how slow the peer was — after the
+             * suspicion duration when it is present; a SLOWOK
+             * event carries the same field with the mean when it
+             * recovered to the threshold or below; no other event
+             * carries one. */
             size_t used = (size_t)snprintf(
                 line, sizeof line, "EVENT %llu %s %s %u %lld",
                 (unsigned long long)ev.seq,
@@ -2590,6 +2599,12 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
                 snprintf(line + used, sizeof line - used,
                          " suspect_ms=%lld",
                          (long long)ev.suspect_ms);
+                used = strlen(line);
+            }
+            if (ev.rtt_mean_ms >= 0) {
+                snprintf(line + used, sizeof line - used,
+                         " rtt_mean_ms=%lld",
+                         (long long)ev.rtt_mean_ms);
                 used = strlen(line);
             }
             if (used < sizeof line - 1) {

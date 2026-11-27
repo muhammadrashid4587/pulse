@@ -426,6 +426,19 @@ static void record_event_phi_suspect(pulse_event_type_t type,
      * when the event is recorded (a GC'd DROPPED, a LEAVE), has
      * none: -1, never a fabricated zero. */
     double probe_rate = -1;
+    /* Mean probe RTT (0.73.0): the peer's mean direct-probe
+     * round-trip time in ms when the event was recorded — the
+     * same value JSON reports as "rtt_mean_ms", frozen at the
+     * event instead of recomputed at replay time, so a replayed
+     * SLOW event still shows how slow the peer was when the
+     * threshold was crossed, and a replayed SLOWOK event still
+     * shows how far the mean had recovered when the episode
+     * ended. Carried only on a SLOW or SLOWOK event: every other
+     * event has no mean to report. Self never probes itself
+     * and a member never answered a probe, or already gone from
+     * the table when the event was recorded, has none: -1, never
+     * a fabricated zero. */
+    int64_t rtt_mean_ms = -1;
     if (strcmp(id, g_self_id) != 0) {
         int64_t now = pulse_now_ms();
         pthread_mutex_lock(&g_lock);
@@ -439,16 +452,20 @@ static void record_event_phi_suspect(pulse_event_type_t type,
             if (type == PULSE_EVENT_LOWRATE ||
                 type == PULSE_EVENT_RATEOK)
                 probe_rate = member_probe_rate(m);
+            if (type == PULSE_EVENT_SLOW ||
+                type == PULSE_EVENT_SLOWOK)
+                rtt_mean_ms = member_rtt_mean_ms(m);
         }
         pthread_mutex_unlock(&g_lock);
     }
-    uint64_t seq = pulse_event_record_suspect_ms(&g_event_log, type, id,
+    uint64_t seq = pulse_event_record_rtt_mean_ms(&g_event_log, type, id,
                                                   incarnation, ts, phi,
                                                   last_seen_age,
                                                   probes_sent,
                                                   probes_answered,
                                                   probe_rate,
-                                                  suspect_ms);
+                                                  suspect_ms,
+                                                  rtt_mean_ms);
     if (g_events_path[0] == '\0') return;
     pthread_mutex_lock(&g_events_file_lock);
     FILE *f = fopen(g_events_path, "a");
@@ -468,7 +485,10 @@ static void record_event_phi_suspect(pulse_event_type_t type,
          * when they are present, and a REVIVED event for a peer
          * that was SUSPECT (0.70.0) carries how long it sat
          * SUSPECT as a trailing " suspect_ms=<ms>", after the
-         * probe rate when it is present — so all five values
+         * probe rate when it is present, and a SLOW event
+         * (0.73.0) — or a SLOWOK event — carries its mean probe
+         * RTT as a trailing " rtt_mean_ms=<ms>", after the
+         * suspicion duration when it is present — so all six values
          * survive a restart and a replay exactly as the WATCH
          * stream shows them; an event with none writes the plain
          * five fields. */
@@ -487,6 +507,8 @@ static void record_event_phi_suspect(pulse_event_type_t type,
         if (probe_rate >= 0) fprintf(f, " probe_rate=%.2f", probe_rate);
         if (suspect_ms >= 0)
             fprintf(f, " suspect_ms=%lld", (long long)suspect_ms);
+        if (rtt_mean_ms >= 0)
+            fprintf(f, " rtt_mean_ms=%lld", (long long)rtt_mean_ms);
         fputc('\n', f);
         fclose(f);
     }
@@ -808,12 +830,23 @@ static void handle_message(const gmsg_t *msg) {
             }
             /* Slow-peer warning (0.22.0): member_note_rtt returns 2
              * when the peer's mean RTT first crosses above the
-             * configured threshold. Log once per episode (the flag
-             * in the table clears on recovery, so a re-crossing
-             * warns again). The log happens after the unlock: the
-             * log lock is separate, but there is no reason to hold
-             * the table lock across IO. */
+             * configured threshold, and 3 (0.73.0) when the mean
+             * recovers to the threshold or below after a warned
+             * episode. Log once per episode (the flag in the table
+             * clears on recovery, so a re-crossing warns again),
+             * and record a SLOW event on the crossing and a SLOWOK
+             * event on the recovery, so the alert lifecycle is
+             * visible on the WATCH stream instead of only in the
+             * log — the mirror of LOWRATE/RATEOK and QUIET/QUIETOK.
+             * The log and the event happen after the unlock and
+             * after note_contact: the log lock is separate, but
+             * there is no reason to hold the table lock across IO,
+             * and the contact is what revives a SUSPECT peer to
+             * ALIVE, so by record time the peer is ALIVE again and
+             * the event's frozen last_seen_ms is the contact that
+             * just arrived, not the age before it. */
             int64_t slow_mean_ms = -1;
+            int64_t slowok_mean_ms = -1;
             if (rtt_ms >= 0) {
                 /* Probe-RTT histogram (0.48.0): every answered
                  * direct probe adds one sample to the global RTT
@@ -838,14 +871,27 @@ static void handle_message(const gmsg_t *msg) {
                 if (r == 2) {
                     member_t *slow = member_find(&g_table, msg->from_id);
                     if (slow) slow_mean_ms = member_rtt_mean_ms(slow);
+                } else if (r == 3) {
+                    member_t *slow = member_find(&g_table, msg->from_id);
+                    if (slow) slowok_mean_ms = member_rtt_mean_ms(slow);
                 }
             }
             pthread_mutex_unlock(&g_lock);
-            if (slow_mean_ms >= 0)
+            note_contact(msg, &from_addr);
+            if (slow_mean_ms >= 0) {
                 log_line("SLOW %s mean=%lldms threshold=%lldms",
                          msg->from_id, (long long)slow_mean_ms,
                          (long long)g_cfg.slow_peer_rtt_ms);
-            note_contact(msg, &from_addr);
+                record_event(PULSE_EVENT_SLOW, msg->from_id,
+                             msg->from_inc);
+            }
+            if (slowok_mean_ms >= 0) {
+                log_line("SLOWOK %s mean=%lldms threshold=%lldms",
+                         msg->from_id, (long long)slowok_mean_ms,
+                         (long long)g_cfg.slow_peer_rtt_ms);
+                record_event(PULSE_EVENT_SLOWOK, msg->from_id,
+                             msg->from_inc);
+            }
             if (has_requester) {
                 /* Forward the ACK to the node that asked us to probe. */
                 gossip_send_ack(g_send_sock, &requester, msg->seq,

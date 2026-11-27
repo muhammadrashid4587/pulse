@@ -412,7 +412,7 @@
  *       SNAPSHOT line per member — id, incarnation, state,
  *       last-seen-ms (or '-') and source, the PEERS shape — then
  *       END, then one EVENT line per membership event as it happens:
- *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE|RATEOK|QUIETOK>
+ *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE|RATEOK|QUIETOK|SLOW|SLOWOK>
  *       <id> <incarnation> <unix-seconds>. JOINED is a peer
  *       appearing in the table, SUSPECTED is ALIVE -> SUSPECT, DEAD
  *       is SUSPECT -> DEAD, REVIVED is a SUSPECT/DEAD peer coming
@@ -432,7 +432,13 @@
  *       and QUIETOK (0.72.0) is an ALIVE peer whose last-contact
  *       age dropped back to the quiet-peer threshold or below
  *       after a QUIET episode — the peer is still alive, it has
- *       been heard from again.
+ *       been heard from again — and SLOW (0.73.0) is an ALIVE
+ *       peer whose mean probe RTT crossed the slow-peer
+ *       threshold — the peer is still alive, it has just started
+ *       answering its probes slowly — and SLOWOK (0.73.0) is an
+ *       ALIVE peer whose mean probe RTT recovered to the
+ *       slow-peer threshold or below after a SLOW episode — the
+ *       peer is still alive, it is answering fast enough again.
  *       The connection
  *       stays open until the client closes it (or falls too far
  *       behind: the event log is a bounded ring, so a slow consumer
@@ -485,7 +491,16 @@
  *       at the event so a replay still shows how long the false
  *       suspicion lasted — after the probe rate when it is
  *       present; a REVIVED for a DEAD peer (a restart) and every
- *       other event carry no field. An event with
+ *       other event carry no field. A SLOW event carries a
+ *       trailing " rtt_mean_ms=<ms>" (0.73.0) — the peer's mean
+ *       probe RTT when the threshold was crossed, the same value
+ *       JSON reports as "rtt_mean_ms", frozen at the event so a
+ *       replay still shows how slow the peer was — after the
+ *       suspicion duration when it is present; a SLOWOK event
+ *       carries the same trailing field — the mean when it
+ *       recovered to the threshold or below, frozen at the event
+ *       so a replay still shows how far the mean had come back —
+ *       and no other event carries one. An event with
  *       no trailing field writes the plain five fields, so
  *       existing consumers see byte-identical lines.
  *       A filter (0.30.0) narrows the stream server-side: an
@@ -507,7 +522,7 @@
  *       state an event leaves its member in: "WATCH STATE
  *       SUSPECT,DEAD" carries only events that land on SUSPECT
  *       or DEAD. JOINED, REVIVED, REFUTED, QUIET, QUIETOK,
- *       LOWRATE and RATEOK land on ALIVE,
+ *       LOWRATE, RATEOK, SLOW and SLOWOK land on ALIVE,
  *       SUSPECTED on SUSPECT, DEAD on DEAD, and DROPPED lands on
  *       no state — the member left the table — so it never
  *       matches a state filter; a watcher that wants removals

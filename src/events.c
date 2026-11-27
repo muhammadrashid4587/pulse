@@ -63,6 +63,10 @@ const char *pulse_event_type_name(pulse_event_type_t type) {
             return "RATEOK";
         case PULSE_EVENT_QUIETOK:
             return "QUIETOK";
+        case PULSE_EVENT_SLOW:
+            return "SLOW";
+        case PULSE_EVENT_SLOWOK:
+            return "SLOWOK";
         default:
             return "UNKNOWN";
     }
@@ -72,8 +76,8 @@ int pulse_event_type_parse(const char *name, pulse_event_type_t *out) {
     static const char *names[] = {"JOINED",   "SUSPECTED", "DEAD",
                                   "REVIVED",  "DROPPED",   "REFUTED",
                                   "QUIET",    "LOWRATE",   "RATEOK",
-                                  "QUIETOK"};
-    for (int i = 0; i < 10; i++) {
+                                  "QUIETOK",  "SLOW",      "SLOWOK"};
+    for (int i = 0; i < 12; i++) {
         if (strcmp(name, names[i]) == 0) {
             *out = (pulse_event_type_t)i;
             return 0;
@@ -100,6 +104,8 @@ int pulse_event_result_state(pulse_event_type_t type, member_state_t *out) {
         case PULSE_EVENT_LOWRATE:
         case PULSE_EVENT_RATEOK:
         case PULSE_EVENT_QUIETOK:
+        case PULSE_EVENT_SLOW:
+        case PULSE_EVENT_SLOWOK:
             *out = MEMBER_ALIVE;
             return 1;
         case PULSE_EVENT_SUSPECTED:
@@ -124,7 +130,7 @@ static void log_insert(pulse_event_log_t *log, uint64_t seq,
                        uint32_t incarnation, int64_t unix_ts, double phi,
                        int64_t last_seen_ms, int64_t probes_sent,
                        int64_t probes_answered, double probe_rate,
-                       int64_t suspect_ms) {
+                       int64_t suspect_ms, int64_t rtt_mean_ms) {
     pulse_event_t *slot = &log->events[log->head];
     slot->seq = seq;
     slot->type = type;
@@ -137,6 +143,7 @@ static void log_insert(pulse_event_log_t *log, uint64_t seq,
     slot->probes_answered = probes_answered;
     slot->probe_rate = probe_rate;
     slot->suspect_ms = suspect_ms;
+    slot->rtt_mean_ms = rtt_mean_ms;
     log->head = (log->head + 1) % log->cap;
     if (log->count < log->cap) log->count++;
 }
@@ -199,11 +206,28 @@ uint64_t pulse_event_record_suspect_ms(pulse_event_log_t *log,
                                        int64_t probes_answered,
                                        double probe_rate,
                                        int64_t suspect_ms) {
+    return pulse_event_record_rtt_mean_ms(log, type, id, incarnation,
+                                          unix_ts, phi, last_seen_ms,
+                                          probes_sent, probes_answered,
+                                          probe_rate, suspect_ms, -1);
+}
+
+uint64_t pulse_event_record_rtt_mean_ms(pulse_event_log_t *log,
+                                       pulse_event_type_t type,
+                                       const char *id,
+                                       uint32_t incarnation,
+                                       int64_t unix_ts, double phi,
+                                       int64_t last_seen_ms,
+                                       int64_t probes_sent,
+                                       int64_t probes_answered,
+                                       double probe_rate,
+                                       int64_t suspect_ms,
+                                       int64_t rtt_mean_ms) {
     pthread_mutex_lock(&log->lock);
     uint64_t seq = log->next_seq++;
     log_insert(log, seq, type, id, incarnation, unix_ts, phi,
                last_seen_ms, probes_sent, probes_answered, probe_rate,
-               suspect_ms);
+               suspect_ms, rtt_mean_ms);
     /* A waiter may be waiting for exactly this event; a broadcast
      * wakes it, and it re-checks under the lock. */
     pthread_cond_broadcast(&log->cond);
@@ -232,7 +256,11 @@ uint64_t pulse_event_record_suspect_ms(pulse_event_log_t *log,
  * when they are present; and a REVIVED event for a peer that was
  * SUSPECT (0.70.0) carries a trailing " suspect_ms=<ms>" — how
  * long the peer sat SUSPECT before it came back ALIVE — after
- * the probe rate when it is present; the loader accepts lines
+ * the probe rate when it is present; and a SLOW event (0.73.0)
+ * — or a SLOWOK event — carries a trailing " rtt_mean_ms=<ms>"
+ * — the peer's mean probe RTT when the threshold was crossed,
+ * or when the mean recovered to it — after the suspicion
+ * duration when it is present; the loader accepts lines
  * with any of the trailing fields, or none of them. An event
  * with none writes the plain five fields, so existing consumers
  * see byte-identical lines. */
@@ -272,7 +300,7 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path) {
         /* The base five fields, then each trailing field that is
          * present: phi first, then the last-contact age, then the
          * probe counts, then the probe rate, then the suspicion
-         * duration — the same order the WATCH stream writes them. */
+         * duration, then the mean probe RTT — the same order the WATCH stream writes them. */
         fprintf(f, "%llu %s %s %u %lld",
                 (unsigned long long)held[i].seq,
                 pulse_event_type_name(held[i].type), held[i].id,
@@ -290,6 +318,9 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path) {
         if (held[i].suspect_ms >= 0)
             fprintf(f, " suspect_ms=%lld",
                     (long long)held[i].suspect_ms);
+        if (held[i].rtt_mean_ms >= 0)
+            fprintf(f, " rtt_mean_ms=%lld",
+                    (long long)held[i].rtt_mean_ms);
         fputc('\n', f);
     }
     free(held);
@@ -324,11 +355,14 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
          * counts when they are present, and a REVIVED event for
          * a peer that was SUSPECT carries a trailing
          * " suspect_ms=<ms>" (0.70.0) — after the probe rate
-         * when it is present.
+         * when it is present, and a SLOW event carries a
+         * trailing " rtt_mean_ms=<ms>" (0.73.0) — or a SLOWOK
+         * event — after the suspicion duration when it is
+         * present.
          * The fields are parsed independently — any of them may
          * be present without the others — so a line without one,
          * or without all five (written before 0.60.0/0.61.0/
-         * 0.67.0/0.68.0/0.70.0, or an event with nothing measured),
+         * 0.67.0/0.68.0/0.70.0/0.73.0, or an event with nothing measured),
          * loads with -1 for the missing ones. Ids carry no
          * spaces, so the strstr cannot match inside an id. */
         double phi = -1;
@@ -337,6 +371,7 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
         int64_t probes_answered = -1;
         double probe_rate = -1;
         int64_t suspect_ms = -1;
+        int64_t rtt_mean_ms = -1;
         const char *phi_at = strstr(line, " phi=");
         if (phi_at) sscanf(phi_at + 5, "%lf", &phi);
         const char *seen_at = strstr(line, " last_seen_ms=");
@@ -365,6 +400,12 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
             if (sscanf(suspect_at + 12, "%lld", &v) == 1)
                 suspect_ms = (int64_t)v;
         }
+        const char *rtt_mean_at = strstr(line, " rtt_mean_ms=");
+        if (rtt_mean_at) {
+            long long v;
+            if (sscanf(rtt_mean_at + 13, "%lld", &v) == 1)
+                rtt_mean_ms = (int64_t)v;
+        }
         if (seq == 0) continue;
         pulse_event_type_t type;
         if (pulse_event_type_parse(type_name, &type) != 0) continue;
@@ -375,7 +416,7 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
         if (seq >= log->next_seq) {
             log_insert(log, seq, type, id, inc, (int64_t)ts, phi,
                        last_seen_ms, probes_sent, probes_answered,
-                       probe_rate, suspect_ms);
+                       probe_rate, suspect_ms, rtt_mean_ms);
             log->next_seq = seq + 1;
             loaded++;
         }
