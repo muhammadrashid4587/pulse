@@ -59,6 +59,8 @@ const char *pulse_event_type_name(pulse_event_type_t type) {
             return "QUIET";
         case PULSE_EVENT_LOWRATE:
             return "LOWRATE";
+        case PULSE_EVENT_RATEOK:
+            return "RATEOK";
         default:
             return "UNKNOWN";
     }
@@ -67,8 +69,8 @@ const char *pulse_event_type_name(pulse_event_type_t type) {
 int pulse_event_type_parse(const char *name, pulse_event_type_t *out) {
     static const char *names[] = {"JOINED",   "SUSPECTED", "DEAD",
                                   "REVIVED",  "DROPPED",   "REFUTED",
-                                  "QUIET",    "LOWRATE"};
-    for (int i = 0; i < 8; i++) {
+                                  "QUIET",    "LOWRATE",   "RATEOK"};
+    for (int i = 0; i < 9; i++) {
         if (strcmp(name, names[i]) == 0) {
             *out = (pulse_event_type_t)i;
             return 0;
@@ -93,6 +95,7 @@ int pulse_event_result_state(pulse_event_type_t type, member_state_t *out) {
         case PULSE_EVENT_REFUTED:
         case PULSE_EVENT_QUIET:
         case PULSE_EVENT_LOWRATE:
+        case PULSE_EVENT_RATEOK:
             *out = MEMBER_ALIVE;
             return 1;
         case PULSE_EVENT_SUSPECTED:
@@ -198,9 +201,11 @@ uint64_t pulse_event_record_rate(pulse_event_log_t *log,
  * " probes_sent=<n> probes_answered=<n>" — how many direct probes
  * this node had sent the member and how many were answered when
  * the event was recorded — after the last_seen_ms field when it is
- * present, and a LOWRATE event (0.68.0) carries a trailing
+ * present, and a LOWRATE event (0.68.0) — or a RATEOK event
+ * (0.69.0) — carries a trailing
  * " probe_rate=<value>" — two decimals, the recent probe success
- * rate when the threshold was crossed — after the probe counts
+ * rate when the threshold was crossed, or when the rate recovered
+ * to it — after the probe counts
  * when they are present; the loader accepts lines with any of
  * the trailing fields, or none of them. An event with none writes
  * the plain five fields, so existing consumers see byte-identical
@@ -286,7 +291,8 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
          * " probes_sent=<n> probes_answered=<n>" (0.67.0),
          * after the last_seen_ms when it is present, and a
          * LOWRATE event carries a trailing " probe_rate=<value>"
-         * (0.68.0), after the probe counts when they are present.
+         * (0.68.0) — or a RATEOK event (0.69.0) — after the probe
+         * counts when they are present.
          * The fields are parsed independently — any of them may
          * be present without the others — so a line without one,
          * or without all four (written before 0.60.0/0.61.0/

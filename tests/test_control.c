@@ -680,7 +680,7 @@ static void test_event_log(void) {
      * continues the sequence instead of restarting at 1. */
     const char *ev_path = "/tmp/pulse-event-log-test.txt";
     pulse_event_log_t saved;
-    pulse_event_log_init(&saved, 6);
+    pulse_event_log_init(&saved, 7);
     pulse_event_record(&saved, PULSE_EVENT_JOINED, "127.0.0.1:17904", 1,
                        1700000300);
     pulse_event_record(&saved, PULSE_EVENT_SUSPECTED, "127.0.0.1:17904",
@@ -718,13 +718,22 @@ static void test_event_log(void) {
     pulse_event_record_rate(&saved, PULSE_EVENT_LOWRATE,
                             "127.0.0.1:17904", 1, 1700000305, -1,
                             640, 24, 6, 0.20);
-    CHECK(pulse_event_log_save(&saved, ev_path) == 6);
+    /* Low-probe-rate recovery (0.69.0): a RATEOK event recorded
+     * with a rate — 0.80 over its recent window, 20 probes sent
+     * and 16 answered, 120 ms since the node last heard from the
+     * member when the rate recovered — round-trips with all of
+     * it, so a restart restores how far the rate had come back,
+     * not just that the episode ended. */
+    pulse_event_record_rate(&saved, PULSE_EVENT_RATEOK,
+                            "127.0.0.1:17904", 1, 1700000306, -1,
+                            120, 20, 16, 0.80);
+    CHECK(pulse_event_log_save(&saved, ev_path) == 7);
     pulse_event_log_free(&saved);
 
     pulse_event_log_t restored;
-    pulse_event_log_init(&restored, 6);
-    CHECK(pulse_event_log_load(&restored, ev_path) == 6);
-    CHECK(pulse_event_latest_seq(&restored) == 6);
+    pulse_event_log_init(&restored, 7);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 7);
+    CHECK(pulse_event_latest_seq(&restored) == 7);
     CHECK(pulse_event_oldest_seq(&restored) == 1);
     CHECK(pulse_event_wait(&restored, 0, &ev, 20) == 1);
     CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
@@ -770,10 +779,23 @@ static void test_event_log(void) {
     CHECK(ev.probes_answered == 6);
     CHECK(ev.probe_rate == 0.20);
     CHECK(ev.phi == -1);
+    /* The RATEOK event recorded after it comes back with its
+     * rate and counts (0.69.0): the recovery survives the restart
+     * with the number that ended the episode, not just the fact
+     * that it ended. */
+    CHECK(pulse_event_wait(&restored, 6, &ev, 20) == 1);
+    CHECK(ev.seq == 7 && ev.type == PULSE_EVENT_RATEOK &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000306);
+    CHECK(ev.last_seen_ms == 120);
+    CHECK(ev.probes_sent == 20);
+    CHECK(ev.probes_answered == 16);
+    CHECK(ev.probe_rate == 0.80);
+    CHECK(ev.phi == -1);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
-                       2, 1700000306);
-    CHECK(pulse_event_latest_seq(&restored) == 7);
+                       2, 1700000307);
+    CHECK(pulse_event_latest_seq(&restored) == 8);
     pulse_event_log_free(&restored);
 
     /* The QUIET word (0.62.0) parses back to the QUIET type, so a
@@ -800,9 +822,23 @@ static void test_event_log(void) {
     CHECK(pulse_event_result_state(PULSE_EVENT_LOWRATE, &lstate) == 1);
     CHECK(lstate == MEMBER_ALIVE);
 
+    /* The RATEOK word (0.69.0) parses back to the RATEOK type,
+     * so a WATCH filter can subscribe to it by name, and it lands
+     * on ALIVE for the state filter — the peer is still alive,
+     * it has just recovered to answering enough of its probes. */
+    pulse_event_type_t rtype;
+    CHECK(pulse_event_type_parse("RATEOK", &rtype) == 0);
+    CHECK(rtype == PULSE_EVENT_RATEOK);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_RATEOK), "RATEOK") == 0);
+    member_state_t rstate;
+    CHECK(pulse_event_result_state(PULSE_EVENT_RATEOK, &rstate) == 1);
+    CHECK(rstate == MEMBER_ALIVE);
+
     /* A missing file loads zero events, and a malformed line is
      * skipped while the good lines around it still load. */
-    pulse_event_log_init(&restored, 4);
+    /* Six events load into a cap-6 ring (0.69.0), so all of them
+     * survive, including the plain pre-0.60.0 DEAD line. */
+    pulse_event_log_init(&restored, 6);
     CHECK(pulse_event_log_load(&restored,
                                "/tmp/pulse-event-log-no-such-file.txt") == 0);
     CHECK(pulse_event_latest_seq(&restored) == 0);
@@ -829,11 +865,17 @@ static void test_event_log(void) {
                 "11 LOWRATE 127.0.0.1:17905 2 1700000404 "
                 "last_seen_ms=640 probes_sent=24 probes_answered=6 "
                 "probe_rate=0.20\n");
+        /* A RATEOK event line (0.69.0) loads as RATEOK with its
+         * rate and probe counts and no phi. */
+        fprintf(mf,
+                "12 RATEOK 127.0.0.1:17905 2 1700000405 "
+                "last_seen_ms=120 probes_sent=20 probes_answered=16 "
+                "probe_rate=0.80\n");
         fclose(mf);
     }
-    CHECK(pulse_event_log_load(&restored, ev_path) == 5);
-    CHECK(pulse_event_latest_seq(&restored) == 11);
-    CHECK(pulse_event_oldest_seq(&restored) == 8);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 6);
+    CHECK(pulse_event_latest_seq(&restored) == 12);
+    CHECK(pulse_event_oldest_seq(&restored) == 7);
     CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
     CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_DEAD);
     /* A line without the trailing phi field — the pre-0.60.0
@@ -857,6 +899,16 @@ static void test_event_log(void) {
     CHECK(ev.probes_sent == 24);
     CHECK(ev.probes_answered == 6);
     CHECK(ev.probe_rate == 0.20);
+    /* The RATEOK event recorded after it comes back with its
+     * rate and counts (0.69.0): the recovery survives the load
+     * with the number that ended the episode. */
+    CHECK(pulse_event_wait(&restored, 11, &ev, 20) == 1);
+    CHECK(ev.seq == 12 && ev.type == PULSE_EVENT_RATEOK &&
+          ev.last_seen_ms == 120);
+    CHECK(ev.phi == -1);
+    CHECK(ev.probes_sent == 20);
+    CHECK(ev.probes_answered == 16);
+    CHECK(ev.probe_rate == 0.80);
     pulse_event_log_free(&restored);
     unlink(ev_path);
 }

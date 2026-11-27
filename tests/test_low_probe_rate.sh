@@ -37,6 +37,15 @@
 #  4. The persisted <data-dir>/events file carries the same
 #     LOWRATE line as the WATCH stream did, and a WATCH FROM 0
 #     replay shows it too.
+#  5. Recovery (0.69.0): restart node 2 (same data dir, so a
+#     higher incarnation): node 1 revives it, its windowed rate
+#     climbs back to the threshold as probes are answered again,
+#     and node 1 logs exactly one "RATEOK <id> rate=<r>
+#     threshold=<t>" line and streams one RATEOK event with a
+#     probe_rate at or above 0.5 — once per episode, re-armed by
+#     the next LOWRATE — while the JSON flag stays false, METRICS
+#     stays at low_probe_rate_peers=0 with no LOWRATE line, and
+#     the persisted file and a replay carry the same RATEOK line.
 # The watcher runs under stdbuf -o0: pulse-ctl's stdout is
 # block-buffered to a file, so without it the streamed lines would
 # sit in the buffer and the test's polling would see nothing.
@@ -165,6 +174,12 @@ rate_below() {
     python3 -c "import sys; r=float('$1'); exit(0 if 0 <= r < float('$2') else 1)" 2>/dev/null
 }
 
+# rate_at_least <rate> <threshold>: 1 when the rate is a number
+# at or above the threshold.
+rate_at_least() {
+    python3 -c "import sys; r=float('$1'); exit(0 if r >= float('$2') else 1)" 2>/dev/null
+}
+
 mkdir -p "$TMP/n1" "$TMP/n2"
 
 # Ports 17351-17352 (gossip) and 18351-18352 (control) so this test
@@ -228,8 +243,10 @@ else
 fi
 
 # Open the WATCH on node 1 in the background: it stays open for
-# the whole test (timeout 60 s bounds it if the test hangs).
-(timeout 60 stdbuf -o0 -e0 "$CTL" "127.0.0.1:18351" WATCH > "$TMP/watch1.out" 2>&1 & echo $! > "$TMP/watch.pid")
+# the whole test (timeout 120 s bounds it if the test hangs — the
+# recovery step restarts a node, so the run takes longer than the
+# warning-only test did).
+(timeout 120 stdbuf -o0 -e0 "$CTL" "127.0.0.1:18351" WATCH > "$TMP/watch1.out" 2>&1 & echo $! > "$TMP/watch.pid")
 
 if wait_for "$TMP/watch1.out" "^END$" 10; then
     note ok "WATCH opens with snapshot and END"
@@ -373,6 +390,103 @@ if wait_for "$TMP/watch2.out" "^EVENT [0-9]+ LOWRATE 127\\.0\\.0\\.1:17352 [0-9]
 else
     note fail "replayed WATCH shows the LOWRATE event with the same rate"
     grep '^EVENT' "$TMP/watch2.out" 2>/dev/null
+fi
+
+# 5. Restart node 2 — same data dir, so it rejoins at a higher
+# incarnation — and node 1 revives it. Its windowed rate then
+# climbs back as probes are answered again: ten answered probes
+# in the 20-probe window bring it to 0.50, about a second of
+# probing, and the recovery fires once.
+(cd "$TMP/n2" && exec "$BIN" --port 17352 --peer-file "$TMP/peers" --control-port 18352 --dead-retention 120 > "$TMP/n2.log" 2>&1 & echo $! > "$TMP/n2.pid")
+
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ REVIVED 127\.0\.0\.1:17352 ' 15; then
+    note ok "WATCH streams REVIVED for the restarted peer"
+else
+    note fail "WATCH streams REVIVED for the restarted peer"
+    grep '^EVENT' "$TMP/watch1.out" 2>/dev/null
+fi
+
+if wait_for "$TMP/n1.log" 'RATEOK 127\.0\.0\.1:17352 rate=[0-9.]+ threshold=0\.50' 15; then
+    note ok "node 1 logs a RATEOK line for the recovered peer"
+else
+    note fail "node 1 logs a RATEOK line for the recovered peer"
+    tail -5 "$TMP/n1.log"
+fi
+
+# The WATCH stream carries the RATEOK event with the recovered
+# rate frozen on it: at or above the 0.5 threshold — the window
+# had climbed that far when the episode ended — and the probe
+# counts show how many probes were answered again.
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ RATEOK 127\.0\.0\.1:17352 [0-9]+ [0-9]+ last_seen_ms=[0-9]+ probes_sent=[0-9]+ probes_answered=[0-9]+ probe_rate=[0-9.]+$' 15; then
+    note ok "WATCH streams a RATEOK event with a probe_rate"
+else
+    note fail "WATCH streams a RATEOK event with a probe_rate"
+    grep '^EVENT' "$TMP/watch1.out" 2>/dev/null
+fi
+
+RATEOK_RATE="$(event_rate "$TMP/watch1.out" '^EVENT [0-9]+ RATEOK 127\.0\.0\.1:17352 ')"
+if [ -n "$RATEOK_RATE" ] && rate_at_least "$RATEOK_RATE" 0.5; then
+    note ok "RATEOK event probe_rate is at or above the threshold ($RATEOK_RATE)"
+else
+    note fail "RATEOK event probe_rate is at or above the threshold (got '$RATEOK_RATE')"
+fi
+
+# The recovered peer reads healthy again: JSON flag false, METRICS
+# at zero with no LOWRATE line, PROMETHEUS gauge at zero — the
+# flag cleared because the peer is answering again, and the
+# RATEOK event is the record of it.
+if [ "$(json_member 18351 127.0.0.1:17352 low_probe_rate)" = "false" ]; then
+    note ok "JSON reads the recovered peer low_probe_rate false"
+else
+    note fail "JSON reads the recovered peer low_probe_rate false"
+    ctl 18351 JSON | sed -n '1p'
+fi
+
+if ctl 18351 METRICS | grep -q "low_probe_rate_peers=0" \
+   && ! ctl 18351 METRICS | grep -q "^LOWRATE "; then
+    note ok "METRICS reports low_probe_rate_peers=0 with no LOWRATE line after recovery"
+else
+    note fail "METRICS reports low_probe_rate_peers=0 with no LOWRATE line after recovery"
+    ctl 18351 METRICS
+fi
+
+if ctl 18351 PROMETHEUS | grep -q "^pulse_low_probe_rate_peers 0$"; then
+    note ok "PROMETHEUS reports pulse_low_probe_rate_peers 0 after recovery"
+else
+    note fail "PROMETHEUS reports pulse_low_probe_rate_peers 0 after recovery"
+    ctl 18351 PROMETHEUS | grep -E "low_probe|probe_rate"
+fi
+
+if [ "$(grep -c ' RATEOK 127\.0\.0\.1:17352 ' "$TMP/n1.log")" = "1" ]; then
+    note ok "the RATEOK line fired exactly once for the episode"
+else
+    note fail "the RATEOK line fired exactly once for the episode"
+    grep ' RATEOK ' "$TMP/n1.log"
+fi
+
+if [ "$(grep -c '^EVENT [0-9]* RATEOK 127\.0\.0\.1:17352 ' "$TMP/watch1.out")" = "1" ]; then
+    note ok "the RATEOK event fired exactly once for the episode"
+else
+    note fail "the RATEOK event fired exactly once for the episode"
+    grep '^EVENT.*RATEOK' "$TMP/watch1.out" 2>/dev/null
+fi
+
+# The persisted event log carries the same RATEOK line as the
+# WATCH stream did: the recovery survives a restart and a replay.
+if wait_for "$TMP/n1/events" "RATEOK 127\\.0\\.0\\.1:17352 [0-9]+ [0-9]+ last_seen_ms=[0-9]+ probes_sent=[0-9]+ probes_answered=[0-9]+ probe_rate=$RATEOK_RATE\$" 10; then
+    note ok "persisted events file carries the same RATEOK line ($RATEOK_RATE)"
+else
+    note fail "persisted events file carries the same RATEOK line ($RATEOK_RATE)"
+    cat "$TMP/n1/events" 2>/dev/null
+fi
+
+# A replay from the start shows the RATEOK event too.
+(timeout 30 stdbuf -o0 -e0 "$CTL" "127.0.0.1:18351" WATCH FROM 0 > "$TMP/watch3.out" 2>&1 & echo $! > "$TMP/watch3.pid")
+if wait_for "$TMP/watch3.out" "^EVENT [0-9]+ RATEOK 127\\.0\\.0\\.1:17352 [0-9]+ [0-9]+ last_seen_ms=[0-9]+ probes_sent=[0-9]+ probes_answered=[0-9]+ probe_rate=$RATEOK_RATE\$" 10; then
+    note ok "replayed WATCH shows the RATEOK event with the same rate"
+else
+    note fail "replayed WATCH shows the RATEOK event with the same rate"
+    grep '^EVENT' "$TMP/watch3.out" 2>/dev/null
 fi
 
 echo "test_low_probe_rate: $PASS passed, $FAIL failed"

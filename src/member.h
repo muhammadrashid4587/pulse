@@ -139,7 +139,11 @@ typedef struct {
      * when the rate recovers to the threshold or above, so a
      * persistently low peer warns once per episode instead of
      * once per probe cycle, and a peer that recovers and drops
-     * again warns again. Unlike quiet_warned it is NOT cleared
+     * again warns again. Clearing the flag is the recovery:
+     * the probe cycle logs a RATEOK line and records a RATEOK
+     * event for the peer (0.69.0), so the episode ends in the
+     * log and on the WATCH stream instead of silently. Unlike
+     * quiet_warned it is NOT cleared
      * on direct contact: one answered probe barely moves a
      * 20-probe window, so clearing on contact would re-fire
      * almost at once for a peer answering one probe in ten. */

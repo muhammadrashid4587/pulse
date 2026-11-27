@@ -408,7 +408,9 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
      * JSON reports as "probe_rate", frozen at the event instead
      * of recomputed at replay time, so a replayed LOWRATE event
      * still shows how low the rate was when the threshold was
-     * crossed. Carried only on a LOWRATE event: every other
+     * crossed, and a replayed RATEOK event (0.69.0) still shows
+     * how far it had recovered when the episode ended. Carried
+     * only on a LOWRATE or RATEOK event: every other
      * event has no rate to report. Self never probes itself
      * and a member never probed, or already gone from the table
      * when the event is recorded (a GC'd DROPPED, a LEAVE), has
@@ -424,7 +426,8 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
                 probes_sent = m->probes_sent;
                 probes_answered = m->probes_answered;
             }
-            if (type == PULSE_EVENT_LOWRATE)
+            if (type == PULSE_EVENT_LOWRATE ||
+                type == PULSE_EVENT_RATEOK)
                 probe_rate = member_probe_rate(m);
         }
         pthread_mutex_unlock(&g_lock);
@@ -446,7 +449,8 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
          * (0.67.0) carries its probe counts as trailing
          * " probes_sent=<n> probes_answered=<n>", after the
          * last_seen_ms when it is present, and a LOWRATE event
-         * (0.68.0) carries its recent probe success rate as a
+         * (0.68.0) — or a RATEOK event (0.69.0) — carries its
+         * recent probe success rate as a
          * trailing " probe_rate=<value>", after the probe counts
          * when they are present — so all four values survive a
          * restart and a replay exactly as the WATCH stream shows
@@ -1538,11 +1542,23 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
      * probes in its window is never warned and never re-armed:
      * its rate is not judged yet. The rate is captured for the
      * log line; the event re-measures it at record time
-     * (record_event), the same value within a millisecond. */
+     * (record_event), the same value within a millisecond.
+     * Recovery (0.69.0): the cycle that clears the flag also
+     * logs one RATEOK line and records one RATEOK event for
+     * the peer — the mirror of LOWRATE, so a consumer watching
+     * the alert lifecycle sees the episode end instead of the
+     * flag silently clearing — once per episode, re-armed by
+     * the next LOWRATE. The RATEOK event carries the recovered
+     * rate frozen as its probe_rate, like LOWRATE carries the
+     * rate at the crossing. */
     char lowrate_ids[8][PULSE_ID_LEN];
     uint32_t lowrate_inc[8];
     double lowrate_rate[8];
     int n_lowrate = 0;
+    char rateok_ids[8][PULSE_ID_LEN];
+    uint32_t rateok_inc[8];
+    double rateok_rate[8];
+    int n_rateok = 0;
     if (g_cfg.low_probe_rate_frac > 0) {
         for (int i = 0; i < g_table.count && n_lowrate < 8; i++) {
             member_t *m = &g_table.members[i];
@@ -1563,11 +1579,31 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
                  * the threshold. A peer whose window is still
                  * too small to judge keeps its flag: it was
                  * warned on a full window, and a window that
-                 * small cannot have recovered yet. */
+                 * small cannot have recovered yet. Clearing the
+                 * flag is the recovery: the RATEOK line and
+                 * event below announce it, so the episode ends
+                 * in the log and on the WATCH stream, not
+                 * silently. A full rateok batch (8) leaves the
+                 * flag set, so the recovery is collected on the
+                 * next cycle instead of lost. */
                 double rate = member_probe_rate(m);
                 if (rate >= 0 &&
-                    rate >= g_cfg.low_probe_rate_frac)
+                    rate >= g_cfg.low_probe_rate_frac) {
                     m->low_rate_warned = 0;
+                    if (n_rateok < 8) {
+                        snprintf(rateok_ids[n_rateok], PULSE_ID_LEN,
+                                 "%s", m->id);
+                        rateok_inc[n_rateok] = m->incarnation;
+                        rateok_rate[n_rateok] = rate;
+                        n_rateok++;
+                    } else {
+                        /* Batch full: re-set the flag so the
+                         * recovery is not lost — the next cycle
+                         * collects it once the batch has been
+                         * emitted. */
+                        m->low_rate_warned = 1;
+                    }
+                }
             }
         }
     }
@@ -1758,6 +1794,20 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
                  g_cfg.low_probe_rate_frac);
         record_event(PULSE_EVENT_LOWRATE, lowrate_ids[i],
                      lowrate_inc[i]);
+    }
+    /* Low-probe-rate recovery (0.69.0): the RATEOK line says how
+     * far the peer's recent probe success rate had recovered
+     * when the episode ended, and the RATEOK event carries the
+     * same rate frozen as its probe_rate, so a WATCH replay shows
+     * it too. The peer is still ALIVE at this point — that is
+     * the point of the recovery: the flag cleared because the
+     * peer is answering again, not because it was suspected. */
+    for (int i = 0; i < n_rateok; i++) {
+        log_line("RATEOK %s rate=%.2f threshold=%.2f",
+                 rateok_ids[i], rateok_rate[i],
+                 g_cfg.low_probe_rate_frac);
+        record_event(PULSE_EVENT_RATEOK, rateok_ids[i],
+                     rateok_inc[i]);
     }
     /* gc_ids holds at most 8 ids even when more entries were GC'd
      * in one cycle (member_gc returns the total removed), so the

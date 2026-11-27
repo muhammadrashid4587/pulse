@@ -2518,8 +2518,10 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
              * " probe_rate=<value>" — two decimals, the same
              * value JSON reports as "probe_rate", frozen at the
              * event so a replay still shows how low the rate was
-             * — after the probe counts when they are present; no
-             * other event carries one. */
+             * — after the probe counts when they are present; a
+             * RATEOK event (0.69.0) carries the same field with
+             * the rate when it recovered to the threshold or
+             * above; no other event carries one. */
             size_t used = (size_t)snprintf(
                 line, sizeof line, "EVENT %llu %s %s %u %lld",
                 (unsigned long long)ev.seq,

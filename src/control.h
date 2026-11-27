@@ -412,7 +412,7 @@
  *       SNAPSHOT line per member — id, incarnation, state,
  *       last-seen-ms (or '-') and source, the PEERS shape — then
  *       END, then one EVENT line per membership event as it happens:
- *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE>
+ *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE|RATEOK>
  *       <id> <incarnation> <unix-seconds>. JOINED is a peer
  *       appearing in the table, SUSPECTED is ALIVE -> SUSPECT, DEAD
  *       is SUSPECT -> DEAD, REVIVED is a SUSPECT/DEAD peer coming
@@ -425,7 +425,11 @@
  *       (0.68.0) is an ALIVE peer whose recent probe success rate
  *       fell below the low-probe-rate threshold — the peer is
  *       still alive, it has just started answering too few of its
- *       probes. The connection
+ *       probes — and RATEOK (0.69.0) is an ALIVE peer whose recent
+ *       probe success rate recovered to the low-probe-rate
+ *       threshold or above after a LOWRATE episode — the peer is
+ *       still alive, it is answering enough of its probes again.
+ *       The connection
  *       stays open until the client closes it (or falls too far
  *       behind: the event log is a bounded ring, so a slow consumer
  *       gets "ERR gap: events lost, reconnect" and must re-read the
@@ -466,7 +470,11 @@
  *       crossed, two decimals, the same value JSON reports as
  *       "probe_rate", frozen at the event so a replay still shows
  *       how low the rate was — after the probe counts when they
- *       are present; no other event carries one. An event with
+ *       are present; a RATEOK event (0.69.0) carries the same
+ *       trailing field — the rate when it recovered to the
+ *       threshold or above, frozen at the event so a replay
+ *       still shows how far the rate had come back — and no other
+ *       event carries one. An event with
  *       no trailing field writes the plain five fields, so
  *       existing consumers see byte-identical lines.
  *       A filter (0.30.0) narrows the stream server-side: an
