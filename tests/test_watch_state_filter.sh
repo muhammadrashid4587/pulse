@@ -178,7 +178,7 @@ fi
 # the ALIVE stream carries it and the DEAD stream stays silent.
 kill -CONT "$(cat "$TMP/n3.pid")"
 if wait_for "$TMP/n1.log" "STATUS alive=3" 10 \
-   && wait_for "$TMP/watch2.out" '^EVENT [0-9]+ REVIVED 127\.0\.0\.1:17843 1 [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
+   && wait_for "$TMP/watch2.out" '^EVENT [0-9]+ REVIVED 127\.0\.0\.1:17843 1 [0-9]+ last_seen_ms=[0-9]+ probes_sent=[0-9]+ probes_answered=[0-9]+ suspect_ms=[0-9]+$' 10; then
     note ok "STATE ALIVE WATCH streams REVIVED when the peer comes back"
 else
     note fail "STATE ALIVE WATCH streams REVIVED when the peer comes back"

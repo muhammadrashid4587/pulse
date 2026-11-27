@@ -371,9 +371,19 @@ static void peer_set_known_version(const char *id, uint64_t version) {
  * cannot be written just means the log does not survive the
  * restart, and a failed append must never stop the node — so a
  * failure is silent here; the log line for the transition is
- * already in the node's stdout either way. */
-static void record_event_phi(pulse_event_type_t type, const char *id,
-                             uint32_t incarnation, double phi) {
+ * already in the node's stdout either way.
+ *
+ * Suspicion duration (0.70.0): a REVIVED event for a peer that
+ * was SUSPECT carries how long it sat SUSPECT — the refute
+ * latency for this one recovery — passed in by the caller, which
+ * is the only place that still knows the peer was SUSPECT: by
+ * record time the table already says ALIVE. A DEAD peer coming
+ * back is a restart, not a refutation, so the caller passes -1,
+ * and every other event passes -1 too. */
+static void record_event_phi_suspect(pulse_event_type_t type,
+                                     const char *id,
+                                     uint32_t incarnation, double phi,
+                                     int64_t suspect_ms) {
     int64_t ts = (int64_t)time(NULL);
     /* Last-contact age in the event log (0.61.0): the ms since
      * this node last heard from the member, measured now — at
@@ -432,10 +442,13 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
         }
         pthread_mutex_unlock(&g_lock);
     }
-    uint64_t seq = pulse_event_record_rate(&g_event_log, type, id,
-                                           incarnation, ts, phi,
-                                           last_seen_age, probes_sent,
-                                           probes_answered, probe_rate);
+    uint64_t seq = pulse_event_record_suspect_ms(&g_event_log, type, id,
+                                                  incarnation, ts, phi,
+                                                  last_seen_age,
+                                                  probes_sent,
+                                                  probes_answered,
+                                                  probe_rate,
+                                                  suspect_ms);
     if (g_events_path[0] == '\0') return;
     pthread_mutex_lock(&g_events_file_lock);
     FILE *f = fopen(g_events_path, "a");
@@ -452,9 +465,13 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
          * (0.68.0) — or a RATEOK event (0.69.0) — carries its
          * recent probe success rate as a
          * trailing " probe_rate=<value>", after the probe counts
-         * when they are present — so all four values survive a
-         * restart and a replay exactly as the WATCH stream shows
-         * them; an event with none writes the plain five fields. */
+         * when they are present, and a REVIVED event for a peer
+         * that was SUSPECT (0.70.0) carries how long it sat
+         * SUSPECT as a trailing " suspect_ms=<ms>", after the
+         * probe rate when it is present — so all five values
+         * survive a restart and a replay exactly as the WATCH
+         * stream shows them; an event with none writes the plain
+         * five fields. */
         fprintf(f, "%llu %s %s %u %lld",
                 (unsigned long long)seq,
                 pulse_event_type_name(type), id, incarnation,
@@ -468,10 +485,29 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
                     (long long)probes_sent,
                     (long long)probes_answered);
         if (probe_rate >= 0) fprintf(f, " probe_rate=%.2f", probe_rate);
+        if (suspect_ms >= 0)
+            fprintf(f, " suspect_ms=%lld", (long long)suspect_ms);
         fputc('\n', f);
         fclose(f);
     }
     pthread_mutex_unlock(&g_events_file_lock);
+}
+
+static void record_event_phi(pulse_event_type_t type, const char *id,
+                             uint32_t incarnation, double phi) {
+    record_event_phi_suspect(type, id, incarnation, phi, -1);
+}
+
+/* A peer coming back ALIVE (0.70.0): the REVIVED event carries how
+ * long it sat SUSPECT — the refute latency for this one recovery —
+ * when the caller measured it, or -1 when the peer was DEAD (a
+ * restart, not a refutation). The caller is the only place that
+ * still knows the peer was SUSPECT: by record time the table
+ * already says ALIVE. */
+static void record_event_revived(const char *id, uint32_t incarnation,
+                                 int64_t suspect_ms) {
+    record_event_phi_suspect(PULSE_EVENT_REVIVED, id, incarnation, -1,
+                             suspect_ms);
 }
 
 static void record_event(pulse_event_type_t type, const char *id,
@@ -504,10 +540,21 @@ static void note_contact(const gmsg_t *msg,
         log_line("JOIN %s", msg->from_id);
         record_event(PULSE_EVENT_JOINED, msg->from_id, msg->from_inc);
     } else if (revived) {
-        log_line("ALIVE %s", msg->from_id);
         /* revived means the state changed to ALIVE, so the peer
-         * was SUSPECT or DEAD: a revival, not a routine heartbeat. */
-        record_event(PULSE_EVENT_REVIVED, msg->from_id, msg->from_inc);
+         * was SUSPECT or DEAD: a revival, not a routine heartbeat.
+         * A SUSPECT peer coming back is a refutation — the REVIVED
+         * event carries how long it sat SUSPECT (0.70.0), the
+         * refute latency for this one recovery, in the log line
+         * and on the WATCH stream; a DEAD peer coming back is a
+         * restart, so it carries none. */
+        int64_t suspect_ms =
+            prev == MEMBER_SUSPECT ? now - since : -1;
+        if (suspect_ms >= 0)
+            log_line("ALIVE %s suspect_ms=%lld", msg->from_id,
+                     (long long)suspect_ms);
+        else
+            log_line("ALIVE %s", msg->from_id);
+        record_event_revived(msg->from_id, msg->from_inc, suspect_ms);
     }
 }
 
@@ -545,6 +592,12 @@ static void handle_membership_msg(const gmsg_t *msg,
     char changed_ids[8][PULSE_ID_LEN];
     member_state_t changed_states[8];
     uint32_t changed_inc[8];
+    /* How long a gossip-learned revival sat SUSPECT (0.70.0):
+     * -1 unless the entry went SUSPECT -> ALIVE, in which case
+     * the ms from when this node marked it SUSPECT to the merge
+     * that revived it — the same refute latency the direct-contact
+     * path measures, frozen on the REVIVED event. */
+    int64_t changed_suspect_ms[8];
     int changed_count = 0;
     pthread_mutex_lock(&g_lock);
     member_t *sender_before = member_find(&g_table, msg->from_id);
@@ -567,6 +620,7 @@ static void handle_membership_msg(const gmsg_t *msg,
         const member_t *e = &msg->entries[i];
         member_t *before = member_find(&g_table, e->id);
         member_state_t prev = before ? before->state : MEMBER_ALIVE;
+        int64_t since = before ? before->state_since_ms : 0;
         int r = member_merge(&g_table, g_self_id, e->id, &e->addr,
                              e->incarnation, e->state, pulse_now_ms());
         if ((r & MERGE_SELF_SUSPECTED) && !refute) {
@@ -618,6 +672,11 @@ static void handle_membership_msg(const gmsg_t *msg,
                          "%s", e->id);
                 changed_states[changed_count] = after->state;
                 changed_inc[changed_count] = after->incarnation;
+                changed_suspect_ms[changed_count] =
+                    (prev == MEMBER_SUSPECT &&
+                     after->state == MEMBER_ALIVE)
+                        ? now - since
+                        : -1;
                 changed_count++;
             }
         }
@@ -638,8 +697,19 @@ static void handle_membership_msg(const gmsg_t *msg,
         log_line("JOIN %s", msg->from_id);
         record_event(PULSE_EVENT_JOINED, msg->from_id, msg->from_inc);
     } else if (revived) {
-        log_line("ALIVE %s", msg->from_id);
-        record_event(PULSE_EVENT_REVIVED, msg->from_id, msg->from_inc);
+        /* Same refutation window as direct contact: the sender is
+         * alive by direct contact too, so a SUSPECT sender coming
+         * back is a locally measured refutation — the REVIVED
+         * event carries how long it sat SUSPECT (0.70.0); a DEAD
+         * sender coming back is a restart, so it carries none. */
+        int64_t suspect_ms =
+            sender_prev == MEMBER_SUSPECT ? now - sender_since : -1;
+        if (suspect_ms >= 0)
+            log_line("ALIVE %s suspect_ms=%lld", msg->from_id,
+                     (long long)suspect_ms);
+        else
+            log_line("ALIVE %s", msg->from_id);
+        record_event_revived(msg->from_id, msg->from_inc, suspect_ms);
     }
     for (int i = 0; i < new_count; i++) {
         log_line("JOIN %s", new_ids[i]);
@@ -651,9 +721,19 @@ static void handle_membership_msg(const gmsg_t *msg,
             record_event(PULSE_EVENT_DEAD, changed_ids[i],
                          changed_inc[i]);
         } else if (changed_states[i] == MEMBER_ALIVE) {
-            log_line("ALIVE %s", changed_ids[i]);
-            record_event(PULSE_EVENT_REVIVED, changed_ids[i],
-                         changed_inc[i]);
+            /* A gossip-learned revival: the REVIVED event carries
+             * how long the peer sat SUSPECT on this node (0.70.0)
+             * when it was SUSPECT — the same refute latency the
+             * direct-contact path measures; a DEAD peer coming
+             * back is a restart, so it carries none. */
+            int64_t suspect_ms = changed_suspect_ms[i];
+            if (suspect_ms >= 0)
+                log_line("ALIVE %s suspect_ms=%lld", changed_ids[i],
+                         (long long)suspect_ms);
+            else
+                log_line("ALIVE %s", changed_ids[i]);
+            record_event_revived(changed_ids[i], changed_inc[i],
+                                 suspect_ms);
         } else {
             log_line("SUSPECT %s", changed_ids[i]);
             record_event(PULSE_EVENT_SUSPECTED, changed_ids[i],

@@ -133,6 +133,24 @@ typedef struct {
      * counts when they are present, and the persisted log
      * carries the same trailing field. */
     double probe_rate;
+    /* Suspicion duration at record time (0.70.0): how long the
+     * member sat SUSPECT before it came back ALIVE — the refute
+     * latency for this one recovery, the same value the
+     * refute-latency group in METRICS and JSON aggregates as a
+     * mean/max/samples, frozen at the event instead of recomputed
+     * at replay time, so a replayed REVIVED event still shows how
+     * long the false suspicion lasted instead of only that the
+     * peer came back. Carried only on a REVIVED event for a peer
+     * that was SUSPECT: a DEAD peer coming back is a restart, not
+     * a refutation, so it carries none, and every other event has
+     * no suspicion to time. -1 when the member was never SUSPECT
+     * (a restart), for self (it never suspects itself), or when
+     * the member had already left the table when the event was
+     * recorded: an absent value, never a fabricated zero. A WATCH
+     * consumer reads it as a trailing " suspect_ms=<ms>" on the
+     * EVENT line, after the probe rate when it is present, and
+     * the persisted log carries the same trailing field. */
+    int64_t suspect_ms;
 } pulse_event_t;
 
 typedef struct {
@@ -247,6 +265,28 @@ uint64_t pulse_event_record_rate(pulse_event_log_t *log,
                                  int64_t probes_answered,
                                  double probe_rate);
 
+/* The same, carrying the phi at a threshold crossing, the
+ * last-contact age at record time, the probe counts at record
+ * time, the recent probe success rate at record time, and the
+ * suspicion duration at record time (0.70.0): the caller passes
+ * how long the member sat SUSPECT before it came back ALIVE, in
+ * ms — the refute latency for this one recovery — or -1 when the
+ * event is not a REVIVED for a peer that was SUSPECT (a DEAD peer
+ * coming back is a restart, not a refutation, and every other
+ * event has no suspicion to time). The duration is frozen at the
+ * event: a replayed REVIVED event still shows how long the false
+ * suspicion lasted, and a restart's REVIVED carries no field. */
+uint64_t pulse_event_record_suspect_ms(pulse_event_log_t *log,
+                                       pulse_event_type_t type,
+                                       const char *id,
+                                       uint32_t incarnation,
+                                       int64_t unix_ts, double phi,
+                                       int64_t last_seen_ms,
+                                       int64_t probes_sent,
+                                       int64_t probes_answered,
+                                       double probe_rate,
+                                       int64_t suspect_ms);
+
 /* Write every event the ring currently holds, in sequence order,
  * to path (one "<seq> <TYPE> <id> <incarnation> <unix_ts>" line per
  * event, with a trailing " phi=<value>" on a phi-mode SUSPECTED
@@ -257,7 +297,9 @@ uint64_t pulse_event_record_rate(pulse_event_log_t *log,
  * was probed — 0.67.0, after the last_seen_ms field when it is
  * present — and a trailing " probe_rate=<value>" on a LOWRATE
  * event — 0.68.0, or a RATEOK event — 0.69.0, after the probe counts
- * when they are present),
+ * when they are present — and a trailing " suspect_ms=<ms>" on a
+ * REVIVED event for a peer that was SUSPECT — 0.70.0, after the
+ * probe rate when it is present),
  * atomically via a tmp file + rename, so a crash
  * mid-write never leaves a half-written file. Returns the number
  * of events written, or -1 if the file could not be written. Used
@@ -282,7 +324,10 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path);
  * or any event whose member was never probed — loads with both
  * counts -1; a line without the trailing " probe_rate=<value>"
  * — written before 0.68.0, or any event that is not a LOWRATE
- * or RATEOK event — loads with probe_rate -1; the trailing fields are
+ * or RATEOK event — loads with probe_rate -1; a line without the
+ * trailing " suspect_ms=<ms>" — written before 0.70.0, or any
+ * event that is not a REVIVED for a peer that was SUSPECT —
+ * loads with suspect_ms -1; the trailing fields are
  * parsed independently, so any of them may be present without
  * the others. */
 int pulse_event_log_load(pulse_event_log_t *log, const char *path);

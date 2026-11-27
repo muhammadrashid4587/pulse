@@ -474,7 +474,14 @@
  *       trailing field — the rate when it recovered to the
  *       threshold or above, frozen at the event so a replay
  *       still shows how far the rate had come back — and no other
- *       event carries one. An event with
+ *       event carries one. A REVIVED event for a peer that was
+ *       SUSPECT carries a trailing " suspect_ms=<ms>" (0.70.0)
+ *       — how long the peer sat SUSPECT before it came back
+ *       ALIVE, the refute latency for this one recovery, frozen
+ *       at the event so a replay still shows how long the false
+ *       suspicion lasted — after the probe rate when it is
+ *       present; a REVIVED for a DEAD peer (a restart) and every
+ *       other event carry no field. An event with
  *       no trailing field writes the plain five fields, so
  *       existing consumers see byte-identical lines.
  *       A filter (0.30.0) narrows the stream server-side: an

@@ -617,6 +617,9 @@ static void test_event_log(void) {
      * member it heard from does. */
     CHECK(ev.phi == -1);
     CHECK(ev.last_seen_ms == -1);
+    /* A plain record carries no suspicion duration either
+     * (0.70.0): only a REVIVED for a peer that was SUSPECT does. */
+    CHECK(ev.suspect_ms == -1);
     CHECK(pulse_event_wait(&log, 1, &ev, 20) == 1);
     CHECK(ev.seq == 2 && ev.type == PULSE_EVENT_SUSPECTED);
     CHECK(pulse_event_wait(&log, 2, &ev, 20) == 1);
@@ -680,7 +683,7 @@ static void test_event_log(void) {
      * continues the sequence instead of restarting at 1. */
     const char *ev_path = "/tmp/pulse-event-log-test.txt";
     pulse_event_log_t saved;
-    pulse_event_log_init(&saved, 7);
+    pulse_event_log_init(&saved, 8);
     pulse_event_record(&saved, PULSE_EVENT_JOINED, "127.0.0.1:17904", 1,
                        1700000300);
     pulse_event_record(&saved, PULSE_EVENT_SUSPECTED, "127.0.0.1:17904",
@@ -727,13 +730,23 @@ static void test_event_log(void) {
     pulse_event_record_rate(&saved, PULSE_EVENT_RATEOK,
                             "127.0.0.1:17904", 1, 1700000306, -1,
                             120, 20, 16, 0.80);
-    CHECK(pulse_event_log_save(&saved, ev_path) == 7);
+    /* Suspicion duration (0.70.0): a REVIVED event recorded with
+     * how long the peer sat SUSPECT — 412 ms before it came back
+     * ALIVE, 20 probes sent and 19 answered, 95 ms since the
+     * node last heard from the member when it revived —
+     * round-trips with all of it, so a restart restores how long
+     * the false suspicion lasted, not just that the peer came
+     * back. */
+    pulse_event_record_suspect_ms(&saved, PULSE_EVENT_REVIVED,
+                                  "127.0.0.1:17904", 1, 1700000307,
+                                  -1, 95, 20, 19, -1, 412);
+    CHECK(pulse_event_log_save(&saved, ev_path) == 8);
     pulse_event_log_free(&saved);
 
     pulse_event_log_t restored;
-    pulse_event_log_init(&restored, 7);
-    CHECK(pulse_event_log_load(&restored, ev_path) == 7);
-    CHECK(pulse_event_latest_seq(&restored) == 7);
+    pulse_event_log_init(&restored, 8);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 8);
+    CHECK(pulse_event_latest_seq(&restored) == 8);
     CHECK(pulse_event_oldest_seq(&restored) == 1);
     CHECK(pulse_event_wait(&restored, 0, &ev, 20) == 1);
     CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
@@ -792,10 +805,26 @@ static void test_event_log(void) {
     CHECK(ev.probes_answered == 16);
     CHECK(ev.probe_rate == 0.80);
     CHECK(ev.phi == -1);
+    /* A RATEOK event carries no suspicion duration (0.70.0):
+     * only a REVIVED for a peer that was SUSPECT does. */
+    CHECK(ev.suspect_ms == -1);
+    /* The REVIVED event recorded after it comes back with how
+     * long the peer sat SUSPECT (0.70.0): the false suspicion
+     * lasted 412 ms, and the counts and age come back with it. */
+    CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
+    CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_REVIVED &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000307);
+    CHECK(ev.last_seen_ms == 95);
+    CHECK(ev.probes_sent == 20);
+    CHECK(ev.probes_answered == 19);
+    CHECK(ev.probe_rate == -1);
+    CHECK(ev.phi == -1);
+    CHECK(ev.suspect_ms == 412);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
-                       2, 1700000307);
-    CHECK(pulse_event_latest_seq(&restored) == 8);
+                       2, 1700000308);
+    CHECK(pulse_event_latest_seq(&restored) == 9);
     pulse_event_log_free(&restored);
 
     /* The QUIET word (0.62.0) parses back to the QUIET type, so a

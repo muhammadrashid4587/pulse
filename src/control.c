@@ -2521,7 +2521,16 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
              * — after the probe counts when they are present; a
              * RATEOK event (0.69.0) carries the same field with
              * the rate when it recovered to the threshold or
-             * above; no other event carries one. */
+             * above; no other event carries one. Suspicion
+             * duration (0.70.0): a REVIVED event for a peer that
+             * was SUSPECT carries how long the peer sat SUSPECT
+             * before it came back ALIVE, as a trailing
+             * " suspect_ms=<ms>" — the refute latency for this
+             * one recovery, frozen at the event so a replay still
+             * shows how long the false suspicion lasted — after
+             * the probe rate when it is present; a REVIVED for a
+             * DEAD peer (a restart) and every other event carry
+             * no field. */
             size_t used = (size_t)snprintf(
                 line, sizeof line, "EVENT %llu %s %s %u %lld",
                 (unsigned long long)ev.seq,
@@ -2548,6 +2557,12 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
             if (ev.probe_rate >= 0) {
                 snprintf(line + used, sizeof line - used,
                          " probe_rate=%.2f", ev.probe_rate);
+                used = strlen(line);
+            }
+            if (ev.suspect_ms >= 0) {
+                snprintf(line + used, sizeof line - used,
+                         " suspect_ms=%lld",
+                         (long long)ev.suspect_ms);
                 used = strlen(line);
             }
             if (used < sizeof line - 1) {

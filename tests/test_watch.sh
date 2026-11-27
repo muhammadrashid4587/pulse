@@ -9,7 +9,9 @@
 #  2. Node 3 joins: the stream carries JOINED for it.
 #  3. Node 3 is stopped (SIGSTOP, not killed): node 1 suspects it
 #     and the stream carries SUSPECTED; resumed (SIGCONT) it comes
-#     back and the stream carries REVIVED. Node 1 runs with a 2 s
+#     back and the stream carries REVIVED — with a trailing
+#     suspect_ms (0.70.0), how long it sat SUSPECT before coming
+#     back. Node 1 runs with a 2 s
 #     suspect timeout so the stop/resume window is comfortable.
 #  4. Node 3 is killed: the stream carries DEAD for it.
 #  5. LEAVE over the control plane drops it at once: the stream
@@ -145,7 +147,7 @@ else
     echo "--- watch1.out"; cat "$TMP/watch1.out"
 fi
 kill -CONT "$(cat "$TMP/n3.pid")"
-if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ REVIVED 127\.0\.0\.1:17823 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ REVIVED 127\.0\.0\.1:17823 [0-9]+ [0-9]+ last_seen_ms=[0-9]+ probes_sent=[0-9]+ probes_answered=[0-9]+ suspect_ms=[0-9]+$' 10; then
     note ok "WATCH streams REVIVED when node 3 answers again"
 else
     note fail "WATCH streams REVIVED when node 3 answers again"
