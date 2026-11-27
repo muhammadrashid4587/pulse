@@ -405,9 +405,19 @@
  *       present. Self, a member never heard from, and a member
  *       already gone from the table when the event was recorded
  *       carry no field: an absent value, never a fabricated
- *       zero. An event with neither trailing field writes the
- *       plain five fields, so existing consumers see
- *       byte-identical lines.
+ *       zero. An event whose member was probed carries trailing
+ *       " probes_sent=<n> probes_answered=<n>" (0.67.0) — how
+ *       many direct probes this node had sent the member and how
+ *       many were answered when the event was recorded, the same
+ *       values JSON reports as "probes_sent" / "probes_answered"
+ *       and METRICS as a PROBES line, frozen at the event so a
+ *       replay still shows how many probes went unanswered before
+ *       a SUSPECTED fired — after the last_seen_ms field when it
+ *       is present. Self, a member never probed, and a member
+ *       already gone from the table when the event was recorded
+ *       carry no probe fields, under the same rule. An event with
+ *       no trailing field writes the plain five fields, so
+ *       existing consumers see byte-identical lines.
  *       A filter (0.30.0) narrows the stream server-side: an
  *       optional type list, an id list, or both, in any order —
  *       "WATCH JOINED,DEAD" (only those event types),

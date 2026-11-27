@@ -191,7 +191,7 @@ fi
 # on it: at least the 300 ms threshold — the peer was silent
 # that long when the threshold was crossed — and under the ~2 s
 # suspicion delay, so it fired while the peer was still ALIVE.
-if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ QUIET 127\.0\.0\.1:17342 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ QUIET 127\.0\.0\.1:17342 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
     note ok "WATCH streams a QUIET event with a last_seen_ms"
 else
     note fail "WATCH streams a QUIET event with a last_seen_ms"
@@ -268,7 +268,7 @@ fi
 
 # 4. The persisted event log carries the same QUIET line as the
 # WATCH stream did: the warning survives a restart and a replay.
-if wait_for "$TMP/n1/events" "^[0-9]+ QUIET 127\\.0\\.0\\.1:17342 [0-9]+ [0-9]+ last_seen_ms=$QUIET_SEEN\$" 10; then
+if wait_for "$TMP/n1/events" "^[0-9]+ QUIET 127\\.0\\.0\\.1:17342 [0-9]+ [0-9]+ last_seen_ms=$QUIET_SEEN( probes_sent=[0-9]+ probes_answered=[0-9]+)?\$" 10; then
     note ok "persisted events file carries the same QUIET line ($QUIET_SEEN ms)"
 else
     note fail "persisted events file carries the same QUIET line ($QUIET_SEEN ms)"
@@ -277,7 +277,7 @@ fi
 
 # A replay from the start shows the QUIET event too.
 (timeout 30 stdbuf -o0 -e0 "$CTL" "127.0.0.1:18341" WATCH FROM 0 > "$TMP/watch2.out" 2>&1 & echo $! > "$TMP/watch2.pid")
-if wait_for "$TMP/watch2.out" "^EVENT [0-9]+ QUIET 127\\.0\\.0\\.1:17342 [0-9]+ [0-9]+ last_seen_ms=$QUIET_SEEN\$" 10; then
+if wait_for "$TMP/watch2.out" "^EVENT [0-9]+ QUIET 127\\.0\\.0\\.1:17342 [0-9]+ [0-9]+ last_seen_ms=$QUIET_SEEN( probes_sent=[0-9]+ probes_answered=[0-9]+)?\$" 10; then
     note ok "replayed WATCH shows the QUIET event with the same age"
 else
     note fail "replayed WATCH shows the QUIET event with the same age"

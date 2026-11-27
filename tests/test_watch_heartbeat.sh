@@ -141,7 +141,7 @@ fi
 # on the same connection, after the heartbeats.
 (cd "$TMP/n3" && exec "$BIN" --port 17853 --seed 127.0.0.1:17851 --control-port 18853 --dead-retention 120 > "$TMP/n3.log" 2>&1 & echo $! > "$TMP/n3.pid")
 if wait_for "$TMP/n1.log" "STATUS alive=3" 10 \
-   && wait_for "$TMP/watch.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17853 1 [0-9]+ last_seen_ms=[0-9]+$' 10; then
+   && wait_for "$TMP/watch.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17853 1 [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
     note ok "WATCH streams JOINED on the same connection after the heartbeats"
 else
     note fail "WATCH streams JOINED on the same connection after the heartbeats"

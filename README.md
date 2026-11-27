@@ -227,6 +227,18 @@ building block, not a production service mesh.
   so a peer that is probed but never answers (sent climbing,
   answered 0) is distinguishable from a peer never probed at
   all. See "Per-member probe counts" below.
+- Probe counts in the event log: every `WATCH` `EVENT` line for a
+  member this node has probed carries trailing
+  ` probes_sent=<n> probes_answered=<n>` — how many direct probes
+  this node had sent the member and how many were answered when
+  the event was recorded, the same values `JSON` reports as
+  `probes_sent` / `probes_answered`, frozen at the event instead
+  of recomputed at replay time — so a replayed SUSPECTED event
+  still shows how many probes went unanswered before the
+  suspicion fired, and a DEAD event shows a sent count that kept
+  climbing while the answered count stayed frozen. Self, a member
+  never probed, and a member already gone from the table carry
+  no fields. See "Probe counts in the event log" below.
 - Slow-peer warning: when a peer's mean probe RTT rises above a
   configurable threshold (`--slow-peer-rtt-ms`), the node logs a
   `SLOW` line once per episode and reports the peer as `"slow":true`
@@ -1196,7 +1208,15 @@ events after the snapshot are the changes:
 Each `EVENT` line carries a sequence number (1-based, monotonic for
 the node's life), the member id, its incarnation at the event, and
 the wall-clock time in unix seconds. A client that sees a jump in
-the sequence numbers knows it missed events.
+the sequence numbers knows it missed events. An event may also
+carry trailing fields, in this order: a phi-mode SUSPECTED carries
+` phi=<value>` (see "Phi threshold crossing in the event log"), an
+event whose member was heard from carries
+` last_seen_ms=<ms>` (see "Last-contact age in the event log"),
+and an event whose member was probed carries
+` probes_sent=<n> probes_answered=<n>` (see "Probe counts in the
+event log") — all frozen at the event, so a replay shows the values
+as they were when the transition happened, not as they are now.
 
 A watcher that only cares about some of the cluster can narrow the
 stream instead of filtering client-side (0.30.0): `WATCH` takes an
@@ -2037,6 +2057,41 @@ when the event was recorded (a GC'd DROPPED, a LEAVE) carry
 no field: an absent value, never a fabricated zero, under the
 same rule as `JSON`'s `last_seen_ms`. An event with neither
 trailing field writes the plain five fields, so existing
+consumers see byte-identical lines.
+
+## Probe counts in the event log
+
+The last-contact age on an event says how quiet the peer was
+when the transition happened, but not how hard this node was
+trying to reach it: a watcher replaying the log cannot tell a
+peer that was probed twice and answered neither from one that
+was probed a hundred times and answered ninety-nine — and by
+the time the watcher polls `METRICS` for the `PROBES` line, the
+counts have moved on.
+
+So every event whose member was probed now carries its probe
+counts at record time: the `WATCH` stream sends them as
+trailing ` probes_sent=<n> probes_answered=<n>` on the `EVENT`
+line — how many direct probes this node had sent the member and
+how many were answered when the event was recorded, the same
+values `JSON` reports as `probes_sent` / `probes_answered` and
+`METRICS` as a `PROBES` line — and the persisted
+`<data-dir>/events` file carries the same trailing fields, so a
+`WATCH FROM <seq>` replay after a restart restores the counts as
+they were, not as they are now. The counts are frozen at the
+event: a SUSPECTED carries sent at least answered, answered at
+least 1 for a peer that used to answer; a DEAD carries a sent
+count at least as large and an answered count frozen at the same
+value, the peer having stopped answering; a SUSPECTED for a peer
+that never answered carries sent at least 1 with answered 0 —
+probed but never answered, distinguishable from never probed at
+all. They ride after the last_seen_ms field when it is present —
+a SUSPECTED carries both, the silence and the unanswered probes
+behind it. Self, a member never probed, and a member already
+gone from the table when the event was recorded (a GC'd DROPPED,
+a LEAVE) carry no fields: an absent value, never a fabricated
+zero, under the same rule as `JSON`'s probe counts. An event
+with no trailing field writes the plain five fields, so existing
 consumers see byte-identical lines.
 
 ## Member metadata
@@ -3142,3 +3197,4 @@ Done in 0.50.0.
 - ~~Worst probe RTT per member: the largest single direct-probe round-trip time over all answered probes per peer rides as `rtt_max_ms` in `JSON` (`null` until a probe has been answered, always `null` for self) and as a `pulse_member_rtt_max_ms` gauge in `PROMETHEUS`, one line per member that has answered a probe — self and a peer never heard from have no line, a value of 0 is a real worst case of sub-millisecond probes rather than a missing one, and a DEAD member keeps its worst RTT until GC — so the mean cannot hide one 60 ms probe among sub-millisecond ones; covered by unit tests for the max tracking (only ever grows, never falls on a faster probe, -1 with no samples) and the canned JSON / PROMETHEUS lines (max 7 for the peer with samples 3, 7, 0, 0; max 0 for the sub-millisecond peer; absent for self and the never-heard-from peer), and an integration test that checks the live gauge exists for a probed peer, is absent for self, and stays present while a crashed peer sits DEAD.~~ Done in 0.64.0.
 - ~~Worst probe RTT per member in METRICS: the largest single direct-probe round-trip time over all answered probes per peer — the value `JSON` already reports as `rtt_max_ms` and `PROMETHEUS` as `pulse_member_rtt_max_ms` — now also rides in the text protocol, as the fourth field of the `RTT` line (`RTT <id> <last_ms> <mean_ms> <max_ms>`), after the `LASTSEEN` lines in `METRICS`, under the same rule as the last and mean (self and a peer never heard from have no line, a value of 0 is a real worst case of sub-millisecond probes rather than a missing one, and a DEAD member keeps its worst RTT until GC) — so a text-protocol consumer can see the slow tail per peer instead of only the mean; the field is appended after the last and mean, so a consumer reading the first three fields by position still gets the same last and mean, but a strict parser expecting exactly three numbers sees a format change; covered by unit tests for the exact canned lines (last 3, mean 2, max 7; last 0, mean 0, max 0) with self and the never-heard-from peer absent, and an integration test that checks the live line's max is non-negative, at least the last and the mean and at least the `JSON` max read a moment earlier, that it agrees exactly with `JSON` while a crashed peer sits SUSPECT, and that the whole line stays frozen a second apart.~~ Done in 0.65.0.
 - ~~Per-member probe counts: each member counts its direct probes — how many this node sent and how many were answered, the probe success rate — as `probes_sent` / `probes_answered` in `JSON` (always numbers, never `null`: 0 sent for self and for a peer never probed, sent climbing with answered 0 for a peer probed but never answered), one `PROBES <id> <sent> <answered>` line per probed member after the `RTT` lines in `METRICS`, and `pulse_member_probes_sent_total` / `pulse_member_probes_answered_total` counters in `PROMETHEUS` (one labelled sample per probed member; self and a peer never probed have none) — so a peer that is probed but never answers is distinguishable from a peer never probed at all, and a peer that answers one probe in ten shows it in the rate even when its mean RTT is fine; sent counts only direct PINGs from the probe cycle (an indirect PING_REQ probe is not counted — its ACK goes to the requester and adds no RTT sample here either), answered increments with the RTT sample so it always equals the sample count, and a DEAD member keeps its counts until GC; covered by unit tests for the counting (sent moves on probe, answered moves with the RTT sample, unknown ids ignored, probed-but-never-answered stays 0 answered) and the exact canned lines (5 sent / 4 answered, 2 / 1, 0 / 0 for self and the never-heard-from peer) on all three surfaces, and an integration test that checks the live line's sent is at least answered and at least 1, that it agrees with `JSON` and the `PROMETHEUS` counters, that self has no line and the never-started peer has sent at least 1 with answered 0, that the lines ride after the `RTT` lines, and that answered stays frozen while a crashed peer sits SUSPECT.~~ Done in 0.66.0.
+- ~~Probe counts in the event log: every `WATCH` `EVENT` line for a member this node has probed carries trailing ` probes_sent=<n> probes_answered=<n>` — how many direct probes this node had sent the member and how many were answered when the event was recorded, the same values `JSON` reports as `probes_sent` / `probes_answered` and `METRICS` as a `PROBES` line, frozen at the event instead of recomputed at replay time — after the ` last_seen_ms=<ms>` field when it is present; a SUSPECTED carries sent at least answered with answered at least 1 for a peer that used to answer, a DEAD carries a sent count at least as large with answered frozen, and a SUSPECTED for a peer that never answered carries sent at least 1 with answered 0, while self, a member never probed, and a member already gone from the table carry no fields, never a fabricated zero, and the persisted `<data-dir>/events` file carries the same trailing fields so the counts survive a restart and a replay; covered by unit tests for the counts round-trip through save/load (47 sent / 45 answered on a phi-mode SUSPECTED, no counts on an event recorded without them) and an integration test that checks the live `WATCH` SUSPECTED counts are sane, the DEAD sent grew while answered stayed frozen, the persisted file carries the same counts, a JOINED for a just-added member carries no probe fields, and a replay shows the never-started peer's SUSPECTED with sent at least 1, answered 0, and no last_seen_ms.~~ Done in 0.67.0.

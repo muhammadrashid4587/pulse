@@ -654,10 +654,13 @@ static void test_event_log(void) {
      * recorded with an age — 512 ms since the node last heard
      * from the member when it was suspected — round-trips with
      * it too, so a restart restores how quiet the peer was when
-     * the transition happened. */
-    pulse_event_record_full(&saved, PULSE_EVENT_SUSPECTED,
-                            "127.0.0.1:17904", 1, 1700000303, 8.42,
-                            512);
+     * the transition happened. Probe counts (0.67.0): the same
+     * event recorded with 47 probes sent and 45 answered
+     * round-trips with them too, so a restart restores how many
+     * probes went unanswered before the suspicion fired. */
+    pulse_event_record_probes(&saved, PULSE_EVENT_SUSPECTED,
+                              "127.0.0.1:17904", 1, 1700000303, 8.42,
+                              512, 47, 45);
     /* Quiet-peer warning (0.62.0): a QUIET event recorded with a
      * last-contact age — 305 ms since the node last heard from
      * the member when the quiet threshold was crossed — and no
@@ -688,6 +691,10 @@ static void test_event_log(void) {
     /* The last-contact age recorded with the crossing comes back
      * with it (0.61.0). */
     CHECK(ev.last_seen_ms == 512);
+    /* The probe counts recorded with the crossing come back with
+     * it too (0.67.0): 47 sent, 45 answered. */
+    CHECK(ev.probes_sent == 47);
+    CHECK(ev.probes_answered == 45);
     /* The QUIET event recorded after it comes back with its age
      * and no phi (0.62.0): the warning survives the restart too. */
     CHECK(pulse_event_wait(&restored, 4, &ev, 20) == 1);
@@ -696,6 +703,11 @@ static void test_event_log(void) {
           ev.incarnation == 1 && ev.unix_ts == 1700000304);
     CHECK(ev.last_seen_ms == 305);
     CHECK(ev.phi == -1);
+    /* The QUIET event was recorded with no probe counts, so it
+     * loads with none (0.67.0): an old-format line, or an event
+     * whose member was never probed, carries no counts. */
+    CHECK(ev.probes_sent == -1);
+    CHECK(ev.probes_answered == -1);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
                        2, 1700000305);

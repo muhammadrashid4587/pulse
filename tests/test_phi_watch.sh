@@ -82,7 +82,7 @@ fi
 # measured. Phi needs ~0.7 s of silence to cross 8 here, plus the
 # 300 ms suspect timeout, so allow 10 s.
 kill -9 "$(cat "$TMP/n2.pid")"
-if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17312 [0-9]+ [0-9]+ phi=[0-9]+\.[0-9][0-9] last_seen_ms=[0-9]+$' 10; then
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17312 [0-9]+ [0-9]+ phi=[0-9]+\.[0-9][0-9] last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
     note ok "WATCH streams SUSPECTED with a phi value"
 else
     note fail "WATCH streams SUSPECTED with a phi value"
@@ -100,7 +100,7 @@ fi
 
 # The DEAD event that follows carries no phi: only a phi-mode
 # threshold crossing does.
-if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ DEAD 127\.0\.0\.1:17312 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ DEAD 127\.0\.0\.1:17312 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
     note ok "DEAD event carries no phi field"
 else
     note fail "DEAD event carries no phi field"
@@ -110,7 +110,7 @@ fi
 # 3. The persisted event log carries the same phi: the crossing
 # is in <data-dir>/events, so a restart restores it. The file's
 # lines start with the sequence number, like the ring's save.
-if wait_for "$TMP/n1/events" '^[0-9]+ SUSPECTED 127\.0\.0\.1:17312 [0-9]+ [0-9]+ phi=[0-9]+\.[0-9][0-9] last_seen_ms=[0-9]+$' 10; then
+if wait_for "$TMP/n1/events" '^[0-9]+ SUSPECTED 127\.0\.0\.1:17312 [0-9]+ [0-9]+ phi=[0-9]+\.[0-9][0-9] last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
     note ok "persisted events file carries the phi crossing"
 else
     note fail "persisted events file carries the phi crossing"

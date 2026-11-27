@@ -383,16 +383,37 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
      * site runs after the table lock is released, so taking it
      * briefly here cannot deadlock. */
     int64_t last_seen_age = -1;
+    /* Probe counts in the event log (0.67.0): how many direct
+     * probes this node had sent the member and how many were
+     * answered when the event was recorded — the same values JSON
+     * reports as "probes_sent" / "probes_answered" and METRICS as
+     * a PROBES line, frozen at the event instead of recomputed at
+     * replay time, so a replayed SUSPECTED event still shows how
+     * many probes went unanswered before the suspicion fired, and
+     * a DEAD event shows a sent count that kept climbing while
+     * the answered count stayed frozen. Self never probes itself
+     * and a member never probed, or already gone from the table
+     * when the event is recorded (a GC'd DROPPED, a LEAVE), has
+     * none: -1, never a fabricated zero. */
+    int64_t probes_sent = -1;
+    int64_t probes_answered = -1;
     if (strcmp(id, g_self_id) != 0) {
         int64_t now = pulse_now_ms();
         pthread_mutex_lock(&g_lock);
         member_t *m = member_find(&g_table, id);
-        if (m) last_seen_age = member_last_seen_age_ms(m, now);
+        if (m) {
+            last_seen_age = member_last_seen_age_ms(m, now);
+            if (m->probes_sent > 0) {
+                probes_sent = m->probes_sent;
+                probes_answered = m->probes_answered;
+            }
+        }
         pthread_mutex_unlock(&g_lock);
     }
-    uint64_t seq = pulse_event_record_full(&g_event_log, type, id,
-                                           incarnation, ts, phi,
-                                           last_seen_age);
+    uint64_t seq = pulse_event_record_probes(&g_event_log, type, id,
+                                             incarnation, ts, phi,
+                                             last_seen_age, probes_sent,
+                                             probes_answered);
     if (g_events_path[0] == '\0') return;
     pthread_mutex_lock(&g_events_file_lock);
     FILE *f = fopen(g_events_path, "a");
@@ -402,9 +423,13 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
          * as a trailing " phi=<value>", and an event whose member
          * was heard from (0.61.0) carries its last-contact age as
          * a trailing " last_seen_ms=<ms>", after the phi when both
-         * are present — so both values survive a restart and a
-         * replay exactly as the WATCH stream shows them; an event
-         * with neither writes the plain five fields. */
+         * are present, and an event whose member was probed
+         * (0.67.0) carries its probe counts as trailing
+         * " probes_sent=<n> probes_answered=<n>", after the
+         * last_seen_ms when it is present — so all three values
+         * survive a restart and a replay exactly as the WATCH
+         * stream shows them; an event with none writes the plain
+         * five fields. */
         fprintf(f, "%llu %s %s %u %lld",
                 (unsigned long long)seq,
                 pulse_event_type_name(type), id, incarnation,
@@ -413,6 +438,10 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
         if (last_seen_age >= 0)
             fprintf(f, " last_seen_ms=%lld",
                     (long long)last_seen_age);
+        if (probes_sent >= 0)
+            fprintf(f, " probes_sent=%lld probes_answered=%lld",
+                    (long long)probes_sent,
+                    (long long)probes_answered);
         fputc('\n', f);
         fclose(f);
     }

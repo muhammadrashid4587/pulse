@@ -104,7 +104,7 @@ fi
 # 2. A third node joins through --seed: the live stream carries its
 # JOINED event with a small last_seen_ms — it was just heard from.
 (cd "$TMP/n3" && exec "$BIN" --port 17323 --seed 127.0.0.1:17321 --control-port 18323 --dead-retention 120 > "$TMP/n3.log" 2>&1 & echo $! > "$TMP/n3.pid")
-if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17323 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17323 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
     note ok "WATCH streams JOINED with a last_seen_ms for the joining node"
 else
     note fail "WATCH streams JOINED with a last_seen_ms for the joining node"
@@ -124,7 +124,7 @@ fi
 # Suspicion needs the direct probe timeout plus the indirect one,
 # so the age at SUSPECTED is at least one ack timeout (100 ms).
 kill -9 "$(cat "$TMP/n2.pid")"
-if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17322 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17322 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
     note ok "WATCH streams SUSPECTED with a last_seen_ms"
 else
     note fail "WATCH streams SUSPECTED with a last_seen_ms"
@@ -140,7 +140,7 @@ fi
 
 # The DEAD event that follows carries a larger age: the silence
 # kept growing across the 300 ms suspect timeout.
-if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ DEAD 127\.0\.0\.1:17322 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
+if wait_for "$TMP/watch1.out" '^EVENT [0-9]+ DEAD 127\.0\.0\.1:17322 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
     note ok "WATCH streams DEAD with a last_seen_ms"
 else
     note fail "WATCH streams DEAD with a last_seen_ms"
@@ -158,7 +158,7 @@ fi
 # 4. The persisted event log carries the same age on the
 # SUSPECTED line as the WATCH stream did: the value recorded at
 # the event, not a value recomputed later.
-if wait_for "$TMP/n1/events" "^[0-9]+ SUSPECTED 127\\.0\\.0\\.1:17322 [0-9]+ [0-9]+ last_seen_ms=$SUSPECT_SEEN\$" 10; then
+if wait_for "$TMP/n1/events" "^[0-9]+ SUSPECTED 127\\.0\\.0\\.1:17322 [0-9]+ [0-9]+ last_seen_ms=$SUSPECT_SEEN( probes_sent=[0-9]+ probes_answered=[0-9]+)?\$" 10; then
     note ok "persisted events file carries the same last_seen_ms ($SUSPECT_SEEN ms) on the SUSPECTED line"
 else
     note fail "persisted events file carries the same last_seen_ms ($SUSPECT_SEEN ms) on the SUSPECTED line"
@@ -171,13 +171,13 @@ fi
 # age to report — while the JOINED for the node that joined live
 # carries its age.
 (timeout 30 stdbuf -o0 -e0 "$CTL" "127.0.0.1:18321" WATCH FROM 0 > "$TMP/watch2.out" 2>&1 & echo $! > "$TMP/watch2.pid")
-if wait_for "$TMP/watch2.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17329 [0-9]+ [0-9]+$' 10; then
+if wait_for "$TMP/watch2.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17329 [0-9]+ [0-9]+ probes_sent=[0-9]+ probes_answered=0$' 10; then
     note ok "replayed SUSPECTED for the never-started peer carries no last_seen_ms field"
 else
     note fail "replayed SUSPECTED for the never-started peer carries no last_seen_ms field"
     grep '^EVENT' "$TMP/watch2.out" 2>/dev/null
 fi
-if wait_for "$TMP/watch2.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17323 [0-9]+ [0-9]+ last_seen_ms=[0-9]+$' 10; then
+if wait_for "$TMP/watch2.out" '^EVENT [0-9]+ JOINED 127\.0\.0\.1:17323 [0-9]+ [0-9]+ last_seen_ms=[0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
     note ok "replayed JOINED for the live-joined node carries its last_seen_ms"
 else
     note fail "replayed JOINED for the live-joined node carries its last_seen_ms"

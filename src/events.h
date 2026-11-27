@@ -88,6 +88,24 @@ typedef struct {
      * phi field when both are present, and the persisted log
      * carries the same trailing field. */
     int64_t last_seen_ms;
+    /* Probe counts at record time (0.67.0): how many direct probes
+     * this node had sent the member and how many were answered
+     * when the event was recorded — the same values JSON reports
+     * as "probes_sent" / "probes_answered" and METRICS as a
+     * PROBES line, frozen at the event instead of recomputed at
+     * replay time, so a replayed SUSPECTED event still shows how
+     * many probes went unanswered before the suspicion fired, and
+     * a DEAD event shows a sent count that kept climbing while
+     * the answered count stayed frozen. -1 when the member was
+     * never probed (probes_sent 0), for self (it never probes
+     * itself), or when the member had already left the table when
+     * the event was recorded: an absent value, never a fabricated
+     * zero. A WATCH consumer reads them as trailing
+     * " probes_sent=<n> probes_answered=<n>" on the EVENT line,
+     * after the last_seen_ms field when it is present, and the
+     * persisted log carries the same trailing fields. */
+    int64_t probes_sent;
+    int64_t probes_answered;
 } pulse_event_t;
 
 typedef struct {
@@ -153,18 +171,40 @@ uint64_t pulse_event_record_phi(pulse_event_log_t *log,
  * recorded, or -1 when the member was never heard from, is self,
  * or had already left the table. The age is frozen at the event:
  * a replayed event shows how quiet the peer was when the
- * transition happened, not how quiet it is now. */
+ * transition happened, not how quiet it is now. The probe counts
+ * are -1: the member was never probed, is self, or had already
+ * left the table. */
 uint64_t pulse_event_record_full(pulse_event_log_t *log,
                                  pulse_event_type_t type, const char *id,
                                  uint32_t incarnation, int64_t unix_ts,
                                  double phi, int64_t last_seen_ms);
+
+/* The same, carrying the phi at a threshold crossing, the
+ * last-contact age at record time, and the probe counts at record
+ * time (0.67.0): the caller passes how many direct probes this
+ * node had sent the member and how many were answered when the
+ * event was recorded, or -1 for both when the member was never
+ * probed, is self, or had already left the table. The counts are
+ * frozen at the event: a replayed SUSPECTED event still shows how
+ * many probes went unanswered before the suspicion fired, and a
+ * DEAD event shows a sent count that kept climbing while the
+ * answered count stayed frozen. */
+uint64_t pulse_event_record_probes(pulse_event_log_t *log,
+                                   pulse_event_type_t type, const char *id,
+                                   uint32_t incarnation, int64_t unix_ts,
+                                   double phi, int64_t last_seen_ms,
+                                   int64_t probes_sent,
+                                   int64_t probes_answered);
 
 /* Write every event the ring currently holds, in sequence order,
  * to path (one "<seq> <TYPE> <id> <incarnation> <unix_ts>" line per
  * event, with a trailing " phi=<value>" on a phi-mode SUSPECTED
  * event — 0.60.0 — and a trailing " last_seen_ms=<ms>" on an event
  * whose member was heard from — 0.61.0, after the phi field when
- * both are present), atomically via a tmp file + rename, so a crash
+ * both are present — and a trailing
+ * " probes_sent=<n> probes_answered=<n>" on an event whose member
+ * was probed — 0.67.0, after the last_seen_ms field when it is
+ * present), atomically via a tmp file + rename, so a crash
  * mid-write never leaves a half-written file. Returns the number
  * of events written, or -1 if the file could not be written. Used
  * to compact the persisted log on startup and on clean shutdown
@@ -183,8 +223,11 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path);
  * measured — loads with phi -1, so an old log still loads, and a
  * line without the trailing " last_seen_ms=<ms>" — written before
  * 0.61.0, or any event whose member was never heard from — loads
- * with last_seen_ms -1; the two trailing fields are parsed
- * independently, so either may be present without the other. */
+ * with last_seen_ms -1; a line without the trailing
+ * " probes_sent=<n> probes_answered=<n>" — written before 0.67.0,
+ * or any event whose member was never probed — loads with both
+ * counts -1; the trailing fields are parsed independently, so any
+ * of them may be present without the others. */
 int pulse_event_log_load(pulse_event_log_t *log, const char *path);
 
 /* The latest sequence number recorded so far (0 when the log is

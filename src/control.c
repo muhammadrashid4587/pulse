@@ -2402,7 +2402,20 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
              * shows a larger age than the SUSPECTED event before
              * it — after the phi field when both are present. An
              * event with neither writes the plain five fields,
-             * so existing consumers see byte-identical lines. */
+             * so existing consumers see byte-identical lines.
+             * Probe counts (0.67.0): an event whose member was
+             * probed carries how many direct probes this node
+             * had sent the member and how many were answered
+             * when the event was recorded, as trailing
+             * " probes_sent=<n> probes_answered=<n>" — the same
+             * values JSON reports as "probes_sent" /
+             * "probes_answered" and METRICS as a PROBES line,
+             * frozen at the event so a replay still shows how
+             * many probes went unanswered before a SUSPECTED
+             * fired, and a DEAD event shows a sent count that
+             * kept climbing while the answered count stayed
+             * frozen — after the last_seen_ms field when it is
+             * present. */
             size_t used = (size_t)snprintf(
                 line, sizeof line, "EVENT %llu %s %s %u %lld",
                 (unsigned long long)ev.seq,
@@ -2417,6 +2430,13 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
                 snprintf(line + used, sizeof line - used,
                          " last_seen_ms=%lld",
                          (long long)ev.last_seen_ms);
+                used = strlen(line);
+            }
+            if (ev.probes_sent >= 0) {
+                snprintf(line + used, sizeof line - used,
+                         " probes_sent=%lld probes_answered=%lld",
+                         (long long)ev.probes_sent,
+                         (long long)ev.probes_answered);
                 used = strlen(line);
             }
             if (used < sizeof line - 1) {
