@@ -91,17 +91,19 @@
  * object carries a top-level "phi_threshold" number from the
  * hook, and with no hook it reports the default 8.00. Per-member
  * probe RTT in METRICS (0.63.0) is covered here too: one "RTT
- * <id> <last> <mean>" line rides after the LASTSEEN lines for
- * each member that answered a probe — the canned 17901 (last 3,
- * mean 2) and 17903 (last 0, mean 0) — with self and the
- * never-heard-from peer absent; the RTT end to end is covered by
- * tests/test_rtt_metrics.sh. Per-member worst probe RTT (0.64.0)
- * is covered here too: each member carries "rtt_max_ms" in JSON
- * (7 for the canned 17901, 0 for 17903, null for self and the
- * never-heard-from peer) and a pulse_member_rtt_max_ms gauge in
- * PROMETHEUS under the same rule as the last and mean gauges;
- * the worst RTT end to end is covered by
- * tests/test_prometheus.sh. */
+ * <id> <last> <mean> <max>" line rides after the LASTSEEN lines
+ * for each member that answered a probe — the canned 17901 (last
+ * 3, mean 2, max 7) and 17903 (last 0, mean 0, max 0) — with self
+ * and the never-heard-from peer absent; the RTT end to end is
+ * covered by tests/test_rtt_metrics.sh. Per-member worst probe
+ * RTT (0.64.0) is covered here too: each member carries
+ * "rtt_max_ms" in JSON (7 for the canned 17901, 0 for 17903,
+ * null for self and the never-heard-from peer) and a
+ * pulse_member_rtt_max_ms gauge in PROMETHEUS under the same rule
+ * as the last and mean gauges; the worst RTT end to end is covered
+ * by tests/test_prometheus.sh. Worst probe RTT in METRICS
+ * (0.65.0) is the same max as the fourth RTT field, covered by
+ * the exact canned lines above. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -880,12 +882,13 @@ int main(void) {
      * order, with timing-dependent values checked as all digits
      * like PEERS does; self (17999) and the never-heard-from peer
      * (17902) have no line. Per-member probe RTT (0.63.0) rides
-     * after the LASTSEEN lines as one "RTT <id> <last> <mean>"
-     * line per member that answered a probe — the canned table's
-     * 17901 (last 3, mean 2 over 4 samples) and 17903 (last 0,
-     * mean 0, a real sub-millisecond probe) in table order, exact
-     * values since they are canned; self and the never-heard-from
-     * peer (17902, rtt_ms -1) have no line — then END. */
+     * after the LASTSEEN lines as one "RTT <id> <last> <mean>
+     * <max>" line per member that answered a probe — the canned
+     * table's 17901 (last 3, mean 2, max 7 over 4 samples) and
+     * 17903 (last 0, mean 0, max 0, a real sub-millisecond probe)
+     * in table order, exact values since they are canned; self
+     * and the never-heard-from peer (17902, rtt_ms -1) have no
+     * line — then END. */
     g_peerfile_mode = 0;
     CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
     {
@@ -910,8 +913,8 @@ int main(void) {
         CHECK(strncmp(reply, metrics_line, sizeof metrics_line - 1) == 0);
         const char *want_seen_id[2] = {"127.0.0.1:17901",
                                        "127.0.0.1:17903"};
-        const char *want_rtt[2] = {"RTT 127.0.0.1:17901 3 2",
-                                   "RTT 127.0.0.1:17903 0 0"};
+        const char *want_rtt[2] = {"RTT 127.0.0.1:17901 3 2 7",
+                                   "RTT 127.0.0.1:17903 0 0 0"};
         int nseen = 0, nrtt = 0;
         char *save = NULL;
         char *line = strtok_r(reply + sizeof metrics_line - 1, "\n",
