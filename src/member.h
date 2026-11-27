@@ -378,6 +378,37 @@ void member_sample_probe_rate(member_t *m, int64_t now);
  * probed but no probe cycle has sampled it yet. */
 int member_probe_rate_history_json(const member_t *m, int64_t start_ms,
                                    char *buf, size_t len);
+/* Latest and minimum of the sampled probe-rate history, and how
+ * many samples the ring holds (0.74.0) — the same shape as
+ * phi_history_stats, but the minimum instead of the maximum: a
+ * probe rate fails downward, so the worst sample is the lowest
+ * one, not the highest. The latest is the most recent
+ * probe-cycle sample — not the live rate recomputed at read
+ * time — and the minimum is over the whole bounded window, so a
+ * reader can see both where the rate is now and how far it fell
+ * while the peer went quiet. All three are 0 / 0 / 0 when no
+ * probe cycle has sampled the peer yet (or for a NULL member). */
+void member_probe_rate_history_stats(const member_t *m, double *latest,
+                                     double *min, int *count);
+/* Probe-rate-history histogram (0.74.0): bucket bounds for the
+ * per-member probe-rate-history histogram in PROMETHEUS — a
+ * healthy peer sits at 1.00 and the low-probe-rate warning fires
+ * below --low-probe-rate-frac, so the buckets split the fall:
+ * under 0.5, 0.75, 0.9, 0.95, then 1.00 itself. The last bucket
+ * is +Inf, so the total bucket count is NBOUNDS + 1. */
+#define PULSE_PROBE_RATE_HIST_BOUNDS { 0.5, 0.75, 0.9, 0.95, 1.0 }
+#define PULSE_PROBE_RATE_HIST_NBOUNDS 5
+/* Cumulative bucket counts over the sampled probe-rate history:
+ * counts[b] is how many samples are <= bounds[b] (the last
+ * entry, counts[n_bounds], is the +Inf bucket — every sample),
+ * *sum is the sum of the sampled rates, and *count is how many
+ * samples the ring holds (0 when no probe cycle has sampled it
+ * yet). A sample exactly at a bound lands in that bucket, like
+ * the detection-latency and probe-RTT histograms. All outputs
+ * are 0 for a NULL member. */
+void member_probe_rate_history_hist(const member_t *m, const double *bounds,
+                                    int n_bounds, int *counts, double *sum,
+                                    int *count);
 /* 1 when the peer counts as low-probe-rate (0.68.0): the
  * low-probe-rate warning is enabled (threshold > 0), the peer
  * is ALIVE, at least PULSE_PROBE_WINDOW_MIN probes are in its

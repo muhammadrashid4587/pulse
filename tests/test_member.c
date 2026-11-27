@@ -1,4 +1,5 @@
 /* Unit tests for the membership table (no networking). */
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -506,6 +507,106 @@ int main(void) {
     CHECK(member_probe_rate_history_json(m7, now, rhbuf, 4) == -1);
     CHECK(member_probe_rate_history_json(NULL, now, rhbuf, sizeof rhbuf) == -1);
     member_sample_probe_rate(NULL, now + 3000); /* no crash */
+
+    /* Probe-rate history stats and histogram (0.74.0): the
+     * latest and minimum of the sampled rates, and how many
+     * samples the ring holds — the minimum, not the maximum,
+     * because the rate fails downward — plus cumulative bucket
+     * counts over the same samples. A fresh member has no
+     * samples: latest/min 0.0, count 0, an all-zero histogram
+     * with sum 0.0; a NULL member reports the same instead of
+     * crashing. */
+    member_table_t t8;
+    member_table_init(&t8);
+    member_t *m8 = member_add(&t8, "127.0.0.1:17108", &a4, 1);
+    double latest, mn, hsum;
+    int n, hcounts[PULSE_PROBE_RATE_HIST_NBOUNDS + 1], hcount;
+    member_probe_rate_history_stats(m8, &latest, &mn, &n);
+    CHECK(latest == 0.0 && mn == 0.0 && n == 0);
+    member_probe_rate_history_hist(m8, (const double[]){0.5, 0.75, 0.9,
+                                                         0.95, 1.0},
+                                   PULSE_PROBE_RATE_HIST_NBOUNDS, hcounts,
+                                   &hsum, &hcount);
+    CHECK(hcount == 0 && hsum == 0.0 && hcounts[0] == 0 &&
+          hcounts[PULSE_PROBE_RATE_HIST_NBOUNDS] == 0);
+    member_probe_rate_history_stats(NULL, &latest, &mn, &n);
+    CHECK(latest == 0.0 && mn == 0.0 && n == 0);
+    member_probe_rate_history_hist(NULL, (const double[]){0.5, 0.75, 0.9,
+                                                           0.95, 1.0},
+                                   PULSE_PROBE_RATE_HIST_NBOUNDS, hcounts,
+                                   &hsum, &hcount);
+    CHECK(hcount == 0 && hsum == 0.0 &&
+          hcounts[PULSE_PROBE_RATE_HIST_NBOUNDS] == 0);
+    /* Five probes: answer three (0.60), sample; answer a fourth
+     * (0.80), sample; answer the fifth (1.00), sample — so the
+     * latest is the recovery to 1.00 while the minimum is the
+     * 0.60 dip, and the histogram holds one sample in each of
+     * the 0.75, 0.9 and 1.0 buckets. */
+    for (uint32_t s = 1; s <= 5; s++)
+        member_note_probe_sent(&t8, "127.0.0.1:17108", s);
+    member_note_probe_answered(&t8, "127.0.0.1:17108", 1);
+    member_note_probe_answered(&t8, "127.0.0.1:17108", 2);
+    member_note_probe_answered(&t8, "127.0.0.1:17108", 3);
+    member_sample_probe_rate(m8, now + 100);
+    member_note_probe_answered(&t8, "127.0.0.1:17108", 4);
+    member_sample_probe_rate(m8, now + 200);
+    member_note_probe_answered(&t8, "127.0.0.1:17108", 5);
+    member_sample_probe_rate(m8, now + 300);
+    member_probe_rate_history_stats(m8, &latest, &mn, &n);
+    CHECK(n == 3);
+    CHECK(fabs(latest - 1.00) < 1e-9);
+    CHECK(fabs(mn - 0.60) < 1e-9);
+    static const double rbounds[] = PULSE_PROBE_RATE_HIST_BOUNDS;
+    member_probe_rate_history_hist(m8, rbounds,
+                                   PULSE_PROBE_RATE_HIST_NBOUNDS, hcounts,
+                                   &hsum, &hcount);
+    CHECK(hcount == 3);
+    CHECK(fabs(hsum - 2.40) < 1e-9);
+    CHECK(hcounts[0] == 0); /* le 0.5: none */
+    CHECK(hcounts[1] == 1); /* le 0.75: the 0.60 sample */
+    CHECK(hcounts[2] == 2); /* le 0.9: 0.60 and 0.80 */
+    CHECK(hcounts[3] == 2); /* le 0.95: same two */
+    CHECK(hcounts[4] == 3); /* le 1.0: all three */
+    CHECK(hcounts[5] == 3); /* +Inf: every sample */
+    /* A sample exactly at a bound lands in that bucket: 3 of 4
+     * answered is exactly 0.75, so it counts under le 0.75 and
+     * not under le 0.5. */
+    member_table_t t9;
+    member_table_init(&t9);
+    member_t *m9 = member_add(&t9, "127.0.0.1:17109", &a4, 1);
+    for (uint32_t s = 1; s <= 4; s++)
+        member_note_probe_sent(&t9, "127.0.0.1:17109", s);
+    member_note_probe_answered(&t9, "127.0.0.1:17109", 1);
+    member_note_probe_answered(&t9, "127.0.0.1:17109", 2);
+    member_note_probe_answered(&t9, "127.0.0.1:17109", 3);
+    member_sample_probe_rate(m9, now + 100);
+    member_probe_rate_history_stats(m9, &latest, &mn, &n);
+    CHECK(n == 1);
+    CHECK(fabs(latest - 0.75) < 1e-9);
+    CHECK(fabs(mn - 0.75) < 1e-9);
+    member_probe_rate_history_hist(m9, rbounds,
+                                   PULSE_PROBE_RATE_HIST_NBOUNDS, hcounts,
+                                   &hsum, &hcount);
+    CHECK(hcount == 1);
+    CHECK(hcounts[0] == 0);
+    CHECK(hcounts[1] == 1);
+    CHECK(hcounts[5] == 1);
+    /* The wrapped ring (0.71.0's m7, 16 samples all 0.80): the
+     * stats read the last 16, not the 22 taken, and the
+     * histogram buckets all 16 under le 0.9. */
+    member_probe_rate_history_stats(m7, &latest, &mn, &n);
+    CHECK(n == 16);
+    CHECK(fabs(latest - 0.80) < 1e-9);
+    CHECK(fabs(mn - 0.80) < 1e-9);
+    member_probe_rate_history_hist(m7, rbounds,
+                                   PULSE_PROBE_RATE_HIST_NBOUNDS, hcounts,
+                                   &hsum, &hcount);
+    CHECK(hcount == 16);
+    CHECK(fabs(hsum - 12.80) < 1e-9);
+    CHECK(hcounts[0] == 0);
+    CHECK(hcounts[1] == 0);
+    CHECK(hcounts[2] == 16);
+    CHECK(hcounts[5] == 16);
 
     /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
     CHECK(member_gossip_fanout(0) == 1);

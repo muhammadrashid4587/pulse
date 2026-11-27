@@ -111,7 +111,17 @@
  * after the RTT lines in METRICS, and
  * pulse_member_probes_sent_total / pulse_member_probes_answered_total
  * counters ride in PROMETHEUS under the same rule; the counts end
- * to end are covered by tests/test_probe_counts.sh. */
+ * to end are covered by tests/test_probe_counts.sh. Per-member
+ * probe-rate history in METRICS and PROMETHEUS (0.74.0) is covered
+ * here too: one "RATEHIST <id> <latest> <min> <samples>" line rides
+ * after the LOWRATE lines in METRICS for each member with at least
+ * one sample — the canned 17901 ([1.00, 0.80]), 17903 ([0.20,
+ * 0.20]) and the DEAD 17902 ([0.00], frozen) — with self absent,
+ * and the same histories ride in PROMETHEUS as latest / min /
+ * samples gauges plus a real histogram per member (cumulative
+ * buckets at le 0.5, 0.75, 0.9, 0.95, 1.0 and +Inf, with _sum and
+ * _count); the history end to end is covered by
+ * tests/test_prometheus.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -199,11 +209,17 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         member_note_probe_sent(out, "127.0.0.1:17901", 302);
         member_note_probe_sent(out, "127.0.0.1:17901", 303);
         member_note_probe_sent(out, "127.0.0.1:17901", 304);
-        member_note_probe_sent(out, "127.0.0.1:17901", 305);
         member_note_probe_answered(out, "127.0.0.1:17901", 301);
         member_note_probe_answered(out, "127.0.0.1:17901", 302);
         member_note_probe_answered(out, "127.0.0.1:17901", 303);
         member_note_probe_answered(out, "127.0.0.1:17901", 304);
+        /* Probe-rate history (0.74.0): sample the rate at 1.00
+         * (4 sent / 4 answered) before the fifth probe goes out
+         * unanswered, then at 0.80 — so the history is [1.00,
+         * 0.80]: latest 0.80, min 0.80, 2 samples. */
+        member_sample_probe_rate(m, now - 200);
+        member_note_probe_sent(out, "127.0.0.1:17901", 305);
+        member_sample_probe_rate(m, now - 100);
         m->rtt_ms = 3;
         m->rtt_sum_ms = 10;
         m->rtt_samples = 4;
@@ -245,6 +261,12 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         member_note_probe_sent(out, "127.0.0.1:17903", 404);
         member_note_probe_sent(out, "127.0.0.1:17903", 405);
         member_note_probe_answered(out, "127.0.0.1:17903", 401);
+        /* Probe-rate history (0.74.0): two samples at the same
+         * 0.20 rate — latest 0.20, min 0.20, 2 samples — so the
+         * low-rate peer's history shows the dip, not just its
+         * live rate. */
+        member_sample_probe_rate(m, now - 200);
+        member_sample_probe_rate(m, now - 100);
         m->rtt_ms = 0;
         m->rtt_sum_ms = 0;
         m->rtt_samples = 1;
@@ -270,6 +292,10 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         member_note_probe_sent(out, "127.0.0.1:17902", 503);
         member_note_probe_sent(out, "127.0.0.1:17902", 504);
         member_note_probe_sent(out, "127.0.0.1:17902", 505);
+        /* Probe-rate history (0.74.0): one sample at 0.00 — the
+         * DEAD peer keeps its frozen history, latest 0.00, min
+         * 0.00, 1 sample, like its frozen phi history. */
+        member_sample_probe_rate(m, now - 100);
         m->probes_sent = 0;
         m->probes_answered = 0;
     }
@@ -1270,7 +1296,16 @@ int main(void) {
                                    "RTT 127.0.0.1:17903 0 0 0"};
         const char *want_probes[2] = {"PROBES 127.0.0.1:17901 5 4",
                                       "PROBES 127.0.0.1:17903 2 1"};
-        int nseen = 0, nrtt = 0, nprobes = 0;
+        /* Probe-rate history in METRICS (0.74.0): the RATEHIST
+         * lines ride after the PROBES lines, in table order —
+         * the 17901 history [1.00, 0.80], the 17903 history
+         * [0.20, 0.20], and the DEAD 17902's frozen [0.00] — and
+         * self, which never probes itself, has none. */
+        const char *want_ratehist[3] = {
+            "RATEHIST 127.0.0.1:17901 0.80 0.80 2",
+            "RATEHIST 127.0.0.1:17903 0.20 0.20 2",
+            "RATEHIST 127.0.0.1:17902 0.00 0.00 1"};
+        int nseen = 0, nrtt = 0, nprobes = 0, nratehist = 0;
         char *save = NULL;
         char *line = strtok_r(reply + sizeof metrics_line - 1, "\n",
                               &save);
@@ -1288,17 +1323,21 @@ int main(void) {
             } else if (nrtt < 2) {
                 CHECK(strcmp(line, want_rtt[nrtt]) == 0);
                 nrtt++;
-            } else {
-                CHECK(nprobes < 2);
-                if (nprobes < 2)
-                    CHECK(strcmp(line, want_probes[nprobes]) == 0);
+            } else if (nprobes < 2) {
+                CHECK(strcmp(line, want_probes[nprobes]) == 0);
                 nprobes++;
+            } else {
+                CHECK(nratehist < 3);
+                if (nratehist < 3)
+                    CHECK(strcmp(line, want_ratehist[nratehist]) == 0);
+                nratehist++;
             }
             line = strtok_r(NULL, "\n", &save);
         }
         CHECK(nseen == 2);
         CHECK(nrtt == 2);
         CHECK(nprobes == 2);
+        CHECK(nratehist == 3);
         CHECK(line != NULL && strcmp(line, "END") == 0);
     }
 
@@ -1467,6 +1506,20 @@ int main(void) {
          * follows. */
         const char *probes = strstr(reply, "PROBES 127.0.0.1:17903 2 1");
         CHECK(probes != NULL && low != NULL && low > probes);
+        /* Probe-rate history in METRICS (0.74.0): one "RATEHIST
+         * <id> <latest> <min> <samples>" line per member with at
+         * least one sample, after the LOWRATE lines — the canned
+         * 17901 (history [1.00, 0.80]) reads latest 0.80, min
+         * 0.80, 2 samples; the canned 17903 ([0.20, 0.20]) reads
+         * 0.20 / 0.20 / 2; the DEAD 17902 ([0.00]) keeps its
+         * frozen history, 0.00 / 0.00 / 1; self, which never
+         * probes itself, has no line. */
+        const char *rhist = strstr(reply, "RATEHIST 127.0.0.1:17901 0.80 0.80 2\n");
+        CHECK(rhist != NULL);
+        CHECK(strstr(reply, "RATEHIST 127.0.0.1:17903 0.20 0.20 2\n") != NULL);
+        CHECK(strstr(reply, "RATEHIST 127.0.0.1:17902 0.00 0.00 1\n") != NULL);
+        CHECK(strstr(reply, "RATEHIST 127.0.0.1:17999") == NULL);
+        CHECK(rhist != NULL && low != NULL && rhist > low);
     }
     CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
     CHECK(strstr(reply, "\"low_probe_rate_peers\":1") != NULL);
@@ -1756,6 +1809,48 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_probes_answered_total{member=\"127.0.0.1:17903\"} 1\n") != NULL);
         CHECK(strstr(preply, "pulse_member_probes_answered_total{member=\"127.0.0.1:17999\"}") == NULL);
         CHECK(strstr(preply, "pulse_member_probes_answered_total{member=\"127.0.0.1:17902\"}") == NULL);
+        /* Probe-rate history in PROMETHEUS (0.74.0): the last 16
+         * sampled rates ride as latest / min / samples gauges —
+         * the canned 17901 (history [1.00, 0.80]) reads latest
+         * 0.80, min 0.80, 2 samples; the canned 17903 ([0.20,
+         * 0.20]) reads 0.20 / 0.20 / 2; the DEAD 17902 ([0.00])
+         * keeps its frozen history, 0.00 / 0.00 / 1; self, which
+         * never probes itself, has no gauge at all — and as a
+         * real histogram per member, cumulative buckets at le
+         * 0.5, 0.75, 0.9, 0.95 and 1.0, plus _sum and _count:
+         * 17901's two samples sum to 1.80 with one under le 0.9
+         * and both under le 1.0, 17903's sum to 0.40 with both
+         * under le 0.5, and the +Inf bucket always equals the
+         * samples gauge for the same member. */
+        CHECK(strstr(preply, "# TYPE pulse_member_probe_rate_history_latest gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_latest{member=\"127.0.0.1:17901\"} 0.80\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_latest{member=\"127.0.0.1:17903\"} 0.20\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_latest{member=\"127.0.0.1:17902\"} 0.00\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_latest{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_probe_rate_history_min gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_min{member=\"127.0.0.1:17901\"} 0.80\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_min{member=\"127.0.0.1:17903\"} 0.20\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_min{member=\"127.0.0.1:17902\"} 0.00\n") != NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_probe_rate_history_samples gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_samples{member=\"127.0.0.1:17901\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_samples{member=\"127.0.0.1:17903\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_samples{member=\"127.0.0.1:17902\"} 1\n") != NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_probe_rate_history histogram\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17901\",le=\"0.5\"} 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17901\",le=\"0.75\"} 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17901\",le=\"0.9\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17901\",le=\"0.95\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17901\",le=\"1\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17901\",le=\"+Inf\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_sum{member=\"127.0.0.1:17901\"} 1.80\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_count{member=\"127.0.0.1:17901\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17903\",le=\"0.5\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17903\",le=\"+Inf\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_sum{member=\"127.0.0.1:17903\"} 0.40\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_count{member=\"127.0.0.1:17903\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17902\",le=\"0.5\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_sum{member=\"127.0.0.1:17902\"} 0.00\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17999\"}") == NULL);
         /* Time since last contact per member (0.59.0): one
          * pulse_member_last_seen_ms gauge sample per member heard
          * from — the seed peer and the peer-file peer, both heard

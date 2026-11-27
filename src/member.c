@@ -575,6 +575,55 @@ int member_probe_rate_history_json(const member_t *m, int64_t start_ms,
     return (int)used;
 }
 
+void member_probe_rate_history_stats(const member_t *m, double *latest,
+                                     double *min, int *count) {
+    *latest = 0.0;
+    *min = 0.0;
+    *count = 0;
+    if (!m) return;
+    *count = m->probe_rate_hist_count;
+    if (m->probe_rate_hist_count == 0) return;
+    /* Oldest first, the same ring walk as
+     * member_probe_rate_history_json; the latest is the last one
+     * walked, and the minimum is the worst sample in the window
+     * — the rate fails downward, so the minimum is the phi
+     * history's maximum mirrored. */
+    int start = m->probe_rate_hist_head - m->probe_rate_hist_count;
+    if (start < 0) start += PULSE_PROBE_RATE_HISTORY;
+    *min = 1.0;
+    for (int k = 0; k < m->probe_rate_hist_count; k++) {
+        int idx = (start + k) % PULSE_PROBE_RATE_HISTORY;
+        double v = m->probe_rate_hist[idx];
+        if (v < *min) *min = v;
+        *latest = v;
+    }
+}
+
+void member_probe_rate_history_hist(const member_t *m, const double *bounds,
+                                    int n_bounds, int *counts, double *sum,
+                                    int *count) {
+    for (int b = 0; b <= n_bounds; b++) counts[b] = 0;
+    *sum = 0.0;
+    *count = 0;
+    if (!m) return;
+    *count = m->probe_rate_hist_count;
+    if (m->probe_rate_hist_count == 0) return;
+    /* Oldest first, the same ring walk as
+     * member_probe_rate_history_json. */
+    int start = m->probe_rate_hist_head - m->probe_rate_hist_count;
+    if (start < 0) start += PULSE_PROBE_RATE_HISTORY;
+    for (int k = 0; k < m->probe_rate_hist_count; k++) {
+        int idx = (start + k) % PULSE_PROBE_RATE_HISTORY;
+        double v = m->probe_rate_hist[idx];
+        *sum += v;
+        for (int b = 0; b < n_bounds; b++) {
+            if (v <= bounds[b]) counts[b]++;
+        }
+    }
+    /* The +Inf bucket holds every sample. */
+    counts[n_bounds] = m->probe_rate_hist_count;
+}
+
 int member_is_low_probe_rate(const member_t *m, double threshold_frac) {
     if (!m || threshold_frac <= 0) return 0;
     if (m->state != MEMBER_ALIVE) return 0;

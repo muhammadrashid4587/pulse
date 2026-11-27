@@ -706,6 +706,35 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
                  mem->id, member_probe_rate(mem));
         if (send_all(fd, lowline) != 0) return;
     }
+    /* Per-member probe-rate history (0.74.0): the last 16 sampled
+     * windowed probe success rates JSON reports as
+     * "probe_rate_history", summarised as one "RATEHIST <id>
+     * <latest> <min> <samples>" line per member with at least one
+     * sample, after the LOWRATE lines — the latest is the most
+     * recent probe-cycle sample, the minimum is the worst sample
+     * in the window (the rate fails downward, so the minimum is
+     * the interesting extreme, the mirror of phi history's
+     * maximum), and the samples count says how many of the 16
+     * slots are filled. The rule is the JSON rule minus the
+     * phi-mode gate: the rate exists whether phi-accrual is on
+     * or not, so the history does too — self never probes itself
+     * and so has no line, a peer no probe cycle has sampled yet
+     * has none, and a DEAD member keeps its frozen history until
+     * GC, like its phi history, so a text-protocol consumer can
+     * see how far a peer's rate fell before it died instead of
+     * only its live probe_rate. */
+    for (int i = 0; i < t.count; i++) {
+        const member_t *mem = &t.members[i];
+        if (strcmp(mem->id, hooks->self_id) == 0) continue;
+        double latest, mn;
+        int n;
+        member_probe_rate_history_stats(mem, &latest, &mn, &n);
+        if (n == 0) continue;
+        char histline[128];
+        snprintf(histline, sizeof histline, "\nRATEHIST %s %.2f %.2f %d",
+                 mem->id, latest, mn, n);
+        if (send_all(fd, histline) != 0) return;
+    }
     send_all(fd, "\nEND\n");
 }
 
@@ -1827,6 +1856,122 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             ok &= prom_add(buf, sizeof buf, &used,
                 "pulse_member_phi_history_sum{member=\"%s\"} %.2f\n"
                 "pulse_member_phi_history_count{member=\"%s\"} %d\n",
+                t.members[i].id, sum, t.members[i].id, n) == 0;
+        }
+    }
+    /* Probe-rate history per member (0.74.0): the last 16 sampled
+     * windowed probe success rates JSON reports as
+     * "probe_rate_history", as gauges a scraper can alert on —
+     * the latest sampled rate (the most recent probe-cycle
+     * sample, not the live value recomputed at scrape time), the
+     * minimum over the window, and how many samples the window
+     * holds (1-16). The mirror of the phi-history gauges, but
+     * the minimum instead of the maximum: a probe rate fails
+     * downward, so the worst sample is the lowest one, and a
+     * scraper can alert on a rate that fell and recovered without
+     * polling JSON. Same rule as the live pulse_member_probe_rate
+     * gauge, minus the phi-mode gate: not self, and at least one
+     * sample taken, so a peer no probe cycle has sampled yet has
+     * no lines; a member that goes DEAD keeps its frozen history,
+     * so its gauges stay at the last-known values until GC, like
+     * the live rate gauge. The samples gauge says whether the
+     * latest/min are real, the same convention as the latency
+     * groups' samples gauges. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_probe_rate_history_latest Latest "
+        "sampled probe success rate in the member's probe-rate "
+        "history.\n"
+        "# TYPE pulse_member_probe_rate_history_latest gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (strcmp(t.members[i].id, hooks->self_id) == 0) continue;
+        double latest, mn;
+        int n;
+        member_probe_rate_history_stats(&t.members[i], &latest, &mn, &n);
+        if (n == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_probe_rate_history_latest{member=\"%s\"} "
+            "%.2f\n",
+            t.members[i].id, latest) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_probe_rate_history_min Minimum "
+        "sampled probe success rate in the member's probe-rate "
+        "history.\n"
+        "# TYPE pulse_member_probe_rate_history_min gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (strcmp(t.members[i].id, hooks->self_id) == 0) continue;
+        double latest, mn;
+        int n;
+        member_probe_rate_history_stats(&t.members[i], &latest, &mn, &n);
+        if (n == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_probe_rate_history_min{member=\"%s\"} "
+            "%.2f\n",
+            t.members[i].id, mn) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_probe_rate_history_samples Samples "
+        "in the member's probe-rate history (at most 16).\n"
+        "# TYPE pulse_member_probe_rate_history_samples gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (strcmp(t.members[i].id, hooks->self_id) == 0) continue;
+        double latest, mn;
+        int n;
+        member_probe_rate_history_stats(&t.members[i], &latest, &mn, &n);
+        if (n == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_probe_rate_history_samples{member=\"%s\"} "
+            "%d\n",
+            t.members[i].id, n) == 0;
+    }
+    /* Probe-rate history histogram per member (0.74.0): the same
+     * 16 sampled rates the gauges above summarise, as a real
+     * histogram — cumulative buckets at le 0.5, 0.75, 0.9, 0.95
+     * and 1.0, plus _sum and _count — so a scraper can compute
+     * quantiles of a peer's rate history instead of trusting the
+     * latest and minimum alone: a peer that spent most of its
+     * window at 1.00 with one dip to 0.40 reads differently from
+     * one that slid steadily down. Same rule as the history
+     * gauges: not self, and at least one sample taken; a member
+     * that goes DEAD keeps its frozen histogram until GC, like
+     * its gauges, so the shape of the fall at suspicion stays
+     * visible after the peer is gone. The sum is the sum of the
+     * sampled rates to two decimals like the gauges, and the
+     * +Inf bucket always equals the samples gauge for the same
+     * member. */
+    {
+        static const double bounds[] = PULSE_PROBE_RATE_HIST_BOUNDS;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "# HELP pulse_member_probe_rate_history Sampled probe "
+            "success rates in the member's probe-rate history, "
+            "cumulative histogram.\n"
+            "# TYPE pulse_member_probe_rate_history histogram\n") == 0;
+        for (int i = 0; i < t.count; i++) {
+            if (strcmp(t.members[i].id, hooks->self_id) == 0) continue;
+            int counts[PULSE_PROBE_RATE_HIST_NBOUNDS + 1];
+            double sum;
+            int n;
+            member_probe_rate_history_hist(&t.members[i], bounds,
+                PULSE_PROBE_RATE_HIST_NBOUNDS, counts, &sum, &n);
+            if (n == 0) continue;
+            for (int b = 0; b <= PULSE_PROBE_RATE_HIST_NBOUNDS; b++) {
+                if (b < PULSE_PROBE_RATE_HIST_NBOUNDS) {
+                    ok &= prom_add(buf, sizeof buf, &used,
+                        "pulse_member_probe_rate_history_bucket{member="
+                        "\"%s\",le=\"%g\"} %d\n",
+                        t.members[i].id, bounds[b], counts[b]) == 0;
+                } else {
+                    ok &= prom_add(buf, sizeof buf, &used,
+                        "pulse_member_probe_rate_history_bucket{member="
+                        "\"%s\",le=\"+Inf\"} %d\n",
+                        t.members[i].id, counts[b]) == 0;
+                }
+            }
+            ok &= prom_add(buf, sizeof buf, &used,
+                "pulse_member_probe_rate_history_sum{member=\"%s\"} "
+                "%.2f\n"
+                "pulse_member_probe_rate_history_count{member=\"%s\"} "
+                "%d\n",
                 t.members[i].id, sum, t.members[i].id, n) == 0;
         }
     }

@@ -31,7 +31,13 @@
 #     that has heartbeat history, none for self, and the value
 #     agrees with the phi JSON reports for the same member. Kill
 #     the peer and the gauge stays, at the last-known phi, the
-#     same as the RTT gauge does for a dead member.
+#     same as the RTT gauge does for a dead member. Probe-rate
+#     history (0.74.0) rides the same way, in both modes: the last
+#     16 sampled windowed rates ride as latest / min / samples
+#     gauges plus a real histogram per member in PROMETHEUS, and
+#     as one RATEHIST line per sampled member in METRICS — and a
+#     dead member keeps its frozen history on both surfaces until
+#     GC, like its phi history.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -329,6 +335,80 @@ else
     printf '%s\n' "$PP" | grep -E 'pulse_member_phi_history_bucket|pulse_member_phi_history_sum|pulse_member_phi_history_count' || true
 fi
 
+# 4e. Probe-rate history in PROMETHEUS (0.74.0): the last 16
+# sampled windowed rates JSON reports as probe_rate_history ride
+# as latest / min / samples gauges — one line per member with at
+# least one sample, none for self — and the latest never drops
+# below the min, with the sample count between 1 and 16. The
+# same history rides in METRICS as one RATEHIST line per sampled
+# member, after the LOWRATE lines — the peer's line carries the
+# same latest / min / samples, and self has no line.
+RATEHIST_LATEST="$(printf '%s' "$PP" | grep '^pulse_member_probe_rate_history_latest{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+RATEHIST_MIN="$(printf '%s' "$PP" | grep '^pulse_member_probe_rate_history_min{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+RATEHIST_N="$(printf '%s' "$PP" | grep '^pulse_member_probe_rate_history_samples{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+RATEHIST_OK=0
+if [ -n "$RATEHIST_LATEST" ] && [ -n "$RATEHIST_MIN" ] && [ -n "$RATEHIST_N" ]; then
+    if awk -v latest="$RATEHIST_LATEST" -v mn="$RATEHIST_MIN" -v n="$RATEHIST_N" 'BEGIN { exit (latest + 0.001 >= mn && latest <= 1.0 && mn >= 0.0 && n >= 1 && n <= 16 ? 0 : 1) }'; then
+        RATEHIST_OK=1
+    fi
+fi
+METRICS="$(ctl 18891 METRICS)"
+if [ -n "$PP" ] \
+   && printf '%s' "$PP" | grep -q '^# TYPE pulse_member_probe_rate_history_latest gauge$' \
+   && printf '%s' "$PP" | grep -q '^# TYPE pulse_member_probe_rate_history_min gauge$' \
+   && printf '%s' "$PP" | grep -q '^# TYPE pulse_member_probe_rate_history_samples gauge$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_latest{member="127.0.0.1:17892"} [01]\.[0-9][0-9]$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_min{member="127.0.0.1:17892"} [01]\.[0-9][0-9]$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_samples{member="127.0.0.1:17892"} [1-9][0-9]*$' \
+   && ! printf '%s' "$PP" | grep -q 'pulse_member_probe_rate_history_latest{member="127.0.0.1:17891"' \
+   && [ "$RATEHIST_OK" = 1 ] \
+   && printf '%s' "$METRICS" | grep -q '^RATEHIST 127.0.0.1:17892 [01]\.[0-9][0-9] [01]\.[0-9][0-9] [1-9][0-9]*$' \
+   && ! printf '%s' "$METRICS" | grep -q '^RATEHIST 127.0.0.1:17891'; then
+    note ok "PROMETHEUS exposes probe-rate history gauges (latest $RATEHIST_LATEST, min $RATEHIST_MIN, $RATEHIST_N samples; no self gauge) and METRICS a RATEHIST line"
+else
+    note fail "PROMETHEUS exposes probe-rate history gauges (latest $RATEHIST_LATEST, min $RATEHIST_MIN, samples $RATEHIST_N) and METRICS a RATEHIST line"
+    printf '%s\n' "$PP" | grep -E 'pulse_member_probe_rate_history' || true
+    printf '%s\n' "$METRICS" | grep -E '^RATEHIST' || true
+fi
+
+# 4f. Probe-rate history histogram in PROMETHEUS (0.74.0): the same
+# 16 sampled rates ride as a real histogram per member —
+# cumulative buckets at le 0.5, 0.75, 0.9, 0.95, 1.0 and +Inf, plus
+# _sum and _count — one line per member with at least one sample,
+# none for self. The +Inf bucket always equals the samples gauge
+# for the same member, and the buckets are cumulative, so each is
+# at least the one before it.
+RATEHIST_INF="$(printf '%s' "$PP" | grep '^pulse_member_probe_rate_history_bucket{member="127.0.0.1:17892",le="+Inf"} ' | awk '{print $2}')"
+RATEHIST_SUM="$(printf '%s' "$PP" | grep '^pulse_member_probe_rate_history_sum{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+RATEHIST_COUNT="$(printf '%s' "$PP" | grep '^pulse_member_probe_rate_history_count{member="127.0.0.1:17892"} ' | awk '{print $2}')"
+RATEHIST_CUM_OK=0
+if [ -n "$RATEHIST_INF" ] && [ -n "$RATEHIST_N" ] && [ "$RATEHIST_INF" = "$RATEHIST_N" ] \
+   && [ -n "$RATEHIST_COUNT" ] && [ "$RATEHIST_COUNT" = "$RATEHIST_N" ]; then
+    # Cumulative check: read the six bucket counts in order and
+    # confirm none decreases.
+    if printf '%s' "$PP" | grep '^pulse_member_probe_rate_history_bucket{member="127.0.0.1:17892"' \
+        | awk '{print $2}' | awk 'NR == 1 { prev = $1; next } { if ($1 < prev) exit 1; prev = $1 } END { exit 0 }'; then
+        RATEHIST_CUM_OK=1
+    fi
+fi
+if [ -n "$PP" ] \
+   && printf '%s' "$PP" | grep -q '^# TYPE pulse_member_probe_rate_history histogram$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_bucket{member="127.0.0.1:17892",le="0.5"} [0-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_bucket{member="127.0.0.1:17892",le="0.75"} [0-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_bucket{member="127.0.0.1:17892",le="0.9"} [0-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_bucket{member="127.0.0.1:17892",le="0.95"} [0-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_bucket{member="127.0.0.1:17892",le="1"} [0-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_bucket{member="127.0.0.1:17892",le="+Inf"} [1-9][0-9]*$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_sum{member="127.0.0.1:17892"} [0-9][0-9]*\.[0-9][0-9]$' \
+   && printf '%s' "$PP" | grep -q '^pulse_member_probe_rate_history_count{member="127.0.0.1:17892"} [1-9][0-9]*$' \
+   && ! printf '%s' "$PP" | grep -q 'pulse_member_probe_rate_history_bucket{member="127.0.0.1:17891"' \
+   && [ "$RATEHIST_CUM_OK" = 1 ]; then
+    note ok "PROMETHEUS exposes the probe-rate history histogram (+Inf $RATEHIST_INF = samples $RATEHIST_N, sum $RATEHIST_SUM, cumulative; no self series)"
+else
+    note fail "PROMETHEUS exposes the probe-rate history histogram (+Inf $RATEHIST_INF, samples $RATEHIST_N, sum $RATEHIST_SUM, count $RATEHIST_COUNT)"
+    printf '%s\n' "$PP" | grep -E 'pulse_member_probe_rate_history_bucket|pulse_member_probe_rate_history_sum|pulse_member_probe_rate_history_count' || true
+fi
+
 kill -9 "$(cat "$TMP/p2.pid")"
 if wait_for "$TMP/p1.log" "DEAD 127.0.0.1:17892" 10; then
     note ok "phi-mode node 1 marks the killed node DEAD"
@@ -362,6 +442,38 @@ if wait_prom 18891 '^pulse_member_phi_history_bucket\{member="127.0.0.1:17892",l
 else
     note fail "dead member keeps its frozen phi history histogram until GC"
     prom 18891 | grep -E 'pulse_member_phi_history' || true
+fi
+# The frozen probe-rate history stays too: the dead member's
+# history gauges are still there, at the values the fall reached
+# at suspicion — the min shows how far the rate fell while the
+# peer went quiet, not just its live rate.
+if wait_prom 18891 '^pulse_member_probe_rate_history_min\{member="127.0.0.1:17892"\} [01]\.[0-9][0-9]$' 5 \
+   && wait_prom 18891 '^pulse_member_probe_rate_history_latest\{member="127.0.0.1:17892"\} [01]\.[0-9][0-9]$' 5 \
+   && wait_prom 18891 '^pulse_member_probe_rate_history_samples\{member="127.0.0.1:17892"\} [1-9][0-9]*$' 5; then
+    note ok "dead member keeps its frozen probe-rate history gauges until GC"
+else
+    note fail "dead member keeps its frozen probe-rate history gauges until GC"
+    prom 18891 | grep -E 'pulse_member_probe_rate_history' || true
+fi
+# And the frozen probe-rate histogram with it: the dead member's
+# bucket lines, sum and count are still there, at the values the
+# fall reached at suspicion — and the METRICS RATEHIST line stays
+# too, with the same frozen values.
+if wait_prom 18891 '^pulse_member_probe_rate_history_bucket\{member="127.0.0.1:17892",le="\+Inf"\} [1-9][0-9]*$' 5 \
+   && wait_prom 18891 '^pulse_member_probe_rate_history_sum\{member="127.0.0.1:17892"\} [0-9][0-9]*\.[0-9][0-9]$' 5 \
+   && wait_prom 18891 '^pulse_member_probe_rate_history_count\{member="127.0.0.1:17892"\} [1-9][0-9]*$' 5; then
+    note ok "dead member keeps its frozen probe-rate history histogram until GC"
+else
+    note fail "dead member keeps its frozen probe-rate history histogram until GC"
+    prom 18891 | grep -E 'pulse_member_probe_rate_history' || true
+fi
+METRICS_DEAD="$(ctl 18891 METRICS)"
+if printf '%s' "$METRICS_DEAD" | grep -q '^RATEHIST 127.0.0.1:17892 [01]\.[0-9][0-9] [01]\.[0-9][0-9] [1-9][0-9]*$' \
+   && ! printf '%s' "$METRICS_DEAD" | grep -q '^RATEHIST 127.0.0.1:17891'; then
+    note ok "dead member keeps its frozen RATEHIST line in METRICS until GC"
+else
+    note fail "dead member keeps its frozen RATEHIST line in METRICS until GC"
+    printf '%s\n' "$METRICS_DEAD" | grep -E '^RATEHIST' || true
 fi
 
 echo "test_prometheus: $PASS passed, $FAIL failed"
