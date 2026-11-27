@@ -309,6 +309,8 @@ member_t *member_add(member_table_t *t, const char *id,
     m->rtt_sum_ms = 0;
     m->rtt_samples = 0;
     m->rtt_max_ms = -1;
+    m->probes_sent = 0;
+    m->probes_answered = 0;
     phi_init(&m->phi);
     note_change(t, m);
     return m;
@@ -484,6 +486,12 @@ int member_merge(member_table_t *t, const char *self_id, const char *id,
     return MERGE_NONE;
 }
 
+void member_note_probe_sent(member_table_t *t, const char *id) {
+    member_t *m = member_find(t, id);
+    if (!m) return;
+    m->probes_sent++;
+}
+
 int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,
                     int64_t slow_threshold_ms) {
     if (rtt_ms < 0) return 0;
@@ -492,6 +500,11 @@ int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,
     m->rtt_ms = rtt_ms;
     m->rtt_sum_ms += rtt_ms;
     m->rtt_samples++;
+    /* Per-member probe counts (0.66.0): an answered probe is one
+     * that produced an RTT sample, so the answered count rides
+     * with the sample — it always equals rtt_samples, and a
+     * probe never answered adds to sent only. */
+    m->probes_answered++;
     if (m->rtt_max_ms < 0 || rtt_ms > m->rtt_max_ms)
         m->rtt_max_ms = rtt_ms;
     /* Slow-peer warning (0.22.0): a first crossing above the threshold

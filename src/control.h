@@ -202,6 +202,17 @@
  *       line (rtt_ms is -1 until a probe is answered); a 0 is
  *       a real sub-millisecond probe, not a missing one; a
  *       DEAD member keeps its last RTT until GC.
+ *       Per-member probe counts (0.66.0): after the RTT lines,
+ *       one "PROBES <id> <sent> <answered>" line per member
+ *       that has been probed — how many direct probes this node
+ *       sent to the peer and how many were answered, the probe
+ *       success rate, the same values JSON reports as
+ *       "probes_sent" / "probes_answered" and PROMETHEUS as
+ *       pulse_member_probes_sent_total /
+ *       pulse_member_probes_answered_total. A peer probed but
+ *       never answered still has a line (sent climbing,
+ *       answered 0); self and a peer never probed have none;
+ *       a DEAD member keeps its counts until GC.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -222,7 +233,14 @@
  *       silent), "source" (where
  *       the peer came from: "seed", "peer-file", "discovered" or
  *       "self" — the same provenance PEERS reports, so a peer-file
- *       peer is distinguishable from a discovered one), and the
+ *       peer is distinguishable from a discovered one),
+ *       "probes_sent" / "probes_answered" (0.66.0: how many
+ *       direct probes this node sent to the peer and how many
+ *       were answered — the probe success rate — always numbers,
+ *       never null: 0 sent for self and for a peer never probed,
+ *       sent climbing with answered 0 for a peer probed but
+ *       never answered; answered always equals the number of
+ *       RTT samples), and the
  *       metrics object carries "slow_peers" (how many members are
  *       slow). The metrics object also carries "seed_rejoins_by_seed"
  *       (0.54.0): the per-seed breakdown of "seed_rejoins" as an
@@ -311,7 +329,14 @@
  *       (1, labelled by member, state and source). The last and
  *       mean probe RTT per member ride as "pulse_member_rtt_ms"
  *       and "pulse_member_rtt_mean_ms" gauges (0.40.0), one line
- *       per member that has answered a probe. How long each
+ *       per member that has answered a probe. How many direct
+ *       probes each member was sent and answered rides as
+ *       "pulse_member_probes_sent_total" and
+ *       "pulse_member_probes_answered_total" counters (0.66.0),
+ *       one labelled sample per member that has been probed — a
+ *       peer probed but never answered still has a sample (sent
+ *       climbing, answered 0); self and a peer never probed have
+ *       none; a DEAD member keeps its counters until GC. How long each
  *       SUSPECT member has been suspected rides as a
  *       "pulse_member_suspect_ms" gauge (0.58.0), one line per
  *       SUSPECT member — the same value JSON reports as

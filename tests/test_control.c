@@ -103,7 +103,15 @@
  * as the last and mean gauges; the worst RTT end to end is covered
  * by tests/test_prometheus.sh. Worst probe RTT in METRICS
  * (0.65.0) is the same max as the fourth RTT field, covered by
- * the exact canned lines above. */
+ * the exact canned lines above. Per-member probe counts (0.66.0)
+ * are covered here too: each member carries "probes_sent" /
+ * "probes_answered" in JSON (5 / 4 for the canned 17901, 2 / 1
+ * for 17903, 0 / 0 for self and the never-heard-from peer), one
+ * "PROBES <id> <sent> <answered>" line per probed member rides
+ * after the RTT lines in METRICS, and
+ * pulse_member_probes_sent_total / pulse_member_probes_answered_total
+ * counters ride in PROMETHEUS under the same rule; the counts end
+ * to end are covered by tests/test_probe_counts.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -178,11 +186,15 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         /* Probe RTT (0.40.0): answered probes, last 3 ms, mean 2
          * over 4 samples — so PROMETHEUS has a real rtt gauge to
          * check for this peer. Worst RTT (0.64.0): 7 ms, the
-         * largest of the four samples (3, 7, 0, 0 sum to 10). */
+         * largest of the four samples (3, 7, 0, 0 sum to 10).
+         * Probe counts (0.66.0): 5 sent, 4 answered — one probe
+         * went unanswered, so the success rate is 4/5, not 1. */
         m->rtt_ms = 3;
         m->rtt_sum_ms = 10;
         m->rtt_samples = 4;
         m->rtt_max_ms = 7;
+        m->probes_sent = 5;
+        m->probes_answered = 4;
         /* Phi history (0.42.0): two 100 ms intervals, last
          * heartbeat ~9.8 s ago — so the live phi at scrape time
          * is pinned at the 30.00 cap (the gap is ~97 floored
@@ -204,11 +216,15 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         m->last_seen_ms = now;
         /* A sub-millisecond probe: last and mean both 0, which is
          * a real value, not a missing one — and the worst is 0
-         * too (0.64.0), a real worst case, not a missing one. */
+         * too (0.64.0), a real worst case, not a missing one.
+         * Probe counts (0.66.0): 2 sent, 1 answered — half its
+         * probes went unanswered, so the rate is 1/2. */
         m->rtt_ms = 0;
         m->rtt_sum_ms = 0;
         m->rtt_samples = 1;
         m->rtt_max_ms = 0;
+        m->probes_sent = 2;
+        m->probes_answered = 1;
     }
     m = member_add(out, "127.0.0.1:17902", &addr, 1);
     if (m) {
@@ -888,7 +904,12 @@ int main(void) {
      * 17903 (last 0, mean 0, max 0, a real sub-millisecond probe)
      * in table order, exact values since they are canned; self
      * and the never-heard-from peer (17902, rtt_ms -1) have no
-     * line — then END. */
+     * line — then the PROBES lines (0.66.0), one "PROBES <id>
+     * <sent> <answered>" line per member that has been probed,
+     * after the RTT lines — the canned 17901 (5 sent, 4
+     * answered) and 17903 (2 sent, 1 answered), exact values;
+     * self (never probes itself) and the never-heard-from peer
+     * (17902, never probed) have no line — then END. */
     g_peerfile_mode = 0;
     CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
     {
@@ -915,7 +936,9 @@ int main(void) {
                                        "127.0.0.1:17903"};
         const char *want_rtt[2] = {"RTT 127.0.0.1:17901 3 2 7",
                                    "RTT 127.0.0.1:17903 0 0 0"};
-        int nseen = 0, nrtt = 0;
+        const char *want_probes[2] = {"PROBES 127.0.0.1:17901 5 4",
+                                      "PROBES 127.0.0.1:17903 2 1"};
+        int nseen = 0, nrtt = 0, nprobes = 0;
         char *save = NULL;
         char *line = strtok_r(reply + sizeof metrics_line - 1, "\n",
                               &save);
@@ -930,15 +953,20 @@ int main(void) {
                     if (!isdigit((unsigned char)ms[i])) all_digits = 0;
                 CHECK(all_digits);
                 nseen++;
-            } else {
-                CHECK(nrtt < 2);
-                if (nrtt < 2) CHECK(strcmp(line, want_rtt[nrtt]) == 0);
+            } else if (nrtt < 2) {
+                CHECK(strcmp(line, want_rtt[nrtt]) == 0);
                 nrtt++;
+            } else {
+                CHECK(nprobes < 2);
+                if (nprobes < 2)
+                    CHECK(strcmp(line, want_probes[nprobes]) == 0);
+                nprobes++;
             }
             line = strtok_r(NULL, "\n", &save);
         }
         CHECK(nseen == 2);
         CHECK(nrtt == 2);
+        CHECK(nprobes == 2);
         CHECK(line != NULL && strcmp(line, "END") == 0);
     }
 
@@ -1044,6 +1072,47 @@ int main(void) {
         next_id = never ? strstr(never + 1, "\"id\":") : NULL;
         CHECK(never != NULL && max_null != NULL &&
               (next_id == NULL || max_null < next_id));
+    }
+    /* Per-member probe counts (0.66.0): each member carries
+     * "probes_sent" / "probes_answered" — always numbers, never
+     * null: 5 / 4 for the canned 17901 (one probe went
+     * unanswered), 2 / 1 for 17903, and 0 / 0 for self (it never
+     * probes itself) and for the never-heard-from 17902 (never
+     * probed), each checked inside its own member object. */
+    {
+        const char *peer = strstr(reply, "\"id\":\"127.0.0.1:17901\"");
+        const char *counts =
+            peer ? strstr(peer, "\"probes_sent\":5,\"probes_answered\":4")
+                 : NULL;
+        const char *next_id =
+            peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && counts != NULL &&
+              (next_id == NULL || counts < next_id));
+        peer = strstr(reply, "\"id\":\"127.0.0.1:17903\"");
+        counts = peer
+                     ? strstr(peer, "\"probes_sent\":2,\"probes_answered\":1")
+                     : NULL;
+        next_id = peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && counts != NULL &&
+              (next_id == NULL || counts < next_id));
+        /* Self (17999) is the first member, but its id also rides
+         * top-level as the node's own "id" — so anchor the search
+         * at the members array, not at the first "id" in the
+         * reply, and bound it by the next member's id (17901). */
+        peer = strstr(reply, "\"members\":[{\"id\":\"127.0.0.1:17999\"");
+        counts = peer
+                     ? strstr(peer, "\"probes_sent\":0,\"probes_answered\":0")
+                     : NULL;
+        next_id = peer ? strstr(peer, "\"id\":\"127.0.0.1:17901\"") : NULL;
+        CHECK(peer != NULL && counts != NULL &&
+              (next_id == NULL || counts < next_id));
+        peer = strstr(reply, "\"id\":\"127.0.0.1:17902\"");
+        counts = peer
+                     ? strstr(peer, "\"probes_sent\":0,\"probes_answered\":0")
+                     : NULL;
+        next_id = peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && counts != NULL &&
+              (next_id == NULL || counts < next_id));
     }
     /* The peer_file object sits at the top level, after metrics. */
     {
@@ -1249,6 +1318,23 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_rtt_max_ms{member=\"127.0.0.1:17903\"} 0\n") != NULL);
         CHECK(strstr(preply, "pulse_member_rtt_max_ms{member=\"127.0.0.1:17999\"}") == NULL);
         CHECK(strstr(preply, "pulse_member_rtt_max_ms{member=\"127.0.0.1:17902\"}") == NULL);
+        /* Per-member probe counts (0.66.0): sent and answered as
+         * counters, one labelled sample per member that has been
+         * probed — 5 sent / 4 answered for 17901 (one probe went
+         * unanswered), 2 / 1 for 17903 (half went unanswered) —
+         * while self, which never probes itself, and the
+         * never-heard-from peer, which was never probed, have no
+         * sample at all. */
+        CHECK(strstr(preply, "# TYPE pulse_member_probes_sent_total counter\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probes_sent_total{member=\"127.0.0.1:17901\"} 5\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probes_sent_total{member=\"127.0.0.1:17903\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probes_sent_total{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_probes_sent_total{member=\"127.0.0.1:17902\"}") == NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_probes_answered_total counter\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probes_answered_total{member=\"127.0.0.1:17901\"} 4\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probes_answered_total{member=\"127.0.0.1:17903\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probes_answered_total{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_probes_answered_total{member=\"127.0.0.1:17902\"}") == NULL);
         /* Time since last contact per member (0.59.0): one
          * pulse_member_last_seen_ms gauge sample per member heard
          * from — the seed peer and the peer-file peer, both heard

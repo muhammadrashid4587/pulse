@@ -1167,9 +1167,20 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
             send = 1;
         }
         pthread_mutex_unlock(&g_lock);
-        if (send)
+        if (send) {
             gossip_send_ping(g_send_sock, &peer_addr, seq, g_self_id,
                              g_incarnation);
+            /* Per-member probe counts (0.66.0): the direct PING
+             * just went out, so the peer's sent count moves — the
+             * same probe an answered ACK later turns into an RTT
+             * sample and an answered count. The send is counted
+             * on the attempt: a failed send still went out as far
+             * as the prober knows, and the ACK that never comes
+             * back is exactly what the success rate measures. */
+            pthread_mutex_lock(&g_lock);
+            member_note_probe_sent(&g_table, peer_id);
+            pthread_mutex_unlock(&g_lock);
+        }
     }
 
     /* 1b. Re-JOIN seeds that are not ALIVE. A node that starts while its

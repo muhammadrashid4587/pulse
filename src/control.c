@@ -649,6 +649,32 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
                  (long long)member_rtt_max_ms(mem));
         if (send_all(fd, rttline) != 0) return;
     }
+    /* Per-member probe counts (0.66.0): how many direct probes
+     * this node sent to each peer and how many were answered —
+     * the probe success rate — as one "PROBES <id> <sent>
+     * <answered>" line per member that has been probed, after
+     * the RTT lines, under the same rule as the RTT line's
+     * membership but not the same threshold: a peer that was
+     * probed and never answered still has a line — sent climbing,
+     * answered 0 — because that is the interesting case, a peer
+     * being probed but never answering, while a peer never
+     * probed at all has none. Self never probes itself, so self
+     * has no line; a DEAD member keeps its counts until GC, the
+     * same as its RTT, so a text-protocol consumer can see how
+     * many probes went unanswered just before the peer died.
+     * The counts are the same values JSON reports as
+     * "probes_sent" / "probes_answered" and PROMETHEUS as
+     * pulse_member_probes_sent_total /
+     * pulse_member_probes_answered_total. */
+    for (int i = 0; i < t.count; i++) {
+        const member_t *mem = &t.members[i];
+        if (mem->probes_sent == 0) continue;
+        char probeline[128];
+        snprintf(probeline, sizeof probeline, "\nPROBES %s %lld %lld",
+                 mem->id, (long long)mem->probes_sent,
+                 (long long)mem->probes_answered);
+        if (send_all(fd, probeline) != 0) return;
+    }
     send_all(fd, "\nEND\n");
 }
 
@@ -779,14 +805,23 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
          * false when the warning is disabled, the peer was never
          * heard from, or it is SUSPECT or DEAD. Self is always
          * false: self's last_seen is startup time, so its age
-         * would be the node's uptime, not a contact age. */
+         * would be the node's uptime, not a contact age.
+         * "probes_sent" / "probes_answered" (0.66.0) are how many
+         * direct probes this node sent to the peer and how many
+         * were answered — the probe success rate — always numbers,
+         * never null: 0 sent for self (it never probes itself)
+         * and for a peer never probed, and a peer probed but
+         * never answered shows sent climbing with answered 0,
+         * which is the interesting case, not a missing value.
+         * Answered always equals the number of RTT samples. */
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
                      "\"rtt_mean_ms\":%s,\"rtt_max_ms\":%s,\"slow\":%s,\"quiet\":%s,"
                      "\"suspect_ms\":%s,"
                      "\"last_seen_ms\":%s,"
-                     "\"source\":\"%s\"}",
+                     "\"source\":\"%s\",\"probes_sent\":%lld,"
+                     "\"probes_answered\":%lld}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
                      rttbuf, rttmeanbuf, rttmaxbuf,
@@ -799,7 +834,9 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                          ? "true"
                          : "false",
                      suspectbuf, seenbuf,
-                     peer_source_str(hooks, mem->id));
+                     peer_source_str(hooks, mem->id),
+                     (long long)mem->probes_sent,
+                     (long long)mem->probes_answered);
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }
@@ -1445,6 +1482,43 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             "pulse_member_rtt_max_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)member_rtt_max_ms(&t.members[i])) == 0;
+    }
+    /* Per-member probe counts (0.66.0): how many direct probes
+     * this node sent to each peer and how many were answered —
+     * the probe success rate — as counters, one labelled sample
+     * per member that has been probed, under the same rule as
+     * the METRICS PROBES line: a peer probed but never answered
+     * still has a sample — sent climbing, answered 0 — because
+     * that is the interesting case, while a peer never probed
+     * (self, which never probes itself) has none: an absent
+     * series is how Prometheus says "never probed", the same as
+     * the RTT gauges say "never answered". Answered always
+     * equals the number of RTT samples, so the two counters
+     * divide to the success rate a scraper can alert on, and a
+     * dead member keeps its counters until GC, like its RTT
+     * gauges, so the count is the last-known one, not a live
+     * one, for a dead member. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_probes_sent_total Direct probes sent "
+        "to a member.\n"
+        "# TYPE pulse_member_probes_sent_total counter\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].probes_sent == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_probes_sent_total{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)t.members[i].probes_sent) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_probes_answered_total Direct probes "
+        "answered by a member.\n"
+        "# TYPE pulse_member_probes_answered_total counter\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].probes_sent == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_probes_answered_total{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)t.members[i].probes_answered) == 0;
     }
     /* Suspicion age per member (0.58.0): how long each SUSPECT
      * member has been suspected, in ms — the same value JSON

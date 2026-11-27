@@ -82,6 +82,26 @@ typedef struct {
      * has been answered, like rtt_ms. Local measurement only —
      * never gossiped, never persisted. */
     int64_t rtt_max_ms;
+    /* Per-member probe counts (0.66.0): how many direct probes
+     * this node sent to the peer (probes_sent) and how many of
+     * them were answered (probes_answered) — the probe success
+     * rate, answered / sent. Sent counts only direct PINGs from
+     * the probe cycle, the same probes the RTT samples come from;
+     * an indirect probe (a PING this node sends because another
+     * node asked it to with PING_REQ) is not counted — its ACK
+     * goes back to the requester and adds no RTT sample here
+     * either, so counting it as sent would drag the rate down
+     * for a probe this node never judged. Answered increments
+     * with the RTT sample, in member_note_rtt, so it always
+     * equals rtt_samples: a probe that was never answered adds
+     * to sent and to nothing else. A peer that never answers —
+     * a seed that never came up — shows sent climbing with
+     * answered stuck at 0, which is the point: the rate says
+     * "probed, never answered" instead of "never probed". Local
+     * measurement only — never gossiped, never persisted, and
+     * not a table-version change, like the RTT itself. */
+    int64_t probes_sent;
+    int64_t probes_answered;
     /* Slow-peer warning (0.22.0): whether a SLOW log line has already
      * been emitted for the current slow episode — a peer whose mean
      * RTT is above the configured threshold. Set when the mean first
@@ -228,6 +248,13 @@ int member_mark_alive(member_table_t *t, const char *id,
                       const struct sockaddr_storage *addr,
                       uint32_t incarnation, int64_t now);
 
+/* Record that a direct probe was sent to a peer (0.66.0): the
+ * probe cycle's PING — the same probe an answered ACK later
+ * turns into an RTT sample. Returns 1 when the member exists
+ * and the count was bumped, 0 otherwise. Does not bump the
+ * table version: probe counts are local measurement, not gossip
+ * content. */
+void member_note_probe_sent(member_table_t *t, const char *id);
 /* Record a probe round-trip time for a peer: the ms between sending a
  * PING (direct, or via PING_REQ) and receiving its ACK. Updates the
  * last RTT, the running mean and the worst RTT (0.64.0). slow_threshold_ms is the slow-peer

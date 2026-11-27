@@ -248,6 +248,45 @@ int main(void) {
     CHECK(member_rtt_max_ms(m3) == -1);
     CHECK(member_is_slow(m3, 1) == 0);
 
+    /* Per-member probe counts (0.66.0): sent and answered start at
+     * 0; sent moves on member_note_probe_sent (the probe cycle's
+     * PING), answered moves with each RTT sample in
+     * member_note_rtt, so answered always equals rtt_samples —
+     * a probe never answered adds to sent and to nothing else.
+     * An unknown id is ignored, and counting is not a
+     * gossip-visible change. m2 already has 9 answered samples
+     * from the RTT and slow-peer blocks above (3, 7, 10, 10, 0,
+     * 0, 0, 0, 100), so its answered count is 9 before this
+     * block sends any. */
+    CHECK(m2->probes_sent == 0);
+    CHECK(m2->probes_answered == 9);
+    CHECK(m2->probes_answered == m2->rtt_samples);
+    member_note_probe_sent(&t, "127.0.0.1:17102");
+    member_note_probe_sent(&t, "127.0.0.1:17102");
+    member_note_probe_sent(&t, "127.0.0.1:17102");
+    CHECK(m2->probes_sent == 3);
+    CHECK(m2->probes_answered == 9);
+    CHECK(t.version == v_before); /* counts are local, not gossip */
+    member_note_probe_sent(&t, "127.0.0.1:17999"); /* unknown: ignored */
+    CHECK(m2->probes_sent == 3);
+    /* One more answered probe moves answered (and rtt_samples)
+     * together; sent is untouched by the answer. */
+    CHECK(member_note_rtt(&t, "127.0.0.1:17102", 4, 0) == 1);
+    CHECK(m2->probes_sent == 3);
+    CHECK(m2->probes_answered == 10);
+    CHECK(m2->rtt_samples == 10);
+    /* A peer probed but never answered: sent climbs, answered
+     * stays 0 — the "probed, never answered" case, not "never
+     * probed". */
+    CHECK(m3->probes_sent == 0);
+    CHECK(m3->probes_answered == 0);
+    member_note_probe_sent(&t, "127.0.0.1:17103");
+    member_note_probe_sent(&t, "127.0.0.1:17103");
+    CHECK(m3->probes_sent == 2);
+    CHECK(m3->probes_answered == 0);
+    CHECK(m3->rtt_samples == 0);
+    CHECK(member_rtt_mean_ms(m3) == -1);
+
     /* suspicion age (0.58.0): -1 unless the member is SUSPECT, then
      * now minus when it went SUSPECT; the age resets when the member
      * revives, and a DEAD member reports -1 — its suspicion is over. */
