@@ -57,6 +57,8 @@ const char *pulse_event_type_name(pulse_event_type_t type) {
             return "REFUTED";
         case PULSE_EVENT_QUIET:
             return "QUIET";
+        case PULSE_EVENT_LOWRATE:
+            return "LOWRATE";
         default:
             return "UNKNOWN";
     }
@@ -65,8 +67,8 @@ const char *pulse_event_type_name(pulse_event_type_t type) {
 int pulse_event_type_parse(const char *name, pulse_event_type_t *out) {
     static const char *names[] = {"JOINED",   "SUSPECTED", "DEAD",
                                   "REVIVED",  "DROPPED",   "REFUTED",
-                                  "QUIET"};
-    for (int i = 0; i < 7; i++) {
+                                  "QUIET",    "LOWRATE"};
+    for (int i = 0; i < 8; i++) {
         if (strcmp(name, names[i]) == 0) {
             *out = (pulse_event_type_t)i;
             return 0;
@@ -90,6 +92,7 @@ int pulse_event_result_state(pulse_event_type_t type, member_state_t *out) {
         case PULSE_EVENT_REVIVED:
         case PULSE_EVENT_REFUTED:
         case PULSE_EVENT_QUIET:
+        case PULSE_EVENT_LOWRATE:
             *out = MEMBER_ALIVE;
             return 1;
         case PULSE_EVENT_SUSPECTED:
@@ -113,7 +116,7 @@ static void log_insert(pulse_event_log_t *log, uint64_t seq,
                        pulse_event_type_t type, const char *id,
                        uint32_t incarnation, int64_t unix_ts, double phi,
                        int64_t last_seen_ms, int64_t probes_sent,
-                       int64_t probes_answered) {
+                       int64_t probes_answered, double probe_rate) {
     pulse_event_t *slot = &log->events[log->head];
     slot->seq = seq;
     slot->type = type;
@@ -124,6 +127,7 @@ static void log_insert(pulse_event_log_t *log, uint64_t seq,
     slot->last_seen_ms = last_seen_ms;
     slot->probes_sent = probes_sent;
     slot->probes_answered = probes_answered;
+    slot->probe_rate = probe_rate;
     log->head = (log->head + 1) % log->cap;
     if (log->count < log->cap) log->count++;
 }
@@ -158,10 +162,22 @@ uint64_t pulse_event_record_probes(pulse_event_log_t *log,
                                    double phi, int64_t last_seen_ms,
                                    int64_t probes_sent,
                                    int64_t probes_answered) {
+    return pulse_event_record_rate(log, type, id, incarnation,
+                                   unix_ts, phi, last_seen_ms,
+                                   probes_sent, probes_answered, -1);
+}
+
+uint64_t pulse_event_record_rate(pulse_event_log_t *log,
+                                 pulse_event_type_t type, const char *id,
+                                 uint32_t incarnation, int64_t unix_ts,
+                                 double phi, int64_t last_seen_ms,
+                                 int64_t probes_sent,
+                                 int64_t probes_answered,
+                                 double probe_rate) {
     pthread_mutex_lock(&log->lock);
     uint64_t seq = log->next_seq++;
     log_insert(log, seq, type, id, incarnation, unix_ts, phi,
-               last_seen_ms, probes_sent, probes_answered);
+               last_seen_ms, probes_sent, probes_answered, probe_rate);
     /* A waiter may be waiting for exactly this event; a broadcast
      * wakes it, and it re-checks under the lock. */
     pthread_cond_broadcast(&log->cond);
@@ -182,9 +198,13 @@ uint64_t pulse_event_record_probes(pulse_event_log_t *log,
  * " probes_sent=<n> probes_answered=<n>" — how many direct probes
  * this node had sent the member and how many were answered when
  * the event was recorded — after the last_seen_ms field when it is
- * present; the loader accepts lines with any of the trailing
- * fields, or none of them. An event with none writes the plain
- * five fields, so existing consumers see byte-identical lines. */
+ * present, and a LOWRATE event (0.68.0) carries a trailing
+ * " probe_rate=<value>" — two decimals, the recent probe success
+ * rate when the threshold was crossed — after the probe counts
+ * when they are present; the loader accepts lines with any of
+ * the trailing fields, or none of them. An event with none writes
+ * the plain five fields, so existing consumers see byte-identical
+ * lines. */
 
 int pulse_event_log_save(pulse_event_log_t *log, const char *path) {
     /* Snapshot the held events in sequence order under the lock,
@@ -220,8 +240,8 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path) {
     for (int i = 0; i < count; i++) {
         /* The base five fields, then each trailing field that is
          * present: phi first, then the last-contact age, then the
-         * probe counts — the same order the WATCH stream writes
-         * them. */
+         * probe counts, then the probe rate — the same order the
+         * WATCH stream writes them. */
         fprintf(f, "%llu %s %s %u %lld",
                 (unsigned long long)held[i].seq,
                 pulse_event_type_name(held[i].type), held[i].id,
@@ -234,6 +254,8 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path) {
             fprintf(f, " probes_sent=%lld probes_answered=%lld",
                     (long long)held[i].probes_sent,
                     (long long)held[i].probes_answered);
+        if (held[i].probe_rate >= 0)
+            fprintf(f, " probe_rate=%.2f", held[i].probe_rate);
         fputc('\n', f);
     }
     free(held);
@@ -262,17 +284,20 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
          * (0.61.0), after the phi when both are present, and an
          * event whose member was probed carries a trailing
          * " probes_sent=<n> probes_answered=<n>" (0.67.0),
-         * after the last_seen_ms when it is present. The fields
-         * are parsed independently — any of them may be present
-         * without the others — so a line without one, or without
-         * all three (written before 0.60.0/0.61.0/0.67.0, or an
-         * event with nothing measured), loads with -1 for the
-         * missing ones. Ids carry no spaces, so the strstr cannot
-         * match inside an id. */
+         * after the last_seen_ms when it is present, and a
+         * LOWRATE event carries a trailing " probe_rate=<value>"
+         * (0.68.0), after the probe counts when they are present.
+         * The fields are parsed independently — any of them may
+         * be present without the others — so a line without one,
+         * or without all four (written before 0.60.0/0.61.0/
+         * 0.67.0/0.68.0, or an event with nothing measured),
+         * loads with -1 for the missing ones. Ids carry no
+         * spaces, so the strstr cannot match inside an id. */
         double phi = -1;
         int64_t last_seen_ms = -1;
         int64_t probes_sent = -1;
         int64_t probes_answered = -1;
+        double probe_rate = -1;
         const char *phi_at = strstr(line, " phi=");
         if (phi_at) sscanf(phi_at + 5, "%lf", &phi);
         const char *seen_at = strstr(line, " last_seen_ms=");
@@ -293,6 +318,8 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
             if (sscanf(ans_at + 17, "%lld", &v) == 1)
                 probes_answered = (int64_t)v;
         }
+        const char *rate_at = strstr(line, " probe_rate=");
+        if (rate_at) sscanf(rate_at + 12, "%lf", &probe_rate);
         if (seq == 0) continue;
         pulse_event_type_t type;
         if (pulse_event_type_parse(type_name, &type) != 0) continue;
@@ -302,7 +329,8 @@ int pulse_event_log_load(pulse_event_log_t *log, const char *path) {
          * case a hand-edited file ever repeats a sequence. */
         if (seq >= log->next_seq) {
             log_insert(log, seq, type, id, inc, (int64_t)ts, phi,
-                       last_seen_ms, probes_sent, probes_answered);
+                       last_seen_ms, probes_sent, probes_answered,
+                       probe_rate);
             log->next_seq = seq + 1;
             loaded++;
         }

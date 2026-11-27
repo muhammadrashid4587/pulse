@@ -10,6 +10,14 @@
 #define PULSE_ID_LEN 64
 #define PULSE_MAX_TOMBSTONES 16
 
+/* Recent-probe window (0.68.0): how many of the last direct
+ * probes to a peer make up its recent success rate, and how many
+ * of them must be in the window before the rate is judged at all.
+ * Five is enough to separate "one probe missed" from "answering
+ * one in five" without waiting for the whole window to fill. */
+#define PULSE_PROBE_WINDOW 20
+#define PULSE_PROBE_WINDOW_MIN 5
+
 /* Member metadata/annotations (0.20.0): a small set of key=value pairs
  * a node carries about itself — role=worker, zone=us-east-1,
  * version=1.2.3 — gossiped with its membership entry, shown in the
@@ -102,6 +110,40 @@ typedef struct {
      * not a table-version change, like the RTT itself. */
     int64_t probes_sent;
     int64_t probes_answered;
+    /* Recent-probe window (0.68.0): the outcomes of the last
+     * PULSE_PROBE_WINDOW direct probes to this peer — the recent
+     * probe success rate, answered / sent over the window,
+     * instead of the lifetime rate probes_sent/probes_answered
+     * gives. Each slot holds one probe's sequence number and
+     * whether it was answered; a slot starts unanswered when
+     * its probe goes out (member_note_probe_sent) and flips
+     * when its ACK arrives (member_note_probe_answered, matched
+     * by sequence number — probes to one peer overlap, so the
+     * most recent unanswered slot would be the wrong one). A
+     * probe whose ACK arrives after its slot slid out of the
+     * window flips nothing: a very late ACK is not recent
+     * evidence. The window is a ring: probe_window_head is the
+     * next slot to write, probe_window_count how many slots are
+     * filled (at most PULSE_PROBE_WINDOW). Local measurement
+     * only — never gossiped, never persisted, and not a
+     * table-version change, like the lifetime counts. */
+    uint32_t probe_window_seq[PULSE_PROBE_WINDOW];
+    int probe_window_answered[PULSE_PROBE_WINDOW];
+    int probe_window_head;
+    int probe_window_count;
+    /* Low-probe-rate warning (0.68.0): whether a LOWRATE log
+     * line and event have already been emitted for the current
+     * low-rate episode — an ALIVE peer whose windowed probe
+     * success rate fell below the configured threshold. Set
+     * when the rate first crosses below the threshold, cleared
+     * when the rate recovers to the threshold or above, so a
+     * persistently low peer warns once per episode instead of
+     * once per probe cycle, and a peer that recovers and drops
+     * again warns again. Unlike quiet_warned it is NOT cleared
+     * on direct contact: one answered probe barely moves a
+     * 20-probe window, so clearing on contact would re-fire
+     * almost at once for a peer answering one probe in ten. */
+    int low_rate_warned;
     /* Slow-peer warning (0.22.0): whether a SLOW log line has already
      * been emitted for the current slow episode — a peer whose mean
      * RTT is above the configured threshold. Set when the mean first
@@ -253,8 +295,44 @@ int member_mark_alive(member_table_t *t, const char *id,
  * turns into an RTT sample. Returns 1 when the member exists
  * and the count was bumped, 0 otherwise. Does not bump the
  * table version: probe counts are local measurement, not gossip
- * content. */
-void member_note_probe_sent(member_table_t *t, const char *id);
+ * content. The probe's sequence number (0.68.0) is recorded in
+ * the recent-probe window as an unanswered slot, so the ACK can
+ * flip exactly this probe's outcome when it arrives. */
+void member_note_probe_sent(member_table_t *t, const char *id,
+                            uint32_t seq);
+/* Record that a direct probe was answered (0.68.0): the ACK for
+ * the probe with this sequence number arrived, so its slot in
+ * the recent-probe window flips to answered. A sequence with no
+ * slot — the probe never went out through this node, or its slot
+ * already slid out of the window — is ignored: a very late ACK
+ * is not recent evidence. Unknown ids are ignored too. */
+void member_note_probe_answered(member_table_t *t, const char *id,
+                                uint32_t seq);
+/* The recent probe success rate (0.68.0): answered / sent over
+ * the last PULSE_PROBE_WINDOW direct probes to this peer, or -1
+ * when no probe to the peer is in the window yet — an absent
+ * value, never a fabricated zero: a peer never probed has no
+ * rate to report. The window counts only direct probes, like
+ * probes_sent / probes_answered: an indirect probe's ACK goes
+ * to the requester and adds no sample here either. */
+double member_probe_rate(const member_t *m);
+/* 1 when the peer counts as low-probe-rate (0.68.0): the
+ * low-probe-rate warning is enabled (threshold > 0), the peer
+ * is ALIVE, at least PULSE_PROBE_WINDOW_MIN probes are in its
+ * window, and its recent success rate is below the threshold.
+ * The threshold is a strict less-than: a rate exactly at the
+ * threshold is not low. Self never probes itself, so self has
+ * no window and is never low; a peer never probed has no rate
+ * and is never low. SUSPECT and DEAD peers are not low either
+ * — a suspicion already says the peer is silent, so the warning
+ * is only for a peer still counted ALIVE. */
+int member_is_low_probe_rate(const member_t *m, double threshold_frac);
+/* How many members in the table currently count as low-probe-rate
+ * (see member_is_low_probe_rate), excluding self (self_id): self
+ * never probes itself, so it has no window to judge. */
+int member_count_low_probe_rate(const member_table_t *t,
+                                const char *self_id,
+                                double threshold_frac);
 /* Record a probe round-trip time for a peer: the ms between sending a
  * PING (direct, or via PING_REQ) and receiving its ACK. Updates the
  * last RTT, the running mean and the worst RTT (0.64.0). slow_threshold_ms is the slow-peer

@@ -486,10 +486,68 @@ int member_merge(member_table_t *t, const char *self_id, const char *id,
     return MERGE_NONE;
 }
 
-void member_note_probe_sent(member_table_t *t, const char *id) {
+void member_note_probe_sent(member_table_t *t, const char *id,
+                            uint32_t seq) {
     member_t *m = member_find(t, id);
     if (!m) return;
     m->probes_sent++;
+    /* Recent-probe window (0.68.0): the probe goes in as an
+     * unanswered slot at the ring head, evicting the oldest
+     * outcome when the window is full — the window always holds
+     * the last PULSE_PROBE_WINDOW direct probes, no older. */
+    int slot = m->probe_window_head;
+    m->probe_window_seq[slot] = seq;
+    m->probe_window_answered[slot] = 0;
+    m->probe_window_head = (slot + 1) % PULSE_PROBE_WINDOW;
+    if (m->probe_window_count < PULSE_PROBE_WINDOW)
+        m->probe_window_count++;
+}
+
+void member_note_probe_answered(member_table_t *t, const char *id,
+                                uint32_t seq) {
+    member_t *m = member_find(t, id);
+    if (!m) return;
+    for (int i = 0; i < m->probe_window_count; i++) {
+        if (m->probe_window_seq[i] == seq &&
+            !m->probe_window_answered[i]) {
+            m->probe_window_answered[i] = 1;
+            return;
+        }
+    }
+    /* No slot for this sequence: the probe never went out
+     * through this node, or its slot already slid out of the
+     * window — either way there is nothing to flip. */
+}
+
+double member_probe_rate(const member_t *m) {
+    if (!m || m->probe_window_count == 0) return -1;
+    int answered = 0;
+    for (int i = 0; i < m->probe_window_count; i++)
+        if (m->probe_window_answered[i]) answered++;
+    return (double)answered / (double)m->probe_window_count;
+}
+
+int member_is_low_probe_rate(const member_t *m, double threshold_frac) {
+    if (!m || threshold_frac <= 0) return 0;
+    if (m->state != MEMBER_ALIVE) return 0;
+    if (m->probe_window_count < PULSE_PROBE_WINDOW_MIN) return 0;
+    double rate = member_probe_rate(m);
+    return rate >= 0 && rate < threshold_frac;
+}
+
+int member_count_low_probe_rate(const member_table_t *t,
+                                const char *self_id,
+                                double threshold_frac) {
+    int n = 0;
+    for (int i = 0; i < t->count; i++) {
+        /* Self never probes itself (see member_is_low_probe_rate),
+         * so it is excluded here, not in the predicate: the
+         * predicate cannot tell self from a peer. */
+        if (self_id && strcmp(t->members[i].id, self_id) == 0) continue;
+        if (member_is_low_probe_rate(&t->members[i], threshold_frac))
+            n++;
+    }
+    return n;
 }
 
 int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,

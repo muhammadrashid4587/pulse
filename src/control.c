@@ -486,6 +486,15 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
     used = strlen(line);
     snprintf(line + used, sizeof line - used, " quiet_peers=%d",
              member_count_quiet(&t, hooks->self_id, hooks->quiet_threshold_ms, now));
+    /* Low-probe-rate warning (0.68.0): how many members currently
+     * count as low-probe-rate — ALIVE with a recent probe success
+     * rate below the configured threshold. Like quiet_peers, the
+     * count is derived from the table, not a metrics counter,
+     * since the rate is current state, not a transition. */
+    used = strlen(line);
+    snprintf(line + used, sizeof line - used, " low_probe_rate_peers=%d",
+             member_count_low_probe_rate(&t, hooks->self_id,
+                                        hooks->low_probe_rate_frac));
     /* Peer-file state (0.28.0): the roster this node seeds from and
      * what the last load of it did. A path with a space breaks the
      * space-separated format — JSON is the machine-readable form —
@@ -675,6 +684,28 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
                  (long long)mem->probes_answered);
         if (send_all(fd, probeline) != 0) return;
     }
+    /* Low-probe-rate warning (0.68.0): the recent probe success
+     * rate JSON reports as "probe_rate", as one "LOWRATE <id>
+     * <rate>" line per member that counts as low-probe-rate,
+     * after the PROBES lines, under the same rule as JSON's
+     * "low_probe_rate" — ALIVE, at least
+     * PULSE_PROBE_WINDOW_MIN direct probes in the window, and a
+     * rate below the configured threshold — two decimals like
+     * JSON and PROMETHEUS. A peer at or above the threshold, a
+     * peer never probed, and a SUSPECT or DEAD peer have no line:
+     * an absent line is how the text protocol says "answering
+     * enough of its probes". Self never probes itself, so self
+     * has no line either. */
+    for (int i = 0; i < t.count; i++) {
+        const member_t *mem = &t.members[i];
+        if (strcmp(mem->id, hooks->self_id) == 0) continue;
+        if (!member_is_low_probe_rate(mem, hooks->low_probe_rate_frac))
+            continue;
+        char lowline[128];
+        snprintf(lowline, sizeof lowline, "\nLOWRATE %s %.2f",
+                 mem->id, member_probe_rate(mem));
+        if (send_all(fd, lowline) != 0) return;
+    }
     send_all(fd, "\nEND\n");
 }
 
@@ -813,7 +844,27 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
          * and for a peer never probed, and a peer probed but
          * never answered shows sent climbing with answered 0,
          * which is the interesting case, not a missing value.
-         * Answered always equals the number of RTT samples. */
+         * Answered always equals the number of RTT samples.
+         * "low_probe_rate" (0.68.0) is true when the peer is
+         * ALIVE and its recent probe success rate is below
+         * --low-probe-rate-frac — the peer is still alive, it
+         * has just started answering too few of its probes —
+         * false when the warning is disabled, when fewer than
+         * PULSE_PROBE_WINDOW_MIN probes are in the window, or
+         * the peer is SUSPECT or DEAD. Self is always false: it
+         * never probes itself, so it has no window to judge.
+         * "probe_rate" (0.68.0) is the rate itself — answered /
+         * sent over the last PULSE_PROBE_WINDOW direct probes,
+         * two decimals — null until the first probe to the peer
+         * goes out, and always null for self: an absent value,
+         * never a fabricated zero. A DEAD member keeps its last
+         * window rate until GC, like its RTT and probe counts. */
+        char ratebuf[32];
+        double rate = member_probe_rate(mem);
+        if (rate < 0)
+            snprintf(ratebuf, sizeof ratebuf, "null");
+        else
+            snprintf(ratebuf, sizeof ratebuf, "%.2f", rate);
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
@@ -821,7 +872,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                      "\"suspect_ms\":%s,"
                      "\"last_seen_ms\":%s,"
                      "\"source\":\"%s\",\"probes_sent\":%lld,"
-                     "\"probes_answered\":%lld}",
+                     "\"probes_answered\":%lld,\"low_probe_rate\":%s,"
+                     "\"probe_rate\":%s}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
                      rttbuf, rttmeanbuf, rttmaxbuf,
@@ -836,7 +888,13 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                      suspectbuf, seenbuf,
                      peer_source_str(hooks, mem->id),
                      (long long)mem->probes_sent,
-                     (long long)mem->probes_answered);
+                     (long long)mem->probes_answered,
+                     (strcmp(mem->id, hooks->self_id) != 0 &&
+                      member_is_low_probe_rate(mem,
+                                               hooks->low_probe_rate_frac))
+                         ? "true"
+                         : "false",
+                     ratebuf);
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }
@@ -967,6 +1025,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"seed_last_rejoin_ms\":%s,\"seed_rejoin_backoff_ms\":%s,"
         "\"adaptive_fast_cycles\":%lld,"
         "\"suspect_refuted\":%lld,\"slow_peers\":%d,\"quiet_peers\":%d,"
+        "\"low_probe_rate_peers\":%d,"
         "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
         "\"max\":%lld,\"samples\":%lld},\"refute_latency_ms\":{\"mean\":%s,"
@@ -983,6 +1042,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (long long)m.suspect_refuted,
         member_count_slow(&t, hooks->slow_rtt_threshold_ms),
         member_count_quiet(&t, hooks->self_id, hooks->quiet_threshold_ms, now),
+        member_count_low_probe_rate(&t, hooks->self_id,
+                                    hooks->low_probe_rate_frac),
         dmean, (long long)m.detect_max_ms,
         (long long)m.detect_samples, dhist, smean,
         (long long)m.suspect_dead_max_ms,
@@ -1095,6 +1156,14 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         "# TYPE pulse_quiet_peers gauge\n"
         "pulse_quiet_peers %d\n",
         member_count_quiet(&t, hooks->self_id, hooks->quiet_threshold_ms, now)) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_low_probe_rate_peers ALIVE members whose "
+        "recent probe success rate is below "
+        "--low-probe-rate-frac.\n"
+        "# TYPE pulse_low_probe_rate_peers gauge\n"
+        "pulse_low_probe_rate_peers %d\n",
+        member_count_low_probe_rate(&t, hooks->self_id,
+                                    hooks->low_probe_rate_frac)) == 0;
     ok &= prom_add(buf, sizeof buf, &used,
         "# HELP pulse_uptime_seconds Seconds since this node "
         "started.\n"
@@ -1519,6 +1588,34 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             "pulse_member_probes_answered_total{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].probes_answered) == 0;
+    }
+    /* Recent probe success rate per member (0.68.0): the answered
+     * / sent ratio over the last PULSE_PROBE_WINDOW direct probes
+     * JSON reports as "probe_rate", as a gauge a scraper can alert
+     * on — one line per member with at least one direct probe in
+     * its window, two decimals like JSON. The lifetime counters
+     * above divide to the lifetime rate; this gauge is the recent
+     * one, so a peer that answered everything for an hour and
+     * then started dropping half its probes shows it here within
+     * a window instead of diluted across its lifetime. A value of
+     * 0.00 is a real window with no answers, not a missing one,
+     * and a dead member keeps its last window rate until GC, like
+     * its RTT gauges — so the gauge is the last-known rate, not a
+     * live one, for a dead member. Self and a peer never probed
+     * have no line: an absent series is how Prometheus says
+     * "never probed", the same as the RTT gauges say "never
+     * answered". */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_probe_rate Recent direct-probe "
+        "success rate per member, answered / sent over the last "
+        "20 direct probes.\n"
+        "# TYPE pulse_member_probe_rate gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        double rate = member_probe_rate(&t.members[i]);
+        if (rate < 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_probe_rate{member=\"%s\"} %.2f\n",
+            t.members[i].id, rate) == 0;
     }
     /* Suspicion age per member (0.58.0): how long each SUSPECT
      * member has been suspected, in ms — the same value JSON
@@ -2415,7 +2512,14 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
              * fired, and a DEAD event shows a sent count that
              * kept climbing while the answered count stayed
              * frozen — after the last_seen_ms field when it is
-             * present. */
+             * present. Probe rate (0.68.0): a LOWRATE event
+             * carries the recent probe success rate when the
+             * threshold was crossed, as a trailing
+             * " probe_rate=<value>" — two decimals, the same
+             * value JSON reports as "probe_rate", frozen at the
+             * event so a replay still shows how low the rate was
+             * — after the probe counts when they are present; no
+             * other event carries one. */
             size_t used = (size_t)snprintf(
                 line, sizeof line, "EVENT %llu %s %s %u %lld",
                 (unsigned long long)ev.seq,
@@ -2437,6 +2541,11 @@ static void handle_watch(int fd, const control_hooks_t *hooks,
                          " probes_sent=%lld probes_answered=%lld",
                          (long long)ev.probes_sent,
                          (long long)ev.probes_answered);
+                used = strlen(line);
+            }
+            if (ev.probe_rate >= 0) {
+                snprintf(line + used, sizeof line - used,
+                         " probe_rate=%.2f", ev.probe_rate);
                 used = strlen(line);
             }
             if (used < sizeof line - 1) {

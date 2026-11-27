@@ -257,17 +257,21 @@ int main(void) {
      * gossip-visible change. m2 already has 9 answered samples
      * from the RTT and slow-peer blocks above (3, 7, 10, 10, 0,
      * 0, 0, 0, 100), so its answered count is 9 before this
-     * block sends any. */
+     * block sends any. The sequence numbers are the probe
+     * cycle's: each sent probe records its seq in the
+     * recent-probe window (0.68.0), so the ACK can flip exactly
+     * that probe's outcome — the window side effect is checked
+     * in the low-probe-rate block below, on a fresh table. */
     CHECK(m2->probes_sent == 0);
     CHECK(m2->probes_answered == 9);
     CHECK(m2->probes_answered == m2->rtt_samples);
-    member_note_probe_sent(&t, "127.0.0.1:17102");
-    member_note_probe_sent(&t, "127.0.0.1:17102");
-    member_note_probe_sent(&t, "127.0.0.1:17102");
+    member_note_probe_sent(&t, "127.0.0.1:17102", 101);
+    member_note_probe_sent(&t, "127.0.0.1:17102", 102);
+    member_note_probe_sent(&t, "127.0.0.1:17102", 103);
     CHECK(m2->probes_sent == 3);
     CHECK(m2->probes_answered == 9);
     CHECK(t.version == v_before); /* counts are local, not gossip */
-    member_note_probe_sent(&t, "127.0.0.1:17999"); /* unknown: ignored */
+    member_note_probe_sent(&t, "127.0.0.1:17999", 104); /* unknown: ignored */
     CHECK(m2->probes_sent == 3);
     /* One more answered probe moves answered (and rtt_samples)
      * together; sent is untouched by the answer. */
@@ -280,8 +284,8 @@ int main(void) {
      * probed". */
     CHECK(m3->probes_sent == 0);
     CHECK(m3->probes_answered == 0);
-    member_note_probe_sent(&t, "127.0.0.1:17103");
-    member_note_probe_sent(&t, "127.0.0.1:17103");
+    member_note_probe_sent(&t, "127.0.0.1:17103", 201);
+    member_note_probe_sent(&t, "127.0.0.1:17103", 202);
     CHECK(m3->probes_sent == 2);
     CHECK(m3->probes_answered == 0);
     CHECK(m3->rtt_samples == 0);
@@ -353,6 +357,91 @@ int main(void) {
     CHECK(member_mark_alive(&t5, "127.0.0.1:17105", &a4, 1, now + 2600) == 1);
     CHECK(m5->quiet_warned == 0);
     CHECK(member_is_quiet(m5, 499, now + 2600) == 0); /* just heard from */
+
+    /* Low-probe-rate warning (0.68.0): a peer is low when it is
+     * ALIVE, at least PULSE_PROBE_WINDOW_MIN direct probes are in
+     * its window, and its recent success rate — answered / sent
+     * over the last PULSE_PROBE_WINDOW probes — is strictly below
+     * the threshold (a rate exactly at the threshold is not low),
+     * 0 disables the warning, and a peer never probed has no rate
+     * and is never low. The window is matched by sequence number:
+     * an ACK flips exactly its own probe's slot, a stale ACK for
+     * a slot that already slid out flips nothing, and the oldest
+     * outcome leaves the window once it holds 20. */
+    member_table_t t6;
+    member_table_init(&t6);
+    member_t *m6 = member_add(&t6, "127.0.0.1:17106", &a4, 1);
+    CHECK(member_probe_rate(m6) == -1); /* never probed: no rate */
+    CHECK(member_is_low_probe_rate(m6, 0.5) == 0);
+    CHECK(member_count_low_probe_rate(&t6, "127.0.0.1:17101", 0.5) == 0);
+    /* Four probes, all answered: a rate of 1, but only four in
+     * the window — below the minimum, so not judged yet. */
+    for (uint32_t s = 1; s <= 4; s++) {
+        member_note_probe_sent(&t6, "127.0.0.1:17106", s);
+        member_note_probe_answered(&t6, "127.0.0.1:17106", s);
+    }
+    CHECK(m6->probe_window_count == 4);
+    CHECK(member_probe_rate(m6) == 1.0);
+    CHECK(member_is_low_probe_rate(m6, 0.5) == 0); /* too few to judge */
+    /* A fifth probe, unanswered: 4/5 = 0.8 — judged now, and not
+     * low at a 0.5 threshold. */
+    member_note_probe_sent(&t6, "127.0.0.1:17106", 5);
+    CHECK(member_probe_rate(m6) == 0.8);
+    CHECK(member_is_low_probe_rate(m6, 0.5) == 0);
+    CHECK(member_is_low_probe_rate(m6, 0.8) == 0); /* rate == threshold */
+    CHECK(member_is_low_probe_rate(m6, 0.81) == 1);
+    CHECK(member_is_low_probe_rate(m6, 0) == 0); /* disabled */
+    /* Five more probes, none answered: 4/10 = 0.4 — low at 0.5. */
+    for (uint32_t s = 6; s <= 10; s++)
+        member_note_probe_sent(&t6, "127.0.0.1:17106", s);
+    CHECK(member_probe_rate(m6) == 0.4);
+    CHECK(member_is_low_probe_rate(m6, 0.5) == 1);
+    CHECK(member_count_low_probe_rate(&t6, "127.0.0.1:17101", 0.5) == 1);
+    /* Self is never counted as low (0.68.0): self never probes
+     * itself, so it has no window to judge — a count that
+     * included self would need a window self never fills. */
+    CHECK(member_count_low_probe_rate(&t6, "127.0.0.1:17106", 0.5) == 0);
+    /* An ACK for one of the unanswered probes flips exactly that
+     * slot: 5/10 = 0.5 — back at the threshold, so not low. */
+    member_note_probe_answered(&t6, "127.0.0.1:17106", 8);
+    CHECK(member_probe_rate(m6) == 0.5);
+    CHECK(member_is_low_probe_rate(m6, 0.5) == 0);
+    /* Ten more unanswered probes fill the window to 20: the five
+     * answered probes are still in it, so the rate is 5/20. Four
+     * more unanswered probes slide the oldest outcomes out — the
+     * four answered probes (seqs 1-4) leave one at a time, so the
+     * rate falls to 1/20 (only seq 8 still answered). */
+    for (uint32_t s = 11; s <= 20; s++)
+        member_note_probe_sent(&t6, "127.0.0.1:17106", s);
+    CHECK(m6->probe_window_count == 20);
+    CHECK(member_probe_rate(m6) == 0.25);
+    CHECK(member_is_low_probe_rate(m6, 0.5) == 1);
+    for (uint32_t s = 21; s <= 24; s++)
+        member_note_probe_sent(&t6, "127.0.0.1:17106", s);
+    CHECK(m6->probe_window_count == 20);
+    CHECK(member_probe_rate(m6) == 0.05);
+    /* A stale ACK for a probe whose slot already slid out (seq 1)
+     * flips nothing: the rate stays 0.05, and the answer is not
+     * counted twice. */
+    member_note_probe_answered(&t6, "127.0.0.1:17106", 1);
+    CHECK(member_probe_rate(m6) == 0.05);
+    /* An answered probe for an unknown id, and a duplicate answer
+     * for a slot already flipped, are both ignored. */
+    member_note_probe_answered(&t6, "127.0.0.1:17999", 8);
+    CHECK(member_probe_rate(m6) == 0.05);
+    member_note_probe_answered(&t6, "127.0.0.1:17106", 8);
+    CHECK(member_probe_rate(m6) == 0.05);
+    /* SUSPECT and DEAD peers are not low, whatever their rate:
+     * the suspicion already says they are silent. */
+    CHECK(member_mark_suspect(&t6, "127.0.0.1:17106", now) == 1);
+    CHECK(member_is_low_probe_rate(m6, 0.5) == 0);
+    CHECK(member_count_low_probe_rate(&t6, "127.0.0.1:17101", 0.5) == 0);
+    /* ...but the rate itself is still measurable: a DEAD member
+     * keeps its last window rate until GC, like its RTT. */
+    CHECK(member_mark_dead(&t6, "127.0.0.1:17106", now) == 1);
+    CHECK(member_probe_rate(m6) == 0.05);
+    CHECK(member_probe_rate(NULL) == -1);
+    CHECK(member_is_low_probe_rate(NULL, 0.5) == 0);
 
     /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
     CHECK(member_gossip_fanout(0) == 1);

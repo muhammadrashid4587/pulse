@@ -53,6 +53,10 @@ typedef enum {
     PULSE_EVENT_QUIET,         /* an ALIVE peer's last-contact age
                                   crossed the quiet-peer threshold
                                   (0.62.0) */
+    PULSE_EVENT_LOWRATE,       /* an ALIVE peer's recent probe
+                                  success rate fell below the
+                                  low-probe-rate threshold
+                                  (0.68.0) */
 } pulse_event_type_t;
 
 typedef struct {
@@ -106,6 +110,22 @@ typedef struct {
      * persisted log carries the same trailing fields. */
     int64_t probes_sent;
     int64_t probes_answered;
+    /* Recent probe success rate at record time (0.68.0): the
+     * answered / sent ratio over the last PULSE_PROBE_WINDOW
+     * direct probes to the member when the event was recorded —
+     * the same value JSON reports as "probe_rate", frozen at the
+     * event instead of recomputed at replay time, so a replayed
+     * LOWRATE event still shows how low the rate was when the
+     * threshold was crossed. Carried only on a LOWRATE event:
+     * every other event has no rate to report. -1 when the
+     * member was never probed, for self (it never probes
+     * itself), or when the member had already left the table
+     * when the event was recorded: an absent value, never a
+     * fabricated zero. A WATCH consumer reads it as a trailing
+     * " probe_rate=<value>" on the EVENT line, after the probe
+     * counts when they are present, and the persisted log
+     * carries the same trailing field. */
+    double probe_rate;
 } pulse_event_t;
 
 typedef struct {
@@ -128,8 +148,9 @@ void pulse_event_log_free(pulse_event_log_t *log);
 /* The ring capacity this log was initialised with. */
 int pulse_event_log_cap(pulse_event_log_t *log);
 
-/* "JOINED", "SUSPECTED", "DEAD", "REVIVED", "DROPPED", "REFUTED":
- * the word that rides in the EVENT line for a type. */
+/* "JOINED", "SUSPECTED", "DEAD", "REVIVED", "DROPPED", "REFUTED",
+ * "QUIET", "LOWRATE": the word that rides in the EVENT line for a
+ * type. */
 const char *pulse_event_type_name(pulse_event_type_t type);
 
 /* The reverse: the type for a wire word ("JOINED" -> JOINED), or -1
@@ -141,8 +162,9 @@ int pulse_event_type_parse(const char *name, pulse_event_type_t *out);
  * REVIVED and REFUTED land on ALIVE, SUSPECTED on SUSPECT, DEAD on
  * DEAD. DROPPED leaves no state — the member left the table — so
  * it returns 0 and never matches a state filter. QUIET (0.62.0)
- * lands on ALIVE: the peer is still alive, it has just gone
- * quiet. Used by the WATCH state filter (0.39.0), which subscribes
+ * and LOWRATE (0.68.0) land on ALIVE: the peer is still alive,
+ * it has just gone quiet, or just started answering too few of
+ * its probes. Used by the WATCH state filter (0.39.0), which subscribes
  * to events by the state they land on. */
 int pulse_event_result_state(pulse_event_type_t type, member_state_t *out);
 
@@ -188,13 +210,33 @@ uint64_t pulse_event_record_full(pulse_event_log_t *log,
  * frozen at the event: a replayed SUSPECTED event still shows how
  * many probes went unanswered before the suspicion fired, and a
  * DEAD event shows a sent count that kept climbing while the
- * answered count stayed frozen. */
+ * answered count stayed frozen. The probe rate is -1: no rate
+ * was measured for this event. */
 uint64_t pulse_event_record_probes(pulse_event_log_t *log,
                                    pulse_event_type_t type, const char *id,
                                    uint32_t incarnation, int64_t unix_ts,
                                    double phi, int64_t last_seen_ms,
                                    int64_t probes_sent,
                                    int64_t probes_answered);
+
+/* The same, carrying the phi at a threshold crossing, the
+ * last-contact age at record time, the probe counts at record
+ * time, and the recent probe success rate at record time
+ * (0.68.0): the caller passes the answered / sent ratio over the
+ * last PULSE_PROBE_WINDOW direct probes to the member when the
+ * event was recorded, or -1 when the member was never probed,
+ * is self, or had already left the table — or when the event is
+ * not a LOWRATE event, which is the only event a rate is
+ * measured for. The rate is frozen at the event: a replayed
+ * LOWRATE event still shows how low the rate was when the
+ * threshold was crossed. */
+uint64_t pulse_event_record_rate(pulse_event_log_t *log,
+                                 pulse_event_type_t type, const char *id,
+                                 uint32_t incarnation, int64_t unix_ts,
+                                 double phi, int64_t last_seen_ms,
+                                 int64_t probes_sent,
+                                 int64_t probes_answered,
+                                 double probe_rate);
 
 /* Write every event the ring currently holds, in sequence order,
  * to path (one "<seq> <TYPE> <id> <incarnation> <unix_ts>" line per
@@ -204,7 +246,9 @@ uint64_t pulse_event_record_probes(pulse_event_log_t *log,
  * both are present — and a trailing
  * " probes_sent=<n> probes_answered=<n>" on an event whose member
  * was probed — 0.67.0, after the last_seen_ms field when it is
- * present), atomically via a tmp file + rename, so a crash
+ * present — and a trailing " probe_rate=<value>" on a LOWRATE
+ * event — 0.68.0, after the probe counts when they are present),
+ * atomically via a tmp file + rename, so a crash
  * mid-write never leaves a half-written file. Returns the number
  * of events written, or -1 if the file could not be written. Used
  * to compact the persisted log on startup and on clean shutdown
@@ -226,8 +270,11 @@ int pulse_event_log_save(pulse_event_log_t *log, const char *path);
  * with last_seen_ms -1; a line without the trailing
  * " probes_sent=<n> probes_answered=<n>" — written before 0.67.0,
  * or any event whose member was never probed — loads with both
- * counts -1; the trailing fields are parsed independently, so any
- * of them may be present without the others. */
+ * counts -1; a line without the trailing " probe_rate=<value>"
+ * — written before 0.68.0, or any event that is not a LOWRATE
+ * event — loads with probe_rate -1; the trailing fields are
+ * parsed independently, so any of them may be present without
+ * the others. */
 int pulse_event_log_load(pulse_event_log_t *log, const char *path);
 
 /* The latest sequence number recorded so far (0 when the log is

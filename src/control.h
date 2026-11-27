@@ -67,7 +67,7 @@
  *           adaptive_fast_cycles=N
  *           detect_latency_ms mean=X max=Y samples=N
  *           suspect_to_dead_ms mean=X max=Y samples=N
- *           slow_peers=N
+ *           slow_peers=N quiet_peers=N low_probe_rate_peers=N
  *           peer_file=<path|'-'> last_reload=<unix|'-'>
  *           last_mtime=<unix|'-'> pf_peers=<N|'-'> pf_added=<N|'-'>
  *           pf_dropped=<N|'-'> pf_kept=<N|'-'> pf_bad=<N|'-'>
@@ -86,6 +86,14 @@
  *       slow_peers is how many members currently count as slow: mean
  *       probe RTT above --slow-peer-rtt-ms (0 when the warning is
  *       disabled; see "Slow-peer warning").
+ *       quiet_peers (0.62.0) is how many members currently count as
+ *       quiet: ALIVE with a last-contact age above --quiet-peer-ms
+ *       (0 when the warning is disabled; see "Quiet-peer early
+ *       warning"). low_probe_rate_peers (0.68.0) is how many
+ *       members currently count as low-probe-rate: ALIVE with a
+ *       recent probe success rate below --low-probe-rate-frac (0
+ *       when the warning is disabled; see "Low-probe-rate
+ *       alert").
  *       The peer-file fields (0.28.0) are the --peer-file state: the
  *       path, the wall-clock time of the last successful load or
  *       reload, the file's mtime at that load, and the counts from
@@ -213,6 +221,17 @@
  *       never answered still has a line (sent climbing,
  *       answered 0); self and a peer never probed have none;
  *       a DEAD member keeps its counts until GC.
+ *       Low-probe-rate warning (0.68.0): after the PROBES lines,
+ *       one "LOWRATE <id> <rate>" line per member that counts
+ *       as low-probe-rate — ALIVE, at least
+ *       PULSE_PROBE_WINDOW_MIN direct probes in its window, and
+ *       a recent success rate below --low-probe-rate-frac — the
+ *       rate itself, two decimals, the same value JSON reports
+ *       as "probe_rate" and PROMETHEUS as
+ *       pulse_member_probe_rate. A peer whose rate is at or
+ *       above the threshold, a peer never probed, and a SUSPECT
+ *       or DEAD peer have no line; self never probes itself and
+ *       has none either.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -240,9 +259,21 @@
  *       never null: 0 sent for self and for a peer never probed,
  *       sent climbing with answered 0 for a peer probed but
  *       never answered; answered always equals the number of
- *       RTT samples), and the
+ *       RTT samples), "low_probe_rate" (0.68.0: true when the
+ *       peer is ALIVE and its recent probe success rate is
+ *       below --low-probe-rate-frac, false otherwise — self and
+ *       a peer never probed are always false) and "probe_rate"
+ *       (0.68.0: the recent success rate itself, answered /
+ *       sent over the last PULSE_PROBE_WINDOW direct probes,
+ *       two decimals — null until the first probe to the peer
+ *       goes out, and always null for self — so a consumer can
+ *       see how far below the threshold a flagged peer sits,
+ *       and a DEAD member keeps its last window rate until GC),
+ *       and the
  *       metrics object carries "slow_peers" (how many members are
- *       slow). The metrics object also carries "seed_rejoins_by_seed"
+ *       slow) and "quiet_peers" (0.62.0: how many members are
+ *       quiet) and "low_probe_rate_peers" (0.68.0: how many
+ *       members count as low-probe-rate).
  *       (0.54.0): the per-seed breakdown of "seed_rejoins" as an
  *       object — {"127.0.0.1:17101":2} — or {} when no seed has
  *       been re-joined yet, so a JSON consumer can see which seed
@@ -350,7 +381,17 @@
  *       LASTSEEN line — so a scraper can alert on a peer going
  *       quiet before the suspicion fires; self and a peer never
  *       heard from have no line, and a DEAD member keeps its
- *       gauge until GC, the value growing. The phi
+ *       gauge until GC, the value growing. How many members
+ *       count as low-probe-rate rides as a "pulse_low_probe_rate_peers"
+ *       gauge (0.68.0) — ALIVE members whose recent probe success
+ *       rate is below --low-probe-rate-frac, 0 when the warning
+ *       is disabled — and the rate itself rides as a
+ *       "pulse_member_probe_rate" gauge, one line per member with
+ *       at least one direct probe in its window, two decimals
+ *       like JSON's "probe_rate" — so a scraper can alert on a
+ *       peer answering one probe in ten instead of only on the
+ *       count; self and a peer never probed have no line, and a
+ *       DEAD member keeps its last window rate until GC. The phi
  *       failure-detector value per member rides as a
  *       "pulse_member_phi" gauge (0.42.0), one line per member
  *       that has a phi — phi mode on, not self, heartbeat history
@@ -371,16 +412,20 @@
  *       SNAPSHOT line per member — id, incarnation, state,
  *       last-seen-ms (or '-') and source, the PEERS shape — then
  *       END, then one EVENT line per membership event as it happens:
- *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET>
+ *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET|LOWRATE>
  *       <id> <incarnation> <unix-seconds>. JOINED is a peer
  *       appearing in the table, SUSPECTED is ALIVE -> SUSPECT, DEAD
  *       is SUSPECT -> DEAD, REVIVED is a SUSPECT/DEAD peer coming
  *       back ALIVE, DROPPED is a peer leaving the table (GC after
  *       its retention, a LEAVE, or a peer-file reload drop),
  *       REFUTED is this node hearing itself SUSPECT/DEAD and bumping
- *       its incarnation, and QUIET (0.62.0) is an ALIVE peer whose
+ *       its incarnation, QUIET (0.62.0) is an ALIVE peer whose
  *       last-contact age crossed the quiet-peer threshold — the
- *       peer is still alive, it has just gone quiet. The connection
+ *       peer is still alive, it has just gone quiet — and LOWRATE
+ *       (0.68.0) is an ALIVE peer whose recent probe success rate
+ *       fell below the low-probe-rate threshold — the peer is
+ *       still alive, it has just started answering too few of its
+ *       probes. The connection
  *       stays open until the client closes it (or falls too far
  *       behind: the event log is a bounded ring, so a slow consumer
  *       gets "ERR gap: events lost, reconnect" and must re-read the
@@ -415,7 +460,13 @@
  *       a SUSPECTED fired — after the last_seen_ms field when it
  *       is present. Self, a member never probed, and a member
  *       already gone from the table when the event was recorded
- *       carry no probe fields, under the same rule. An event with
+ *       carry no probe fields, under the same rule. A LOWRATE
+ *       event carries a trailing " probe_rate=<value>" (0.68.0)
+ *       — the recent probe success rate when the threshold was
+ *       crossed, two decimals, the same value JSON reports as
+ *       "probe_rate", frozen at the event so a replay still shows
+ *       how low the rate was — after the probe counts when they
+ *       are present; no other event carries one. An event with
  *       no trailing field writes the plain five fields, so
  *       existing consumers see byte-identical lines.
  *       A filter (0.30.0) narrows the stream server-side: an
@@ -620,6 +671,13 @@ typedef struct {
      * above this counts as quiet, and is reported as "quiet" per
      * member in JSON and as quiet_peers in METRICS and JSON. */
     int64_t quiet_threshold_ms;
+    /* Low-probe-rate threshold as a fraction (0 = warning
+     * disabled, 0.68.0): an ALIVE peer whose recent probe success
+     * rate — answered / sent over the last PULSE_PROBE_WINDOW
+     * direct probes — is below this counts as low-probe-rate,
+     * and is reported as "low_probe_rate" per member in JSON
+     * and as low_probe_rate_peers in METRICS and JSON. */
+    double low_probe_rate_frac;
     /* Membership events for the WATCH command (0.29.0): the next
      * event after last_seq, or a wait for one. Returns 1 with *out
      * filled, 0 when no new event arrived within timeout_ms, -1

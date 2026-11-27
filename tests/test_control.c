@@ -188,7 +188,22 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
          * check for this peer. Worst RTT (0.64.0): 7 ms, the
          * largest of the four samples (3, 7, 0, 0 sum to 10).
          * Probe counts (0.66.0): 5 sent, 4 answered — one probe
-         * went unanswered, so the success rate is 4/5, not 1. */
+         * went unanswered, so the success rate is 4/5, not 1.
+         * Recent-probe window (0.68.0): the same 5 sent / 4
+         * answered in the window — rate 0.80, healthy at a 0.5
+         * threshold — recorded through the real send/answer
+         * functions first, then the lifetime counts are set to
+         * the canned values (the window and the lifetime counts
+         * are independent measurements of the same probes). */
+        member_note_probe_sent(out, "127.0.0.1:17901", 301);
+        member_note_probe_sent(out, "127.0.0.1:17901", 302);
+        member_note_probe_sent(out, "127.0.0.1:17901", 303);
+        member_note_probe_sent(out, "127.0.0.1:17901", 304);
+        member_note_probe_sent(out, "127.0.0.1:17901", 305);
+        member_note_probe_answered(out, "127.0.0.1:17901", 301);
+        member_note_probe_answered(out, "127.0.0.1:17901", 302);
+        member_note_probe_answered(out, "127.0.0.1:17901", 303);
+        member_note_probe_answered(out, "127.0.0.1:17901", 304);
         m->rtt_ms = 3;
         m->rtt_sum_ms = 10;
         m->rtt_samples = 4;
@@ -218,7 +233,18 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
          * a real value, not a missing one — and the worst is 0
          * too (0.64.0), a real worst case, not a missing one.
          * Probe counts (0.66.0): 2 sent, 1 answered — half its
-         * probes went unanswered, so the rate is 1/2. */
+         * probes went unanswered, so the rate is 1/2.
+         * Recent-probe window (0.68.0): 5 sent / 1 answered in
+         * the window — rate 0.20, low at a 0.5 threshold — so
+         * this is the canned low-rate peer; the window is its
+         * own recent history, independent of the 2 / 1 lifetime
+         * counts above. */
+        member_note_probe_sent(out, "127.0.0.1:17903", 401);
+        member_note_probe_sent(out, "127.0.0.1:17903", 402);
+        member_note_probe_sent(out, "127.0.0.1:17903", 403);
+        member_note_probe_sent(out, "127.0.0.1:17903", 404);
+        member_note_probe_sent(out, "127.0.0.1:17903", 405);
+        member_note_probe_answered(out, "127.0.0.1:17903", 401);
         m->rtt_ms = 0;
         m->rtt_sum_ms = 0;
         m->rtt_samples = 1;
@@ -231,7 +257,21 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         m->state = MEMBER_DEAD;
         m->last_seen_ms = 0; /* never heard from */
         /* No probe ever answered: rtt_ms stays -1, so PROMETHEUS
-         * has no rtt gauge for this peer (0.40.0). */
+         * has no rtt gauge for this peer (0.40.0). Recent-probe
+         * window (0.68.0): 5 sent / 0 answered — rate 0.00, a
+         * real measurement of a peer that never answered — but
+         * the peer is DEAD, so it never counts as low-probe-rate:
+         * the flag is only for a peer still ALIVE. The lifetime
+         * counts stay 0 / 0 here, so the canned PROBES and
+         * probe-counter expectations below still hold: the window
+         * is its own recent history, independent of them. */
+        member_note_probe_sent(out, "127.0.0.1:17902", 501);
+        member_note_probe_sent(out, "127.0.0.1:17902", 502);
+        member_note_probe_sent(out, "127.0.0.1:17902", 503);
+        member_note_probe_sent(out, "127.0.0.1:17902", 504);
+        member_note_probe_sent(out, "127.0.0.1:17902", 505);
+        m->probes_sent = 0;
+        m->probes_answered = 0;
     }
 }
 
@@ -640,7 +680,7 @@ static void test_event_log(void) {
      * continues the sequence instead of restarting at 1. */
     const char *ev_path = "/tmp/pulse-event-log-test.txt";
     pulse_event_log_t saved;
-    pulse_event_log_init(&saved, 5);
+    pulse_event_log_init(&saved, 6);
     pulse_event_record(&saved, PULSE_EVENT_JOINED, "127.0.0.1:17904", 1,
                        1700000300);
     pulse_event_record(&saved, PULSE_EVENT_SUSPECTED, "127.0.0.1:17904",
@@ -669,13 +709,22 @@ static void test_event_log(void) {
     pulse_event_record_full(&saved, PULSE_EVENT_QUIET,
                             "127.0.0.1:17904", 1, 1700000304, -1,
                             305);
-    CHECK(pulse_event_log_save(&saved, ev_path) == 5);
+    /* Low-probe-rate warning (0.68.0): a LOWRATE event recorded
+     * with a rate — 0.20 over its recent window, 24 probes sent
+     * and 6 answered, 640 ms since the node last heard from the
+     * member when the threshold was crossed — round-trips with
+     * all of it, so a restart restores how low the rate was, not
+     * just that it was low. */
+    pulse_event_record_rate(&saved, PULSE_EVENT_LOWRATE,
+                            "127.0.0.1:17904", 1, 1700000305, -1,
+                            640, 24, 6, 0.20);
+    CHECK(pulse_event_log_save(&saved, ev_path) == 6);
     pulse_event_log_free(&saved);
 
     pulse_event_log_t restored;
-    pulse_event_log_init(&restored, 5);
-    CHECK(pulse_event_log_load(&restored, ev_path) == 5);
-    CHECK(pulse_event_latest_seq(&restored) == 5);
+    pulse_event_log_init(&restored, 6);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 6);
+    CHECK(pulse_event_latest_seq(&restored) == 6);
     CHECK(pulse_event_oldest_seq(&restored) == 1);
     CHECK(pulse_event_wait(&restored, 0, &ev, 20) == 1);
     CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
@@ -708,10 +757,23 @@ static void test_event_log(void) {
      * whose member was never probed, carries no counts. */
     CHECK(ev.probes_sent == -1);
     CHECK(ev.probes_answered == -1);
+    /* The LOWRATE event recorded after it comes back with its
+     * rate and counts (0.68.0): the warning survives the restart
+     * with the number that fired it, not just the fact that it
+     * fired. */
+    CHECK(pulse_event_wait(&restored, 5, &ev, 20) == 1);
+    CHECK(ev.seq == 6 && ev.type == PULSE_EVENT_LOWRATE &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000305);
+    CHECK(ev.last_seen_ms == 640);
+    CHECK(ev.probes_sent == 24);
+    CHECK(ev.probes_answered == 6);
+    CHECK(ev.probe_rate == 0.20);
+    CHECK(ev.phi == -1);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
-                       2, 1700000305);
-    CHECK(pulse_event_latest_seq(&restored) == 6);
+                       2, 1700000306);
+    CHECK(pulse_event_latest_seq(&restored) == 7);
     pulse_event_log_free(&restored);
 
     /* The QUIET word (0.62.0) parses back to the QUIET type, so a
@@ -725,6 +787,18 @@ static void test_event_log(void) {
     member_state_t qstate;
     CHECK(pulse_event_result_state(PULSE_EVENT_QUIET, &qstate) == 1);
     CHECK(qstate == MEMBER_ALIVE);
+
+    /* The LOWRATE word (0.68.0) parses back to the LOWRATE type,
+     * so a WATCH filter can subscribe to it by name, and it lands
+     * on ALIVE for the state filter — the peer is still alive,
+     * it has just started answering too few of its probes. */
+    pulse_event_type_t ltype;
+    CHECK(pulse_event_type_parse("LOWRATE", &ltype) == 0);
+    CHECK(ltype == PULSE_EVENT_LOWRATE);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_LOWRATE), "LOWRATE") == 0);
+    member_state_t lstate;
+    CHECK(pulse_event_result_state(PULSE_EVENT_LOWRATE, &lstate) == 1);
+    CHECK(lstate == MEMBER_ALIVE);
 
     /* A missing file loads zero events, and a malformed line is
      * skipped while the good lines around it still load. */
@@ -749,23 +823,24 @@ static void test_event_log(void) {
         fprintf(mf,
                 "10 QUIET 127.0.0.1:17905 2 1700000403 "
                 "last_seen_ms=305\n");
+        /* A LOWRATE event line (0.68.0) loads as LOWRATE with
+         * its rate and probe counts and no phi. */
+        fprintf(mf,
+                "11 LOWRATE 127.0.0.1:17905 2 1700000404 "
+                "last_seen_ms=640 probes_sent=24 probes_answered=6 "
+                "probe_rate=0.20\n");
         fclose(mf);
     }
-    CHECK(pulse_event_log_load(&restored, ev_path) == 4);
-    CHECK(pulse_event_latest_seq(&restored) == 10);
-    CHECK(pulse_event_oldest_seq(&restored) == 7);
-    CHECK(pulse_event_wait(&restored, 6, &ev, 20) == 1);
-    CHECK(ev.seq == 7 && ev.type == PULSE_EVENT_REVIVED &&
-          strcmp(ev.id, "127.0.0.1:17905") == 0);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 5);
+    CHECK(pulse_event_latest_seq(&restored) == 11);
+    CHECK(pulse_event_oldest_seq(&restored) == 8);
+    CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
+    CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_DEAD);
     /* A line without the trailing phi field — the pre-0.60.0
      * format — loads with phi -1, so an old log still loads. */
     CHECK(ev.phi == -1);
     /* ...and without a last_seen_ms field either — the
      * pre-0.61.0 format — it loads with last_seen_ms -1. */
-    CHECK(ev.last_seen_ms == -1);
-    CHECK(pulse_event_wait(&restored, 7, &ev, 20) == 1);
-    CHECK(ev.seq == 8 && ev.type == PULSE_EVENT_DEAD);
-    CHECK(ev.phi == -1);
     CHECK(ev.last_seen_ms == -1);
     CHECK(pulse_event_wait(&restored, 8, &ev, 20) == 1);
     CHECK(ev.seq == 9 && ev.type == PULSE_EVENT_JOINED &&
@@ -775,6 +850,13 @@ static void test_event_log(void) {
     CHECK(ev.seq == 10 && ev.type == PULSE_EVENT_QUIET &&
           ev.last_seen_ms == 305);
     CHECK(ev.phi == -1);
+    CHECK(pulse_event_wait(&restored, 10, &ev, 20) == 1);
+    CHECK(ev.seq == 11 && ev.type == PULSE_EVENT_LOWRATE &&
+          ev.last_seen_ms == 640);
+    CHECK(ev.phi == -1);
+    CHECK(ev.probes_sent == 24);
+    CHECK(ev.probes_answered == 6);
+    CHECK(ev.probe_rate == 0.20);
     pulse_event_log_free(&restored);
     unlink(ev_path);
 }
@@ -794,6 +876,7 @@ int main(void) {
     g_hooks.peer_source = peer_source_hook;
     g_hooks.slow_rtt_threshold_ms = 0;
     g_hooks.quiet_threshold_ms = 0;
+    g_hooks.low_probe_rate_frac = 0;
     g_hooks.self_id = "127.0.0.1:17999";
     g_hooks.start_ms = pulse_now_ms();
 
@@ -936,6 +1019,7 @@ int main(void) {
             "samples=0 refute_latency_ms mean=- max=- samples=0 "
             "probe_rtt_ms mean=- max=- samples=0 "
             "hist=[0,0,0,0,0] slow_peers=0 quiet_peers=0 "
+            "low_probe_rate_peers=0 "
             "peer_file=/tmp/peers "
             "last_reload=1700000000 last_mtime=1699999000 "
             "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
@@ -1126,6 +1210,95 @@ int main(void) {
         CHECK(peer != NULL && counts != NULL &&
               (next_id == NULL || counts < next_id));
     }
+    /* Low-probe-rate warning (0.68.0): with the threshold hook
+     * at 0.5, the canned 17903 (window 5 sent / 1 answered,
+     * rate 0.20) counts as low, the canned 17901 (5 / 4, rate
+     * 0.80) does not, self (no window) never does, and the DEAD
+     * 17902 (window 5 / 0, rate 0.00) does not either — the flag
+     * is only for a peer still ALIVE, while the rate itself is
+     * still reported for a dead member, like its RTT. */
+    g_hooks.low_probe_rate_frac = 0.5;
+    CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "low_probe_rate_peers=1") != NULL);
+    {
+        const char *low = strstr(reply, "LOWRATE 127.0.0.1:17903 0.20\n");
+        CHECK(low != NULL);
+        CHECK(strstr(reply, "LOWRATE 127.0.0.1:17901") == NULL);
+        CHECK(strstr(reply, "LOWRATE 127.0.0.1:17902") == NULL);
+        CHECK(strstr(reply, "LOWRATE 127.0.0.1:17999") == NULL);
+        /* The LOWRATE line rides after the PROBES lines, like
+         * every other per-member line rides after the one it
+         * follows. */
+        const char *probes = strstr(reply, "PROBES 127.0.0.1:17903 2 1");
+        CHECK(probes != NULL && low != NULL && low > probes);
+    }
+    CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "\"low_probe_rate_peers\":1") != NULL);
+    {
+        const char *peer = strstr(reply, "\"id\":\"127.0.0.1:17903\"");
+        const char *flag =
+            peer ? strstr(peer, "\"low_probe_rate\":true") : NULL;
+        const char *rate =
+            peer ? strstr(peer, "\"probe_rate\":0.20") : NULL;
+        const char *next_id =
+            peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && flag != NULL &&
+              (next_id == NULL || flag < next_id));
+        CHECK(peer != NULL && rate != NULL &&
+              (next_id == NULL || rate < next_id));
+        peer = strstr(reply, "\"id\":\"127.0.0.1:17901\"");
+        flag = peer ? strstr(peer, "\"low_probe_rate\":false") : NULL;
+        rate = peer ? strstr(peer, "\"probe_rate\":0.80") : NULL;
+        next_id = peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && flag != NULL &&
+              (next_id == NULL || flag < next_id));
+        CHECK(peer != NULL && rate != NULL &&
+              (next_id == NULL || rate < next_id));
+        /* Self is the first member, so anchor at the members
+         * array like the probe-counts check above does. */
+        peer = strstr(reply, "\"members\":[{\"id\":\"127.0.0.1:17999\"");
+        flag = peer ? strstr(peer, "\"low_probe_rate\":false") : NULL;
+        rate = peer ? strstr(peer, "\"probe_rate\":null") : NULL;
+        next_id = peer ? strstr(peer, "\"id\":\"127.0.0.1:17901\"") : NULL;
+        CHECK(peer != NULL && flag != NULL &&
+              (next_id == NULL || flag < next_id));
+        CHECK(peer != NULL && rate != NULL &&
+              (next_id == NULL || rate < next_id));
+        /* The DEAD peer keeps its rate but never the flag. */
+        peer = strstr(reply, "\"id\":\"127.0.0.1:17902\"");
+        flag = peer ? strstr(peer, "\"low_probe_rate\":false") : NULL;
+        rate = peer ? strstr(peer, "\"probe_rate\":0.00") : NULL;
+        next_id = peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && flag != NULL &&
+              (next_id == NULL || flag < next_id));
+        CHECK(peer != NULL && rate != NULL &&
+              (next_id == NULL || rate < next_id));
+    }
+    CHECK(send_cmd(18991, "PROMETHEUS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "pulse_low_probe_rate_peers 1\n") != NULL);
+    CHECK(strstr(reply,
+                 "# TYPE pulse_member_probe_rate gauge\n") != NULL);
+    CHECK(strstr(reply,
+                 "pulse_member_probe_rate{member=\"127.0.0.1:17903\"} "
+                 "0.20\n") != NULL);
+    CHECK(strstr(reply,
+                 "pulse_member_probe_rate{member=\"127.0.0.1:17901\"} "
+                 "0.80\n") != NULL);
+    CHECK(strstr(reply,
+                 "pulse_member_probe_rate{member=\"127.0.0.1:17902\"} "
+                 "0.00\n") != NULL);
+    CHECK(strstr(reply,
+                 "pulse_member_probe_rate{member=\"127.0.0.1:17999\"}") ==
+          NULL);
+    /* With the warning disabled again the count is 0 and no
+     * LOWRATE line rides anywhere. */
+    g_hooks.low_probe_rate_frac = 0;
+    CHECK(send_cmd(18991, "METRICS\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "low_probe_rate_peers=0") != NULL);
+    CHECK(strstr(reply, "LOWRATE ") == NULL);
+    CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
+    CHECK(strstr(reply, "\"low_probe_rate_peers\":0") != NULL);
+    CHECK(strstr(reply, "\"low_probe_rate\":true") == NULL);
     /* The peer_file object sits at the top level, after metrics. */
     {
         const char *metrics = strstr(reply, "\"metrics\":{");

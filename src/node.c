@@ -96,6 +96,11 @@ typedef struct {
                                   when an ALIVE peer's last-contact age
                                   is above this many ms, 0 = disabled
                                   (see member.h) */
+    double low_probe_rate_frac; /* low-probe-rate warning threshold:
+                                  warn when an ALIVE peer's recent
+                                  probe success rate falls below this
+                                  fraction, 0 = disabled (see
+                                  member.h) */
     int event_log_cap;         /* WATCH event ring capacity: how many
                                   membership events the log holds for
                                   replay (0.36.0), 0 = default 128 */
@@ -397,6 +402,18 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
      * none: -1, never a fabricated zero. */
     int64_t probes_sent = -1;
     int64_t probes_answered = -1;
+    /* Recent probe success rate (0.68.0): the answered / sent
+     * ratio over the last PULSE_PROBE_WINDOW direct probes to
+     * the member when the event was recorded — the same value
+     * JSON reports as "probe_rate", frozen at the event instead
+     * of recomputed at replay time, so a replayed LOWRATE event
+     * still shows how low the rate was when the threshold was
+     * crossed. Carried only on a LOWRATE event: every other
+     * event has no rate to report. Self never probes itself
+     * and a member never probed, or already gone from the table
+     * when the event is recorded (a GC'd DROPPED, a LEAVE), has
+     * none: -1, never a fabricated zero. */
+    double probe_rate = -1;
     if (strcmp(id, g_self_id) != 0) {
         int64_t now = pulse_now_ms();
         pthread_mutex_lock(&g_lock);
@@ -407,13 +424,15 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
                 probes_sent = m->probes_sent;
                 probes_answered = m->probes_answered;
             }
+            if (type == PULSE_EVENT_LOWRATE)
+                probe_rate = member_probe_rate(m);
         }
         pthread_mutex_unlock(&g_lock);
     }
-    uint64_t seq = pulse_event_record_probes(&g_event_log, type, id,
-                                             incarnation, ts, phi,
-                                             last_seen_age, probes_sent,
-                                             probes_answered);
+    uint64_t seq = pulse_event_record_rate(&g_event_log, type, id,
+                                           incarnation, ts, phi,
+                                           last_seen_age, probes_sent,
+                                           probes_answered, probe_rate);
     if (g_events_path[0] == '\0') return;
     pthread_mutex_lock(&g_events_file_lock);
     FILE *f = fopen(g_events_path, "a");
@@ -426,10 +445,12 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
          * are present, and an event whose member was probed
          * (0.67.0) carries its probe counts as trailing
          * " probes_sent=<n> probes_answered=<n>", after the
-         * last_seen_ms when it is present — so all three values
-         * survive a restart and a replay exactly as the WATCH
-         * stream shows them; an event with none writes the plain
-         * five fields. */
+         * last_seen_ms when it is present, and a LOWRATE event
+         * (0.68.0) carries its recent probe success rate as a
+         * trailing " probe_rate=<value>", after the probe counts
+         * when they are present — so all four values survive a
+         * restart and a replay exactly as the WATCH stream shows
+         * them; an event with none writes the plain five fields. */
         fprintf(f, "%llu %s %s %u %lld",
                 (unsigned long long)seq,
                 pulse_event_type_name(type), id, incarnation,
@@ -442,6 +463,7 @@ static void record_event_phi(pulse_event_type_t type, const char *id,
             fprintf(f, " probes_sent=%lld probes_answered=%lld",
                     (long long)probes_sent,
                     (long long)probes_answered);
+        if (probe_rate >= 0) fprintf(f, " probe_rate=%.2f", probe_rate);
         fputc('\n', f);
         fclose(f);
     }
@@ -718,6 +740,17 @@ static void handle_message(const gmsg_t *msg) {
                 metrics_note_rtt(&g_metrics, rtt_ms);
                 int r = member_note_rtt(&g_table, msg->from_id, rtt_ms,
                                         g_cfg.slow_peer_rtt_ms);
+                /* Recent-probe window (0.68.0): the ACK matches
+                 * this probe's sequence number, so its slot in
+                 * the window flips to answered — the same probe
+                 * the RTT sample and the answered count above
+                 * came from, so the window rate and the lifetime
+                 * answered count move together. An ACK that
+                 * matched no pending probe never reaches here
+                 * (rtt_ms stays -1), so a stale or duplicate ACK
+                 * flips nothing. */
+                member_note_probe_answered(&g_table, msg->from_id,
+                                           msg->seq);
                 if (r == 2) {
                     member_t *slow = member_find(&g_table, msg->from_id);
                     if (slow) slow_mean_ms = member_rtt_mean_ms(slow);
@@ -1205,9 +1238,12 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
              * sample and an answered count. The send is counted
              * on the attempt: a failed send still went out as far
              * as the prober knows, and the ACK that never comes
-             * back is exactly what the success rate measures. */
+             * back is exactly what the success rate measures. The
+             * probe's sequence number (0.68.0) goes into the
+             * recent-probe window as an unanswered slot, so the
+             * ACK can flip exactly this probe's outcome. */
             pthread_mutex_lock(&g_lock);
-            member_note_probe_sent(&g_table, peer_id);
+            member_note_probe_sent(&g_table, peer_id, seq);
             pthread_mutex_unlock(&g_lock);
         }
     }
@@ -1484,6 +1520,57 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
             n_quiet++;
         }
     }
+    /* 3a-b. Low-probe-rate warning (0.68.0): an ALIVE peer whose
+     * recent probe success rate fell below the configured
+     * fraction gets one LOWRATE log line and one LOWRATE event
+     * per episode. The check runs here, after the suspect-to-dead
+     * sweep, so a peer that just went DEAD this cycle is never
+     * warned as low-rate — the DEAD line already says it is
+     * gone. The warning is once per crossing: low_rate_warned
+     * is set here and cleared when the windowed rate recovers
+     * to the threshold or above, so a persistently low peer warns
+     * once instead of once per probe cycle, and a peer that
+     * recovers and drops again warns again. The re-arm is on
+     * recovery, not on direct contact the way quiet_warned is:
+     * one answered probe barely moves a 20-probe window, so
+     * clearing on contact would re-fire almost at once for a
+     * peer answering one probe in ten. A peer with too few
+     * probes in its window is never warned and never re-armed:
+     * its rate is not judged yet. The rate is captured for the
+     * log line; the event re-measures it at record time
+     * (record_event), the same value within a millisecond. */
+    char lowrate_ids[8][PULSE_ID_LEN];
+    uint32_t lowrate_inc[8];
+    double lowrate_rate[8];
+    int n_lowrate = 0;
+    if (g_cfg.low_probe_rate_frac > 0) {
+        for (int i = 0; i < g_table.count && n_lowrate < 8; i++) {
+            member_t *m = &g_table.members[i];
+            if (strcmp(m->id, g_self_id) == 0) continue;
+            if (m->state != MEMBER_ALIVE) continue;
+            if (member_is_low_probe_rate(m,
+                                         g_cfg.low_probe_rate_frac)) {
+                if (m->low_rate_warned) continue;
+                m->low_rate_warned = 1;
+                snprintf(lowrate_ids[n_lowrate], PULSE_ID_LEN, "%s",
+                         m->id);
+                lowrate_inc[n_lowrate] = m->incarnation;
+                lowrate_rate[n_lowrate] = member_probe_rate(m);
+                n_lowrate++;
+            } else if (m->low_rate_warned) {
+                /* Not low any more: re-arm only on a real
+                 * recovery — the windowed rate back at or above
+                 * the threshold. A peer whose window is still
+                 * too small to judge keeps its flag: it was
+                 * warned on a full window, and a window that
+                 * small cannot have recovered yet. */
+                double rate = member_probe_rate(m);
+                if (rate >= 0 &&
+                    rate >= g_cfg.low_probe_rate_frac)
+                    m->low_rate_warned = 0;
+            }
+        }
+    }
     /* 3b. Garbage-collect DEAD entries older than the retention period.
      * Tombstones live twice as long: a peer that learned the DEAD entry
      * later than we did still has up to one retention period to GC it
@@ -1656,6 +1743,21 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
                  (long long)quiet_age[i],
                  (long long)g_cfg.quiet_peer_ms);
         record_event(PULSE_EVENT_QUIET, quiet_ids[i], quiet_inc[i]);
+    }
+    /* Low-probe-rate warning (0.68.0): the LOWRATE line says how
+     * low the peer's recent probe success rate was when the
+     * threshold was crossed, and the LOWRATE event carries the
+     * same rate frozen as its probe_rate, so a WATCH replay shows
+     * it too. The peer is still ALIVE at this point — that is
+     * the point of the warning: the suspicion has not fired yet,
+     * and a peer answering one probe in ten is worth knowing
+     * about before it is suspected. */
+    for (int i = 0; i < n_lowrate; i++) {
+        log_line("LOWRATE %s rate=%.2f threshold=%.2f",
+                 lowrate_ids[i], lowrate_rate[i],
+                 g_cfg.low_probe_rate_frac);
+        record_event(PULSE_EVENT_LOWRATE, lowrate_ids[i],
+                     lowrate_inc[i]);
     }
     /* gc_ids holds at most 8 ids even when more entries were GC'd
      * in one cycle (member_gc returns the total removed), so the
@@ -1966,6 +2068,7 @@ static void usage(const char *prog) {
             "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
             "       [--slow-peer-rtt-ms N]\n"
             "       [--quiet-peer-ms N]\n"
+            "       [--low-probe-rate-frac N]\n"
             "       [--dead-retention SECONDS]\n"
             "       [--phi-accrual] [--phi-threshold N]\n"
             "       [--sync-interval-ms N]\n"
@@ -1993,6 +2096,7 @@ int main(int argc, char **argv) {
     g_cfg.sync_interval_ms = 10000; /* anti-entropy full-table exchange */
     g_cfg.slow_peer_rtt_ms = 0; /* slow-peer warning disabled */
     g_cfg.quiet_peer_ms = 0; /* quiet-peer warning disabled */
+    g_cfg.low_probe_rate_frac = 0; /* low-probe-rate warning disabled */
     g_cfg.event_log_cap = 0; /* default WATCH event ring (128 events) */
     g_cfg.gossip_digest_size = 0; /* default gossip digest (16 entries) */
     g_cfg.control_port = -1; /* disabled unless --control-port is given */
@@ -2076,6 +2180,27 @@ int main(int argc, char **argv) {
             g_cfg.quiet_peer_ms = atoi(argv[++i]);
             if (g_cfg.quiet_peer_ms < 0) {
                 fprintf(stderr, "--quiet-peer-ms must be 0 (disabled) or a positive number of milliseconds\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--low-probe-rate-frac") == 0 &&
+                   i + 1 < argc) {
+            /* Low-probe-rate warning (0.68.0): warn when an ALIVE
+             * peer's recent probe success rate — answered / sent
+             * over the last PULSE_PROBE_WINDOW direct probes —
+             * falls below this fraction, so a peer answering one
+             * probe in ten is visible while it is still ALIVE
+             * instead of only after it is suspected. 0 disables
+             * it, like --quiet-peer-ms: the right threshold
+             * depends on how lossy the network is allowed to be,
+             * so there is no safe universal default — it must
+             * sit below a healthy peer's normal rate (near 1 on
+             * a good link) and above 0, or it never fires. A
+             * value above 1 would flag every peer that ever
+             * missed a probe, so it is a clean startup error. */
+            g_cfg.low_probe_rate_frac = atof(argv[++i]);
+            if (g_cfg.low_probe_rate_frac < 0 ||
+                g_cfg.low_probe_rate_frac > 1) {
+                fprintf(stderr, "--low-probe-rate-frac must be 0 (disabled) or a fraction between 0 and 1\n");
                 return 2;
             }
         } else if (strcmp(argv[i], "--control-port") == 0 && i + 1 < argc) {
@@ -2479,13 +2604,19 @@ int main(int argc, char **argv) {
                  (long long)g_cfg.quiet_peer_ms);
     else
         quietbuf[0] = '\0';
+    char lowratebuf[32];
+    if (g_cfg.low_probe_rate_frac > 0)
+        snprintf(lowratebuf, sizeof lowratebuf, " low-rate=%.2f",
+                 g_cfg.low_probe_rate_frac);
+    else
+        lowratebuf[0] = '\0';
     if (g_cfg.phi_accrual) {
-        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s%s%s%s", g_self_id,
+        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s%s%s%s%s", g_self_id,
                  g_incarnation, g_cfg.port, g_cfg.phi_threshold, sec, v6,
-                 slowbuf, quietbuf);
+                 slowbuf, quietbuf, lowratebuf);
     } else {
-        log_line("START %s inc=%u port=%d%s%s%s%s", g_self_id, g_incarnation,
-                 g_cfg.port, sec, v6, slowbuf, quietbuf);
+        log_line("START %s inc=%u port=%d%s%s%s%s%s", g_self_id, g_incarnation,
+                 g_cfg.port, sec, v6, slowbuf, quietbuf, lowratebuf);
     }
     if (g_cfg.meta_count > 0) {
         char metabuf[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
@@ -2556,6 +2687,7 @@ int main(int argc, char **argv) {
         g_hooks.peer_source = peer_source_hook;
         g_hooks.slow_rtt_threshold_ms = g_cfg.slow_peer_rtt_ms;
         g_hooks.quiet_threshold_ms = g_cfg.quiet_peer_ms;
+        g_hooks.low_probe_rate_frac = g_cfg.low_probe_rate_frac;
         g_hooks.self_id = g_self_id;
         g_hooks.start_ms = g_start_ms;
         if (pthread_create(&control, NULL, control_thread, NULL) != 0) {
