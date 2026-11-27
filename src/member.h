@@ -83,6 +83,15 @@ typedef struct {
      * per probe, and a peer that recovers and slows again warns
      * again. */
     int rtt_slow_warned;
+    /* Quiet-peer warning (0.62.0): whether a QUIET log line and
+     * event have already been emitted for the current quiet
+     * episode — an ALIVE peer whose last-contact age crossed the
+     * configured threshold. Set when the age first crosses the
+     * threshold, cleared on the next direct contact (see
+     * member_mark_alive), so a persistently quiet peer warns once
+     * per episode instead of once per probe cycle, and a peer
+     * that answers again and goes quiet again warns again. */
+    int quiet_warned;
     /* Metadata the member carries about itself (role, zone, version,
      * ...): set at startup with --meta, changeable at runtime with
      * the control plane's META command, gossiped with the membership
@@ -236,6 +245,25 @@ int member_is_slow(const member_t *m, int64_t slow_threshold_ms);
 /* How many members in the table currently count as slow (see
  * member_is_slow). */
 int member_count_slow(const member_table_t *t, int64_t slow_threshold_ms);
+/* 1 when the peer counts as quiet (0.62.0): the quiet-peer warning
+ * is enabled (threshold > 0), the peer is ALIVE, and its
+ * last-contact age is above the threshold — this node has not heard
+ * from it directly for longer than the configured quiet window. A
+ * peer never heard from has no age (-1), so it is never quiet: a
+ * seed that never answered is a different problem, and a zero would
+ * claim nothing. SUSPECT and DEAD peers are not quiet either — a
+ * suspicion already says the peer is silent, so the warning is
+ * only for a peer still counted ALIVE. Self is excluded by the
+ * caller: self's last_seen is startup time, so its age would be
+ * the node's uptime, not a contact age (see member_last_seen_age_ms). */
+int member_is_quiet(const member_t *m, int64_t quiet_threshold_ms,
+                    int64_t now);
+/* How many members in the table currently count as quiet (see
+ * member_is_quiet), excluding self (self_id): self's last-contact
+ * age is the node's uptime, so counting it would report a quiet
+ * peer on every node that has been up longer than the threshold. */
+int member_count_quiet(const member_table_t *t, const char *self_id,
+                       int64_t quiet_threshold_ms, int64_t now);
 /* How long a member has been SUSPECT, in ms (0.58.0): now minus the
  * time its current state started. -1 when the member is not
  * SUSPECT — an ALIVE member has no suspicion to age, and a DEAD

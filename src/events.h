@@ -48,8 +48,11 @@ typedef enum {
     PULSE_EVENT_REVIVED,       /* a SUSPECT/DEAD peer came back ALIVE */
     PULSE_EVENT_DROPPED,       /* a peer left the table (GC, LEAVE,
                                   or a peer-file reload drop) */
-    PULSE_EVENT_REFUTED        /* this node heard itself SUSPECT/DEAD
+    PULSE_EVENT_REFUTED,       /* this node heard itself SUSPECT/DEAD
                                   and bumped its incarnation */
+    PULSE_EVENT_QUIET,         /* an ALIVE peer's last-contact age
+                                  crossed the quiet-peer threshold
+                                  (0.62.0) */
 } pulse_event_type_t;
 
 typedef struct {
@@ -119,9 +122,10 @@ int pulse_event_type_parse(const char *name, pulse_event_type_t *out);
 /* The member state an event leaves its member in (0.39.0): JOINED,
  * REVIVED and REFUTED land on ALIVE, SUSPECTED on SUSPECT, DEAD on
  * DEAD. DROPPED leaves no state — the member left the table — so
- * it returns 0 and never matches a state filter. Used by the WATCH
- * state filter (0.39.0), which subscribes to events by the state
- * they land on. */
+ * it returns 0 and never matches a state filter. QUIET (0.62.0)
+ * lands on ALIVE: the peer is still alive, it has just gone
+ * quiet. Used by the WATCH state filter (0.39.0), which subscribes
+ * to events by the state they land on. */
 int pulse_event_result_state(pulse_event_type_t type, member_state_t *out);
 
 /* Append one event (assigning it the next sequence number) and wake

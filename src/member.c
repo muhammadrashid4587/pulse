@@ -523,6 +523,28 @@ int member_count_slow(const member_table_t *t, int64_t slow_threshold_ms) {
     return n;
 }
 
+int member_is_quiet(const member_t *m, int64_t quiet_threshold_ms,
+                    int64_t now) {
+    if (!m || quiet_threshold_ms <= 0) return 0;
+    if (m->state != MEMBER_ALIVE) return 0;
+    int64_t age = member_last_seen_age_ms(m, now);
+    return age >= 0 && age > quiet_threshold_ms;
+}
+
+int member_count_quiet(const member_table_t *t, const char *self_id,
+                       int64_t quiet_threshold_ms, int64_t now) {
+    int n = 0;
+    for (int i = 0; i < t->count; i++) {
+        /* Self's last-contact age is the node's uptime (see
+         * member_is_quiet), so it is excluded here, not in the
+         * predicate: the predicate cannot tell self from a peer. */
+        if (self_id && strcmp(t->members[i].id, self_id) == 0) continue;
+        if (member_is_quiet(&t->members[i], quiet_threshold_ms, now))
+            n++;
+    }
+    return n;
+}
+
 int64_t member_suspect_age_ms(const member_t *m, int64_t now) {
     if (!m || m->state != MEMBER_SUSPECT) return -1;
     return now - m->state_since_ms;
@@ -576,6 +598,11 @@ int member_mark_alive(member_table_t *t, const char *id,
     if (inc_raised) m->incarnation = incarnation;
     if (addr) m->addr = *addr;
     m->last_seen_ms = now;
+    /* Direct contact re-arms the quiet-peer warning (0.62.0): the
+     * peer answered again, so a later silence is a fresh episode
+     * and warns again instead of staying silent because the first
+     * crossing already fired. */
+    m->quiet_warned = 0;
     if (changed) m->state_since_ms = now;
     /* A state change or a higher incarnation is gossip-visible, so it
      * bumps the table version; a routine heartbeat that only moves

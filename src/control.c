@@ -463,6 +463,7 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
     hooks->metrics(hooks->ctx, &m);
     member_table_t t;
     hooks->snapshot(hooks->ctx, &t);
+    int64_t now = pulse_now_ms(); /* quiet-peer ages are measured now */
     /* The metrics line plus slow_peers plus the peer-file fields
      * (path up to 512 chars) plus the per-seed rejoin breakdown
      * (16 seeds at most, each "host:port=N") can run long; 4 KB
@@ -477,6 +478,14 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
     size_t used = strlen(line);
     snprintf(line + used, sizeof line - used, " slow_peers=%d",
              member_count_slow(&t, hooks->slow_rtt_threshold_ms));
+    /* Quiet-peer warning (0.62.0): how many members currently
+     * count as quiet — ALIVE with a last-contact age above the
+     * configured threshold. Like slow_peers, the count is derived
+     * from the table, not a metrics counter, since quietness is
+     * current state, not a transition. */
+    used = strlen(line);
+    snprintf(line + used, sizeof line - used, " quiet_peers=%d",
+             member_count_quiet(&t, hooks->self_id, hooks->quiet_threshold_ms, now));
     /* Peer-file state (0.28.0): the roster this node seeds from and
      * what the last load of it did. A path with a space breaks the
      * space-separated format — JSON is the machine-readable form —
@@ -726,17 +735,30 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         /* "source" (0.28.0) is where this node got the peer from —
          * "seed", "peer-file", "discovered" or "self" — the same
          * provenance PEERS reports, so a peer-file peer is
-         * distinguishable from a discovered one in JSON too. */
+         * distinguishable from a discovered one in JSON too.
+         * "quiet" (0.62.0) is true when the peer is ALIVE and its
+         * last-contact age is above --quiet-peer-ms — the peer
+         * has gone quiet but the suspicion has not fired yet —
+         * false when the warning is disabled, the peer was never
+         * heard from, or it is SUSPECT or DEAD. Self is always
+         * false: self's last_seen is startup time, so its age
+         * would be the node's uptime, not a contact age. */
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
-                     "\"rtt_mean_ms\":%s,\"slow\":%s,\"suspect_ms\":%s,"
+                     "\"rtt_mean_ms\":%s,\"slow\":%s,\"quiet\":%s,"
+                     "\"suspect_ms\":%s,"
                      "\"last_seen_ms\":%s,"
                      "\"source\":\"%s\"}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
                      rttbuf, rttmeanbuf,
                      member_is_slow(mem, hooks->slow_rtt_threshold_ms)
+                         ? "true"
+                         : "false",
+                     (strcmp(mem->id, hooks->self_id) != 0 &&
+                      member_is_quiet(mem, hooks->quiet_threshold_ms,
+                                      now))
                          ? "true"
                          : "false",
                      suspectbuf, seenbuf,
@@ -870,7 +892,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         "\"joins\":%lld,\"seed_rejoins\":%lld,\"seed_rejoins_by_seed\":%s,"
         "\"seed_last_rejoin_ms\":%s,\"seed_rejoin_backoff_ms\":%s,"
         "\"adaptive_fast_cycles\":%lld,"
-        "\"suspect_refuted\":%lld,\"slow_peers\":%d,"
+        "\"suspect_refuted\":%lld,\"slow_peers\":%d,\"quiet_peers\":%d,"
         "\"detect_latency_ms\":{\"mean\":%s,\"max\":%lld,"
         "\"samples\":%lld,\"hist\":[%s]},\"suspect_to_dead_ms\":{\"mean\":%s,"
         "\"max\":%lld,\"samples\":%lld},\"refute_latency_ms\":{\"mean\":%s,"
@@ -886,6 +908,7 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
         (long long)m.adaptive_fast_cycles,
         (long long)m.suspect_refuted,
         member_count_slow(&t, hooks->slow_rtt_threshold_ms),
+        member_count_quiet(&t, hooks->self_id, hooks->quiet_threshold_ms, now),
         dmean, (long long)m.detect_max_ms,
         (long long)m.detect_samples, dhist, smean,
         (long long)m.suspect_dead_max_ms,
@@ -992,6 +1015,12 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         "# TYPE pulse_slow_peers gauge\n"
         "pulse_slow_peers %d\n",
         member_count_slow(&t, hooks->slow_rtt_threshold_ms)) == 0;
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_quiet_peers ALIVE members whose last-contact "
+        "age is above --quiet-peer-ms.\n"
+        "# TYPE pulse_quiet_peers gauge\n"
+        "pulse_quiet_peers %d\n",
+        member_count_quiet(&t, hooks->self_id, hooks->quiet_threshold_ms, now)) == 0;
     ok &= prom_add(buf, sizeof buf, &used,
         "# HELP pulse_uptime_seconds Seconds since this node "
         "started.\n"
@@ -1682,7 +1711,7 @@ typedef struct {
     int n_ids;
     /* State filter (0.39.0): "STATE <list>" narrows the stream to
      * events that leave their member in one of these states —
-     * JOINED/REVIVED/REFUTED land on ALIVE, SUSPECTED on SUSPECT,
+     * JOINED/REVIVED/REFUTED/QUIET land on ALIVE, SUSPECTED on SUSPECT,
      * DEAD on DEAD — and narrows the snapshot the same way, so a
      * watcher subscribed to DEAD snapshots only the dead members.
      * One bit per member_state_t; DROPPED lands on no state, so it
@@ -2020,7 +2049,7 @@ static int watch_wait_paused(int fd, watch_pause_entry_t *pause_entry,
  * an event leaves its member in: "WATCH STATE SUSPECT,DEAD"
  * carries only events that land on SUSPECT or DEAD, so a watcher
  * that only cares about trouble never sees joins or revivals.
- * JOINED, REVIVED and REFUTED land on ALIVE, SUSPECTED on SUSPECT,
+ * JOINED, REVIVED, REFUTED and QUIET land on ALIVE, SUSPECTED on SUSPECT,
  * DEAD on DEAD, and DROPPED lands on no state at all — the member
  * left the table — so it never matches a state filter; a watcher
  * that wants removals subscribes to the DROPPED type instead.

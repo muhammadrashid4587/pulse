@@ -92,6 +92,10 @@ typedef struct {
     int64_t slow_peer_rtt_ms;  /* slow-peer warning threshold: warn when
                                   a peer's mean probe RTT is above this
                                   many ms, 0 = disabled (see member.h) */
+    int64_t quiet_peer_ms;     /* quiet-peer warning threshold: warn
+                                  when an ALIVE peer's last-contact age
+                                  is above this many ms, 0 = disabled
+                                  (see member.h) */
     int event_log_cap;         /* WATCH event ring capacity: how many
                                   membership events the log holds for
                                   replay (0.36.0), 0 = default 128 */
@@ -1406,6 +1410,40 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
             }
         }
     }
+    /* 3a. Quiet-peer early warning (0.62.0): an ALIVE peer whose
+     * last-contact age crossed the configured threshold gets one
+     * QUIET log line and one QUIET event per episode. The check
+     * runs here, after the suspect-to-dead sweep, so a peer that
+     * just went DEAD this cycle is never warned as quiet — the
+     * DEAD line already says it is gone. The warning is once per
+     * crossing: quiet_warned is set here and cleared on the next
+     * direct contact (member_mark_alive), so a persistently quiet
+     * peer warns once instead of once per probe cycle, and a peer
+     * that answers again and goes quiet again warns again. A peer
+     * never heard from has no age (-1), so it never warns: a seed
+     * that never answered is not a peer going quiet. The age is
+     * captured for the log line; the event re-measures it at
+     * record time (record_event), the same value within a
+     * millisecond. */
+    char quiet_ids[8][PULSE_ID_LEN];
+    uint32_t quiet_inc[8];
+    int64_t quiet_age[8];
+    int n_quiet = 0;
+    if (g_cfg.quiet_peer_ms > 0) {
+        for (int i = 0; i < g_table.count && n_quiet < 8; i++) {
+            member_t *m = &g_table.members[i];
+            if (strcmp(m->id, g_self_id) == 0) continue;
+            if (m->state != MEMBER_ALIVE) continue;
+            if (m->quiet_warned) continue;
+            int64_t age = member_last_seen_age_ms(m, now);
+            if (age < 0 || age <= g_cfg.quiet_peer_ms) continue;
+            m->quiet_warned = 1;
+            snprintf(quiet_ids[n_quiet], PULSE_ID_LEN, "%s", m->id);
+            quiet_inc[n_quiet] = m->incarnation;
+            quiet_age[n_quiet] = age;
+            n_quiet++;
+        }
+    }
     /* 3b. Garbage-collect DEAD entries older than the retention period.
      * Tombstones live twice as long: a peer that learned the DEAD entry
      * later than we did still has up to one retention period to GC it
@@ -1566,6 +1604,18 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
     for (int i = 0; i < n_dead; i++) {
         log_line("DEAD %s", newly_dead[i]);
         record_event(PULSE_EVENT_DEAD, newly_dead[i], newly_dead_inc[i]);
+    }
+    /* Quiet-peer warning (0.62.0): the QUIET line says how quiet
+     * the peer was when the threshold was crossed, and the QUIET
+     * event carries the same age frozen as its last_seen_ms, so a
+     * WATCH replay shows it too. The peer is still ALIVE at this
+     * point — that is the point of the warning: the suspicion has
+     * not fired yet. */
+    for (int i = 0; i < n_quiet; i++) {
+        log_line("QUIET %s age=%lldms threshold=%lldms", quiet_ids[i],
+                 (long long)quiet_age[i],
+                 (long long)g_cfg.quiet_peer_ms);
+        record_event(PULSE_EVENT_QUIET, quiet_ids[i], quiet_inc[i]);
     }
     /* gc_ids holds at most 8 ids even when more entries were GC'd
      * in one cycle (member_gc returns the total removed), so the
@@ -1875,6 +1925,7 @@ static void usage(const char *prog) {
             "       [--probe-jitter-frac N]\n"
             "       [--ack-timeout-ms N] [--suspect-timeout-ms N]\n"
             "       [--slow-peer-rtt-ms N]\n"
+            "       [--quiet-peer-ms N]\n"
             "       [--dead-retention SECONDS]\n"
             "       [--phi-accrual] [--phi-threshold N]\n"
             "       [--sync-interval-ms N]\n"
@@ -1901,6 +1952,7 @@ int main(int argc, char **argv) {
     g_cfg.phi_threshold = PULSE_PHI_THRESHOLD_DEFAULT;
     g_cfg.sync_interval_ms = 10000; /* anti-entropy full-table exchange */
     g_cfg.slow_peer_rtt_ms = 0; /* slow-peer warning disabled */
+    g_cfg.quiet_peer_ms = 0; /* quiet-peer warning disabled */
     g_cfg.event_log_cap = 0; /* default WATCH event ring (128 events) */
     g_cfg.gossip_digest_size = 0; /* default gossip digest (16 entries) */
     g_cfg.control_port = -1; /* disabled unless --control-port is given */
@@ -1968,6 +2020,22 @@ int main(int argc, char **argv) {
             g_cfg.slow_peer_rtt_ms = atoi(argv[++i]);
             if (g_cfg.slow_peer_rtt_ms < 0) {
                 fprintf(stderr, "--slow-peer-rtt-ms must be 0 (disabled) or a positive number of milliseconds\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--quiet-peer-ms") == 0 && i + 1 < argc) {
+            /* Quiet-peer early warning (0.62.0): warn when an ALIVE
+             * peer's last-contact age crosses this many ms, so a
+             * peer going quiet is visible before the suspicion
+             * fires. 0 disables it, like --slow-peer-rtt-ms: the
+             * right threshold depends on the probe interval and
+             * the ack timeout, so there is no safe universal
+             * default — it must sit above a healthy peer's normal
+             * silence (a few probe intervals) and below the
+             * suspicion delay (two ack timeouts in fixed-timeout
+             * mode), or it never fires while the peer is ALIVE. */
+            g_cfg.quiet_peer_ms = atoi(argv[++i]);
+            if (g_cfg.quiet_peer_ms < 0) {
+                fprintf(stderr, "--quiet-peer-ms must be 0 (disabled) or a positive number of milliseconds\n");
                 return 2;
             }
         } else if (strcmp(argv[i], "--control-port") == 0 && i + 1 < argc) {
@@ -2365,13 +2433,19 @@ int main(int argc, char **argv) {
                  (long long)g_cfg.slow_peer_rtt_ms);
     else
         slowbuf[0] = '\0';
+    char quietbuf[32];
+    if (g_cfg.quiet_peer_ms > 0)
+        snprintf(quietbuf, sizeof quietbuf, " quiet=%lldms",
+                 (long long)g_cfg.quiet_peer_ms);
+    else
+        quietbuf[0] = '\0';
     if (g_cfg.phi_accrual) {
-        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s%s%s", g_self_id,
+        log_line("START %s inc=%u port=%d phi=on threshold=%.1f%s%s%s%s", g_self_id,
                  g_incarnation, g_cfg.port, g_cfg.phi_threshold, sec, v6,
-                 slowbuf);
+                 slowbuf, quietbuf);
     } else {
-        log_line("START %s inc=%u port=%d%s%s%s", g_self_id, g_incarnation,
-                 g_cfg.port, sec, v6, slowbuf);
+        log_line("START %s inc=%u port=%d%s%s%s%s", g_self_id, g_incarnation,
+                 g_cfg.port, sec, v6, slowbuf, quietbuf);
     }
     if (g_cfg.meta_count > 0) {
         char metabuf[PULSE_MAX_META * (PULSE_META_MAX_LEN + 1)];
@@ -2441,6 +2515,7 @@ int main(int argc, char **argv) {
         g_hooks.phi_enabled = phi_enabled_hook;
         g_hooks.peer_source = peer_source_hook;
         g_hooks.slow_rtt_threshold_ms = g_cfg.slow_peer_rtt_ms;
+        g_hooks.quiet_threshold_ms = g_cfg.quiet_peer_ms;
         g_hooks.self_id = g_self_id;
         g_hooks.start_ms = g_start_ms;
         if (pthread_create(&control, NULL, control_thread, NULL) != 0) {

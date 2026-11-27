@@ -263,6 +263,45 @@ int main(void) {
     CHECK(member_last_seen_age_ms(m4, now + 1700) == 1500); /* DEAD, still aging */
     CHECK(member_last_seen_age_ms(NULL, now) == -1);
 
+    /* quiet-peer warning (0.62.0): a peer is quiet when it is ALIVE
+     * and its last-contact age is above the threshold; the
+     * threshold is a strict greater-than (age == threshold is not
+     * quiet), 0 disables the warning, a peer never heard from has
+     * no age and is never quiet, and SUSPECT/DEAD peers are not
+     * quiet — the suspicion already says they are silent, so the
+     * warning is only for a peer still counted ALIVE. */
+    member_table_t t5;
+    member_table_init(&t5);
+    member_t *m5 = member_add(&t5, "127.0.0.1:17105", &a4, 1);
+    CHECK(member_is_quiet(m5, 300, now) == 0); /* never heard from */
+    CHECK(member_count_quiet(&t5, "127.0.0.1:17101", 300, now) == 0);
+    CHECK(member_mark_alive(&t5, "127.0.0.1:17105", &a4, 1, now) == 0);
+    CHECK(member_is_quiet(m5, 300, now) == 0); /* just heard from */
+    CHECK(member_is_quiet(m5, 0, now + 1000) == 0); /* disabled */
+    CHECK(member_is_quiet(m5, 500, now + 500) == 0); /* age == threshold */
+    CHECK(member_is_quiet(m5, 499, now + 500) == 1); /* age above it */
+    CHECK(member_count_quiet(&t5, "127.0.0.1:17101", 499, now + 500) == 1);
+    CHECK(member_count_quiet(&t5, "127.0.0.1:17101", 500, now + 500) == 0);
+    /* Self is never counted as quiet (0.62.0): self's last_seen is
+     * startup time, so its age is uptime, not a contact age — a
+     * count that included self would report a quiet peer on every
+     * node up longer than the threshold. */
+    CHECK(member_count_quiet(&t5, "127.0.0.1:17105", 499, now + 500) == 0);
+    /* SUSPECT and DEAD peers are not quiet, whatever their age. */
+    CHECK(member_mark_suspect(&t5, "127.0.0.1:17105", now + 500) == 1);
+    CHECK(member_is_quiet(m5, 499, now + 1500) == 0);
+    CHECK(member_mark_dead(&t5, "127.0.0.1:17105", now + 1500) == 1);
+    CHECK(member_is_quiet(m5, 499, now + 2500) == 0);
+    CHECK(member_is_quiet(NULL, 499, now) == 0);
+    /* Re-arm: direct contact clears quiet_warned (the per-episode
+     * flag the probe cycle sets on the first crossing), so a peer
+     * that answers again and goes quiet again warns again instead
+     * of staying silent because the first crossing already fired. */
+    m5->quiet_warned = 1;
+    CHECK(member_mark_alive(&t5, "127.0.0.1:17105", &a4, 1, now + 2600) == 1);
+    CHECK(m5->quiet_warned == 0);
+    CHECK(member_is_quiet(m5, 499, now + 2600) == 0); /* just heard from */
+
     /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
     CHECK(member_gossip_fanout(0) == 1);
     CHECK(member_gossip_fanout(1) == 1);

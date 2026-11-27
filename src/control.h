@@ -333,17 +333,20 @@
  *       SNAPSHOT line per member — id, incarnation, state,
  *       last-seen-ms (or '-') and source, the PEERS shape — then
  *       END, then one EVENT line per membership event as it happens:
- *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED>
+ *       EVENT <seq> <JOINED|SUSPECTED|DEAD|REVIVED|DROPPED|REFUTED|QUIET>
  *       <id> <incarnation> <unix-seconds>. JOINED is a peer
  *       appearing in the table, SUSPECTED is ALIVE -> SUSPECT, DEAD
  *       is SUSPECT -> DEAD, REVIVED is a SUSPECT/DEAD peer coming
  *       back ALIVE, DROPPED is a peer leaving the table (GC after
- *       its retention, a LEAVE, or a peer-file reload drop), and
+ *       its retention, a LEAVE, or a peer-file reload drop),
  *       REFUTED is this node hearing itself SUSPECT/DEAD and bumping
- *       its incarnation. The connection stays open until the client
- *       closes it (or falls too far behind: the event log is a
- *       bounded ring, so a slow consumer gets "ERR gap: events lost,
- *       reconnect" and must re-read the snapshot). Sequence numbers
+ *       its incarnation, and QUIET (0.62.0) is an ALIVE peer whose
+ *       last-contact age crossed the quiet-peer threshold — the
+ *       peer is still alive, it has just gone quiet. The connection
+ *       stays open until the client closes it (or falls too far
+ *       behind: the event log is a bounded ring, so a slow consumer
+ *       gets "ERR gap: events lost, reconnect" and must re-read the
+ *       snapshot). Sequence numbers
  *       are 1-based and monotonic for the node's life; a jump in
  *       them means events were missed. The snapshot is taken after
  *       the latest sequence is read, so no event is ever lost
@@ -385,7 +388,7 @@
  *       A state filter (0.39.0) narrows the stream by the member
  *       state an event leaves its member in: "WATCH STATE
  *       SUSPECT,DEAD" carries only events that land on SUSPECT
- *       or DEAD. JOINED, REVIVED and REFUTED land on ALIVE,
+ *       or DEAD. JOINED, REVIVED, REFUTED and QUIET land on ALIVE,
  *       SUSPECTED on SUSPECT, DEAD on DEAD, and DROPPED lands on
  *       no state — the member left the table — so it never
  *       matches a state filter; a watcher that wants removals
@@ -564,6 +567,11 @@ typedef struct {
      * reported as "slow" per member in JSON and as slow_peers in
      * METRICS and JSON. */
     int64_t slow_rtt_threshold_ms;
+    /* Quiet-peer last-contact threshold in ms (0 = warning
+     * disabled, 0.62.0): an ALIVE peer whose last-contact age is
+     * above this counts as quiet, and is reported as "quiet" per
+     * member in JSON and as quiet_peers in METRICS and JSON. */
+    int64_t quiet_threshold_ms;
     /* Membership events for the WATCH command (0.29.0): the next
      * event after last_seq, or a wait for one. Returns 1 with *out
      * filled, 0 when no new event arrived within timeout_ms, -1

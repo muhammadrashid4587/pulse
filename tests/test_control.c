@@ -606,7 +606,7 @@ static void test_event_log(void) {
      * continues the sequence instead of restarting at 1. */
     const char *ev_path = "/tmp/pulse-event-log-test.txt";
     pulse_event_log_t saved;
-    pulse_event_log_init(&saved, 4);
+    pulse_event_log_init(&saved, 5);
     pulse_event_record(&saved, PULSE_EVENT_JOINED, "127.0.0.1:17904", 1,
                        1700000300);
     pulse_event_record(&saved, PULSE_EVENT_SUSPECTED, "127.0.0.1:17904",
@@ -624,13 +624,21 @@ static void test_event_log(void) {
     pulse_event_record_full(&saved, PULSE_EVENT_SUSPECTED,
                             "127.0.0.1:17904", 1, 1700000303, 8.42,
                             512);
-    CHECK(pulse_event_log_save(&saved, ev_path) == 4);
+    /* Quiet-peer warning (0.62.0): a QUIET event recorded with a
+     * last-contact age — 305 ms since the node last heard from
+     * the member when the quiet threshold was crossed — and no
+     * phi round-trips with it, so a restart restores the
+     * warning, not just the suspicion. */
+    pulse_event_record_full(&saved, PULSE_EVENT_QUIET,
+                            "127.0.0.1:17904", 1, 1700000304, -1,
+                            305);
+    CHECK(pulse_event_log_save(&saved, ev_path) == 5);
     pulse_event_log_free(&saved);
 
     pulse_event_log_t restored;
-    pulse_event_log_init(&restored, 4);
-    CHECK(pulse_event_log_load(&restored, ev_path) == 4);
-    CHECK(pulse_event_latest_seq(&restored) == 4);
+    pulse_event_log_init(&restored, 5);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 5);
+    CHECK(pulse_event_latest_seq(&restored) == 5);
     CHECK(pulse_event_oldest_seq(&restored) == 1);
     CHECK(pulse_event_wait(&restored, 0, &ev, 20) == 1);
     CHECK(ev.seq == 1 && ev.type == PULSE_EVENT_JOINED &&
@@ -646,11 +654,31 @@ static void test_event_log(void) {
     /* The last-contact age recorded with the crossing comes back
      * with it (0.61.0). */
     CHECK(ev.last_seen_ms == 512);
+    /* The QUIET event recorded after it comes back with its age
+     * and no phi (0.62.0): the warning survives the restart too. */
+    CHECK(pulse_event_wait(&restored, 4, &ev, 20) == 1);
+    CHECK(ev.seq == 5 && ev.type == PULSE_EVENT_QUIET &&
+          strcmp(ev.id, "127.0.0.1:17904") == 0 &&
+          ev.incarnation == 1 && ev.unix_ts == 1700000304);
+    CHECK(ev.last_seen_ms == 305);
+    CHECK(ev.phi == -1);
     /* The next record continues the sequence, not restarts it. */
     pulse_event_record(&restored, PULSE_EVENT_REVIVED, "127.0.0.1:17904",
-                       2, 1700000304);
-    CHECK(pulse_event_latest_seq(&restored) == 5);
+                       2, 1700000305);
+    CHECK(pulse_event_latest_seq(&restored) == 6);
     pulse_event_log_free(&restored);
+
+    /* The QUIET word (0.62.0) parses back to the QUIET type, so a
+     * WATCH filter can subscribe to it by name, and it lands on
+     * ALIVE for the state filter — the peer is still alive, it
+     * has just gone quiet. */
+    pulse_event_type_t qtype;
+    CHECK(pulse_event_type_parse("QUIET", &qtype) == 0);
+    CHECK(qtype == PULSE_EVENT_QUIET);
+    CHECK(strcmp(pulse_event_type_name(PULSE_EVENT_QUIET), "QUIET") == 0);
+    member_state_t qstate;
+    CHECK(pulse_event_result_state(PULSE_EVENT_QUIET, &qstate) == 1);
+    CHECK(qstate == MEMBER_ALIVE);
 
     /* A missing file loads zero events, and a malformed line is
      * skipped while the good lines around it still load. */
@@ -670,10 +698,15 @@ static void test_event_log(void) {
         fprintf(mf,
                 "9 JOINED 127.0.0.1:17905 2 1700000402 "
                 "last_seen_ms=437\n");
+        /* A QUIET event line (0.62.0) loads as QUIET with its
+         * age and no phi. */
+        fprintf(mf,
+                "10 QUIET 127.0.0.1:17905 2 1700000403 "
+                "last_seen_ms=305\n");
         fclose(mf);
     }
-    CHECK(pulse_event_log_load(&restored, ev_path) == 3);
-    CHECK(pulse_event_latest_seq(&restored) == 9);
+    CHECK(pulse_event_log_load(&restored, ev_path) == 4);
+    CHECK(pulse_event_latest_seq(&restored) == 10);
     CHECK(pulse_event_oldest_seq(&restored) == 7);
     CHECK(pulse_event_wait(&restored, 6, &ev, 20) == 1);
     CHECK(ev.seq == 7 && ev.type == PULSE_EVENT_REVIVED &&
@@ -691,6 +724,10 @@ static void test_event_log(void) {
     CHECK(pulse_event_wait(&restored, 8, &ev, 20) == 1);
     CHECK(ev.seq == 9 && ev.type == PULSE_EVENT_JOINED &&
           ev.last_seen_ms == 437);
+    CHECK(ev.phi == -1);
+    CHECK(pulse_event_wait(&restored, 9, &ev, 20) == 1);
+    CHECK(ev.seq == 10 && ev.type == PULSE_EVENT_QUIET &&
+          ev.last_seen_ms == 305);
     CHECK(ev.phi == -1);
     pulse_event_log_free(&restored);
     unlink(ev_path);
@@ -710,6 +747,7 @@ int main(void) {
     g_hooks.phi_threshold = phi_threshold_hook;
     g_hooks.peer_source = peer_source_hook;
     g_hooks.slow_rtt_threshold_ms = 0;
+    g_hooks.quiet_threshold_ms = 0;
     g_hooks.self_id = "127.0.0.1:17999";
     g_hooks.start_ms = pulse_now_ms();
 
@@ -724,7 +762,11 @@ int main(void) {
     pthread_t server;
     CHECK(pthread_create(&server, NULL, serve_thread, &fd) == 0);
 
-    char reply[4096];
+    /* 8 KB, not 4 KB: the JSON reply grows a field at a time
+     * (0.62.0's per-member "quiet" flag and "quiet_peers" pushed
+     * it past 4 KB with the canned table), and a truncated reply
+     * drops the watch "streams" array at the end. */
+    char reply[8192];
 
     /* RELOAD success: the exact outcome line, no END trailer (like
      * LEAVE/META, a single-line reply). */
@@ -835,7 +877,8 @@ int main(void) {
             "hist=[0,0,0,0,0] suspect_to_dead_ms mean=- max=- "
             "samples=0 refute_latency_ms mean=- max=- samples=0 "
             "probe_rtt_ms mean=- max=- samples=0 "
-            "hist=[0,0,0,0,0] slow_peers=0 peer_file=/tmp/peers "
+            "hist=[0,0,0,0,0] slow_peers=0 quiet_peers=0 "
+            "peer_file=/tmp/peers "
             "last_reload=1700000000 last_mtime=1699999000 "
             "pf_peers=3 pf_added=1 pf_dropped=0 pf_kept=1 "
             "pf_bad=0 watch_subscribers=0 watch_sessions=0 "
@@ -1189,7 +1232,12 @@ int main(void) {
      * the never-heard-from dead peer have no phi gauge at all. */
     g_phi_mode = 1;
     {
-        char preply[8192];
+        /* 16 KB, not 8 KB: the phi-mode reply carries the phi and
+         * phi-history families on top of the rest, and 0.62.0's
+         * pulse_quiet_peers family pushed it past 8 KB — a
+         * truncated reply drops the phi-history samples gauges
+         * at the end. */
+        char preply[16384];
         CHECK(send_cmd(18991, "PROMETHEUS\n", preply, sizeof preply) > 0);
         CHECK(strstr(preply, "# TYPE pulse_member_phi gauge\n") != NULL);
         CHECK(strstr(preply, "pulse_member_phi{member=\"127.0.0.1:17901\"} 30.00\n") != NULL);
