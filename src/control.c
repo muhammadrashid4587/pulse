@@ -735,6 +735,32 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
                  mem->id, latest, mn, n);
         if (send_all(fd, histline) != 0) return;
     }
+    /* Flap counter (0.75.0): how many completed ALIVE ->
+     * SUSPECT -> ALIVE / DEAD cycles each member has had, as one
+     * "FLAP <id> <count> <recent>" line per member with at least
+     * one flap, after the RATEHIST lines — the lifetime count
+     * and how many of those flaps completed in the last 10
+     * minutes, the same values JSON reports as "flap_count" /
+     * "flaps_10m" and PROMETHEUS as
+     * pulse_member_flap_count_total / pulse_member_flaps_10m —
+     * so a text-protocol consumer can spot an unstable member
+     * without parsing JSON or scraping Prometheus. Self never
+     * suspects itself and so has no line, a peer that never
+     * flapped has none, and a DEAD member keeps its count until
+     * GC, like its probe counts, so the flaps that killed it
+     * stay visible after it is gone. */
+    {
+        int64_t now = pulse_now_ms();
+        for (int i = 0; i < t.count; i++) {
+            const member_t *mem = &t.members[i];
+            if (mem->flap_count == 0) continue;
+            char flapline[128];
+            snprintf(flapline, sizeof flapline, "\nFLAP %s %lld %d",
+                     mem->id, (long long)mem->flap_count,
+                     member_flaps_recent(mem, now));
+            if (send_all(fd, flapline) != 0) return;
+        }
+    }
     send_all(fd, "\nEND\n");
 }
 
@@ -895,7 +921,13 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
          * once per probe cycle, null for self, "[]" until the
          * first sample lands, and frozen for a DEAD member
          * until GC, so a JSON consumer can see the rate fall
-         * over time instead of only its live value. */
+         * over time instead of only its live value.
+         * "flap_count" / "flaps_10m" (0.75.0) are how many
+         * completed ALIVE -> SUSPECT -> ALIVE / DEAD cycles
+         * this peer has had in total and in the last 10
+         * minutes — always numbers, never null, 0 for self
+         * and for a peer that never flapped, and a DEAD member
+         * keeps its count until GC. */
         char ratebuf[32];
         double rate = member_probe_rate(mem);
         if (rate < 0)
@@ -921,6 +953,18 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                                                 ratehistbuf,
                                                 sizeof ratehistbuf) < 0)
             snprintf(ratehistbuf, sizeof ratehistbuf, "[]");
+        /* Flap counter (0.75.0): "flap_count" is how many
+         * completed ALIVE -> SUSPECT -> ALIVE / DEAD cycles
+         * this peer has had — a peer that keeps flapping is
+         * visible as a count instead of only in the log — and
+         * "flaps_10m" is how many of those completed in the
+         * last 10 minutes, so a consumer can tell a peer
+         * flapping right now from one that flapped an hour ago.
+         * Both are always numbers, never null: 0 for self (it
+         * never suspects itself) and for a peer that never
+         * flapped. A DEAD member keeps its count until GC, like
+         * its probe counts, so the flaps that killed it stay
+         * visible after it is gone. */
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
@@ -929,7 +973,8 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                      "\"last_seen_ms\":%s,"
                      "\"source\":\"%s\",\"probes_sent\":%lld,"
                      "\"probes_answered\":%lld,\"low_probe_rate\":%s,"
-                     "\"probe_rate\":%s,\"probe_rate_history\":%s}",
+                     "\"probe_rate\":%s,\"probe_rate_history\":%s,"
+                     "\"flap_count\":%lld,\"flaps_10m\":%d}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
                      rttbuf, rttmeanbuf, rttmaxbuf,
@@ -950,7 +995,9 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                                                hooks->low_probe_rate_frac))
                          ? "true"
                          : "false",
-                     ratebuf, ratehistbuf);
+                     ratebuf, ratehistbuf,
+                     (long long)mem->flap_count,
+                     member_flaps_recent(mem, now));
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }
@@ -1973,6 +2020,48 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
                 "pulse_member_probe_rate_history_count{member=\"%s\"} "
                 "%d\n",
                 t.members[i].id, sum, t.members[i].id, n) == 0;
+        }
+    }
+    /* Flap counter per member (0.75.0): how many completed
+     * ALIVE -> SUSPECT -> ALIVE / DEAD cycles each member has
+     * had, as a counter — the same value JSON reports as
+     * "flap_count" and METRICS as a FLAP line — plus how many
+     * of those completed in the last 10 minutes as a gauge, so
+     * a scraper can alert on a member flapping right now
+     * instead of only on a lifetime count that never falls. One
+     * labelled sample per member with at least one flap, under
+     * the same rule as the PROBES counters: a peer that never
+     * flapped (self, which never suspects itself) has no sample
+     * — an absent series is how Prometheus says "never flapped"
+     * — and a dead member keeps its count and gauge until GC,
+     * like its probe counters, so the flaps that killed it stay
+     * visible after it is gone. The gauge saturates at 16: the
+     * ring only holds the last 16 flap times, so a peer
+     * flapping more than 16 times in 10 minutes still reads 16
+     * recent while the counter keeps growing. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_flap_count_total Completed "
+        "ALIVE -> SUSPECT -> ALIVE / DEAD cycles per member.\n"
+        "# TYPE pulse_member_flap_count_total counter\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].flap_count == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_flap_count_total{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)t.members[i].flap_count) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_flaps_10m Flap cycles completed in "
+        "the last 10 minutes, per member (at most 16).\n"
+        "# TYPE pulse_member_flaps_10m gauge\n") == 0;
+    {
+        int64_t now = pulse_now_ms();
+        for (int i = 0; i < t.count; i++) {
+            if (t.members[i].flap_count == 0) continue;
+            ok &= prom_add(buf, sizeof buf, &used,
+                "pulse_member_flaps_10m{member=\"%s\"} %d\n",
+                t.members[i].id,
+                member_flaps_recent(&t.members[i], now)) == 0;
         }
     }
     /* Peer-file state (0.28.0): only when the node runs with

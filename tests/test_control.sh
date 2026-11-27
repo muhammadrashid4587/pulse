@@ -111,7 +111,7 @@ json="$(ctl 18401 JSON)"
 if echo "$json" | head -n 1 | python3 -c "import json,sys; json.load(sys.stdin)" \
    && echo "$json" | grep -q '"id":"127.0.0.1:17401"' \
    && echo "$json" | grep -q '"total":1' \
-   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17401","incarnation":1,"state":"ALIVE","phi":null,"phi_history":null,"meta":{},"rtt_ms":null,"rtt_mean_ms":null,"rtt_max_ms":null,"slow":false,"quiet":false,"suspect_ms":null,"last_seen_ms":null,"source":"self","probes_sent":0,"probes_answered":0,"low_probe_rate":false,"probe_rate":null,"probe_rate_history":null}\]' \
+   && echo "$json" | grep -q '"members":\[{"id":"127.0.0.1:17401","incarnation":1,"state":"ALIVE","phi":null,"phi_history":null,"meta":{},"rtt_ms":null,"rtt_mean_ms":null,"rtt_max_ms":null,"slow":false,"quiet":false,"suspect_ms":null,"last_seen_ms":null,"source":"self","probes_sent":0,"probes_answered":0,"low_probe_rate":false,"probe_rate":null,"probe_rate_history":null,"flap_count":0,"flaps_10m":0}\]' \
    && echo "$json" | grep -q '"metrics":{"suspected":0,"dead":0,"refutes":0,"joins":0' \
    && echo "$json" | grep -q '"slow_peers":0' \
    && echo "$json" | grep -q '"low_probe_rate_peers":0' \

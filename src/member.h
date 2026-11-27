@@ -26,6 +26,21 @@
 
 #define PULSE_PROBE_RATE_HISTORY 16
 
+/* Flap counter (0.75.0): how many completed flap cycles to keep
+ * timestamps for per peer — the same 16-slot ring the histories
+ * use — and how far back the recent-flap count looks. A flap is
+ * one completed ALIVE -> SUSPECT -> ALIVE cycle (a refuted
+ * suspicion) or ALIVE -> SUSPECT -> DEAD (the peer died after
+ * being suspected). Ten minutes is the recent window: long
+ * enough to catch a peer flapping every minute or two, short
+ * enough that a flap from an hour ago stops counting as "right
+ * now". The ring caps the recent count at 16: a peer flapping
+ * more than 16 times in 10 minutes still reads 16 recent, while
+ * the lifetime count keeps growing. */
+
+#define PULSE_FLAP_HISTORY 16
+#define PULSE_FLAP_WINDOW_MS (10 * 60 * 1000)
+
 /* Member metadata/annotations (0.20.0): a small set of key=value pairs
  * a node carries about itself — role=worker, zone=us-east-1,
  * version=1.2.3 — gossiped with its membership entry, shown in the
@@ -159,6 +174,25 @@ typedef struct {
     int64_t probe_rate_hist_ms[PULSE_PROBE_RATE_HISTORY];
     int probe_rate_hist_count;
     int probe_rate_hist_head;
+    /* Flap counter (0.75.0): how many completed flap cycles
+     * this peer has had — ALIVE -> SUSPECT -> ALIVE (a refuted
+     * suspicion, the peer came back) or ALIVE -> SUSPECT -> DEAD
+     * (the peer died after being suspected) — and when the last
+     * 16 of them completed, as monotonic ms, so the recent count
+     * can be read off the ring. flap_armed is 1 while a cycle is
+     * in progress: the member entered SUSPECT from ALIVE on this
+     * node. A member that arrives SUSPECT from gossip — never
+     * ALIVE here — is never armed, so a later revival is not
+     * counted: the cycle has to start on this node. A direct
+     * ALIVE -> DEAD with no suspicion in between is not a flap
+     * either: there was no cycle to complete. Local measurement
+     * only — never gossiped, never persisted, and not a
+     * table-version change, like the probe counts. */
+    int64_t flap_count;
+    int64_t flap_hist_ms[PULSE_FLAP_HISTORY];
+    int flap_hist_count;
+    int flap_hist_head;
+    int flap_armed;
     /* Low-probe-rate warning (0.68.0): whether a LOWRATE log
      * line and event have already been emitted for the current
      * low-rate episode — an ALIVE peer whose windowed probe
@@ -409,6 +443,14 @@ void member_probe_rate_history_stats(const member_t *m, double *latest,
 void member_probe_rate_history_hist(const member_t *m, const double *bounds,
                                     int n_bounds, int *counts, double *sum,
                                     int *count);
+/* How many of the member's completed flap cycles fall inside
+ * the recent window (0.75.0): flap times within
+ * PULSE_FLAP_WINDOW_MS of now, at most PULSE_FLAP_HISTORY —
+ * the ring only holds the last 16 times, so a peer flapping
+ * more than 16 times in the window reads 16 here while its
+ * lifetime flap_count keeps growing. 0 for a NULL member, and
+ * for a member that never flapped. */
+int member_flaps_recent(const member_t *m, int64_t now);
 /* 1 when the peer counts as low-probe-rate (0.68.0): the
  * low-probe-rate warning is enabled (threshold > 0), the peer
  * is ALIVE, at least PULSE_PROBE_WINDOW_MIN probes are in its

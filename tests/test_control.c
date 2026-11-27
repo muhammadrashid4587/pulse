@@ -121,7 +121,15 @@
  * samples gauges plus a real histogram per member (cumulative
  * buckets at le 0.5, 0.75, 0.9, 0.95, 1.0 and +Inf, with _sum and
  * _count); the history end to end is covered by
- * tests/test_prometheus.sh. */
+ * tests/test_prometheus.sh. The flap counter (0.75.0) is covered
+ * here too: each member carries "flap_count" / "flaps_10m" in
+ * JSON (2 / 2 for the canned 17901, 1 / 1 for the DEAD 17902, 0 /
+ * 0 for self and the never-flapped 17903), one "FLAP <id>
+ * <count> <recent>" line rides after the RATEHIST lines in
+ * METRICS for each member with at least one flap, and
+ * pulse_member_flap_count_total / pulse_member_flaps_10m ride in
+ * PROMETHEUS under the same rule; the counter end to end is
+ * covered by tests/test_flap_counter.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -193,6 +201,19 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
     m = member_add(out, "127.0.0.1:17901", &addr, 1);
     if (m) {
         m->last_seen_ms = now;
+        /* Flap counter (0.75.0): two completed ALIVE -> SUSPECT
+         * -> ALIVE cycles, both inside the 10-minute window —
+         * so the canned peer reads flap_count 2, flaps_10m 2.
+         * Set directly, like the canned RTT and probe counts
+         * below: driving the cycles through member_mark_alive
+         * would add heartbeats that move the canned phi
+         * history, and the real transitions are covered in
+         * test_member.c. */
+        m->flap_count = 2;
+        m->flap_hist_ms[0] = now - 3000;
+        m->flap_hist_ms[1] = now - 1000;
+        m->flap_hist_count = 2;
+        m->flap_hist_head = 2;
         /* Probe RTT (0.40.0): answered probes, last 3 ms, mean 2
          * over 4 samples — so PROMETHEUS has a real rtt gauge to
          * check for this peer. Worst RTT (0.64.0): 7 ms, the
@@ -276,6 +297,12 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
     }
     m = member_add(out, "127.0.0.1:17902", &addr, 1);
     if (m) {
+        /* Flap counter (0.75.0): one completed ALIVE -> SUSPECT
+         * -> DEAD cycle, inside the window — the DEAD peer keeps
+         * its flap count until GC, like its frozen probe-rate
+         * history. */
+        member_mark_suspect(out, "127.0.0.1:17902", now - 5000);
+        member_mark_dead(out, "127.0.0.1:17902", now - 4000);
         m->state = MEMBER_DEAD;
         m->last_seen_ms = 0; /* never heard from */
         /* No probe ever answered: rtt_ms stays -1, so PROMETHEUS
@@ -1305,7 +1332,14 @@ int main(void) {
             "RATEHIST 127.0.0.1:17901 0.80 0.80 2",
             "RATEHIST 127.0.0.1:17903 0.20 0.20 2",
             "RATEHIST 127.0.0.1:17902 0.00 0.00 1"};
-        int nseen = 0, nrtt = 0, nprobes = 0, nratehist = 0;
+        /* Flap counter in METRICS (0.75.0): the FLAP lines ride
+         * after the RATEHIST lines, in table order — the 17901
+         * peer (2 flaps, both recent) and the DEAD 17902 (1
+         * flap) — and the never-flapped 17903 and self have
+         * none. */
+        const char *want_flap[2] = {"FLAP 127.0.0.1:17901 2 2",
+                                    "FLAP 127.0.0.1:17902 1 1"};
+        int nseen = 0, nrtt = 0, nprobes = 0, nratehist = 0, nflap = 0;
         char *save = NULL;
         char *line = strtok_r(reply + sizeof metrics_line - 1, "\n",
                               &save);
@@ -1326,11 +1360,14 @@ int main(void) {
             } else if (nprobes < 2) {
                 CHECK(strcmp(line, want_probes[nprobes]) == 0);
                 nprobes++;
-            } else {
-                CHECK(nratehist < 3);
-                if (nratehist < 3)
-                    CHECK(strcmp(line, want_ratehist[nratehist]) == 0);
+            } else if (nratehist < 3) {
+                CHECK(strcmp(line, want_ratehist[nratehist]) == 0);
                 nratehist++;
+            } else {
+                CHECK(nflap < 2);
+                if (nflap < 2)
+                    CHECK(strcmp(line, want_flap[nflap]) == 0);
+                nflap++;
             }
             line = strtok_r(NULL, "\n", &save);
         }
@@ -1338,6 +1375,7 @@ int main(void) {
         CHECK(nrtt == 2);
         CHECK(nprobes == 2);
         CHECK(nratehist == 3);
+        CHECK(nflap == 2);
         CHECK(line != NULL && strcmp(line, "END") == 0);
     }
 
@@ -1485,6 +1523,42 @@ int main(void) {
         CHECK(peer != NULL && counts != NULL &&
               (next_id == NULL || counts < next_id));
     }
+    /* Flap counter in JSON (0.75.0): each member carries
+     * "flap_count" (lifetime completed ALIVE -> SUSPECT ->
+     * ALIVE / DEAD cycles) and "flaps_10m" (flaps in the last 10
+     * minutes) — always numbers, never null: 2 / 2 for the
+     * canned 17901, 1 / 1 for the DEAD 17902, and 0 / 0 for self
+     * (it never suspects itself) and for the never-flapped
+     * 17903, each checked inside its own member object. */
+    {
+        const char *peer = strstr(reply, "\"id\":\"127.0.0.1:17901\"");
+        const char *flaps =
+            peer ? strstr(peer, "\"flap_count\":2,\"flaps_10m\":2") : NULL;
+        const char *next_id =
+            peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && flaps != NULL &&
+              (next_id == NULL || flaps < next_id));
+        peer = strstr(reply, "\"id\":\"127.0.0.1:17902\"");
+        flaps = peer ? strstr(peer, "\"flap_count\":1,\"flaps_10m\":1")
+                     : NULL;
+        next_id = peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && flaps != NULL &&
+              (next_id == NULL || flaps < next_id));
+        peer = strstr(reply, "\"id\":\"127.0.0.1:17903\"");
+        flaps = peer ? strstr(peer, "\"flap_count\":0,\"flaps_10m\":0")
+                     : NULL;
+        next_id = peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && flaps != NULL &&
+              (next_id == NULL || flaps < next_id));
+        /* Self is the first member, so anchor at the members
+         * array like the probe-counts check above does. */
+        peer = strstr(reply, "\"members\":[{\"id\":\"127.0.0.1:17999\"");
+        flaps = peer ? strstr(peer, "\"flap_count\":0,\"flaps_10m\":0")
+                     : NULL;
+        next_id = peer ? strstr(peer, "\"id\":\"127.0.0.1:17901\"") : NULL;
+        CHECK(peer != NULL && flaps != NULL &&
+              (next_id == NULL || flaps < next_id));
+    }
     /* Low-probe-rate warning (0.68.0): with the threshold hook
      * at 0.5, the canned 17903 (window 5 sent / 1 answered,
      * rate 0.20) counts as low, the canned 17901 (5 / 4, rate
@@ -1520,6 +1594,17 @@ int main(void) {
         CHECK(strstr(reply, "RATEHIST 127.0.0.1:17902 0.00 0.00 1\n") != NULL);
         CHECK(strstr(reply, "RATEHIST 127.0.0.1:17999") == NULL);
         CHECK(rhist != NULL && low != NULL && rhist > low);
+        /* Flap counter in METRICS (0.75.0): one "FLAP <id>
+         * <count> <recent>" line per member with at least one
+         * flap, after the RATEHIST lines — the canned 17901 (2
+         * flaps, both recent) and the DEAD 17902 (1 flap); the
+         * never-flapped 17903 and self have no line. */
+        const char *flap = strstr(reply, "FLAP 127.0.0.1:17901 2 2\n");
+        CHECK(flap != NULL);
+        CHECK(strstr(reply, "FLAP 127.0.0.1:17902 1 1\n") != NULL);
+        CHECK(strstr(reply, "FLAP 127.0.0.1:17903") == NULL);
+        CHECK(strstr(reply, "FLAP 127.0.0.1:17999") == NULL);
+        CHECK(flap != NULL && rhist != NULL && flap > rhist);
     }
     CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
     CHECK(strstr(reply, "\"low_probe_rate_peers\":1") != NULL);
@@ -1851,6 +1936,22 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17902\",le=\"0.5\"} 1\n") != NULL);
         CHECK(strstr(preply, "pulse_member_probe_rate_history_sum{member=\"127.0.0.1:17902\"} 0.00\n") != NULL);
         CHECK(strstr(preply, "pulse_member_probe_rate_history_bucket{member=\"127.0.0.1:17999\"}") == NULL);
+        /* Flap counter in PROMETHEUS (0.75.0): the lifetime
+         * count rides as a counter and the 10-minute count as a
+         * gauge — one labelled sample per member with at least
+         * one flap: the canned 17901 (2 flaps) and the DEAD
+         * 17902 (1 flap, kept until GC); the never-flapped 17903
+         * and self have no sample at all. */
+        CHECK(strstr(preply, "# TYPE pulse_member_flap_count_total counter\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_flap_count_total{member=\"127.0.0.1:17901\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_flap_count_total{member=\"127.0.0.1:17902\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_flap_count_total{member=\"127.0.0.1:17903\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_flap_count_total{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_flaps_10m gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_flaps_10m{member=\"127.0.0.1:17901\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_flaps_10m{member=\"127.0.0.1:17902\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_flaps_10m{member=\"127.0.0.1:17903\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_flaps_10m{member=\"127.0.0.1:17999\"}") == NULL);
         /* Time since last contact per member (0.59.0): one
          * pulse_member_last_seen_ms gauge sample per member heard
          * from — the seed peer and the peer-file peer, both heard

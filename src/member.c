@@ -443,6 +443,12 @@ static int state_rank(member_state_t s) {
     }
 }
 
+/* Flap bookkeeping for one state transition (0.75.0) — defined
+ * below, beside the mark_* functions; declared here because the
+ * gossip merge below is the first caller in the file. */
+static void flap_on_transition(member_t *m, member_state_t from,
+                               member_state_t to, int64_t now);
+
 int member_merge(member_table_t *t, const char *self_id, const char *id,
                  const struct sockaddr_storage *addr, uint32_t incarnation,
                  member_state_t state, int64_t now) {
@@ -470,16 +476,20 @@ int member_merge(member_table_t *t, const char *self_id, const char *id,
         return MERGE_NEW;
     }
     if (incarnation > m->incarnation) {
+        member_state_t old = m->state;
         m->incarnation = incarnation;
         m->state = state;
         m->state_since_ms = now;
         if (addr) m->addr = *addr;
+        flap_on_transition(m, old, state, now);
         note_change(t, m);
         return MERGE_CHANGED;
     }
     if (incarnation == m->incarnation && state_rank(state) > state_rank(m->state)) {
+        member_state_t old = m->state;
         m->state = state;
         m->state_since_ms = now;
+        flap_on_transition(m, old, state, now);
         note_change(t, m);
         return MERGE_CHANGED;
     }
@@ -740,9 +750,62 @@ int64_t member_last_seen_age_ms(const member_t *m, int64_t now) {
     return now - m->last_seen_ms;
 }
 
+/* Flap counter (0.75.0): record one completed flap cycle —
+ * the member left SUSPECT for ALIVE or DEAD after a suspicion
+ * that started from ALIVE on this node. Bumps the lifetime
+ * count and stamps the completion time in the ring (oldest
+ * slides out past 16), so the recent count can be read off it.
+ * The armed flag clears with the cycle: the next flap needs a
+ * fresh suspicion. */
+static void note_flap(member_t *m, int64_t now) {
+    m->flap_count++;
+    int slot = m->flap_hist_head;
+    m->flap_hist_ms[slot] = now;
+    m->flap_hist_head = (slot + 1) % PULSE_FLAP_HISTORY;
+    if (m->flap_hist_count < PULSE_FLAP_HISTORY)
+        m->flap_hist_count++;
+    m->flap_armed = 0;
+}
+
+/* Flap bookkeeping for one state transition, old -> new
+ * (0.75.0): entering SUSPECT from ALIVE arms a cycle; leaving
+ * SUSPECT for ALIVE or DEAD completes it, but only when armed —
+ * a member that arrived SUSPECT from gossip, never ALIVE here,
+ * never armed, so its revival is not a flap. Any other leg is
+ * not a cycle either: a direct ALIVE -> DEAD has no suspicion
+ * in it, and a DEAD -> SUSPECT at a higher incarnation was
+ * never ALIVE here, so it disarms instead of arming. Called by
+ * every path that moves a member's state — the local mark_*
+ * functions and the gossip merge — so a flap counts the same
+ * whether this node detected it or learned it from a peer. */
+static void flap_on_transition(member_t *m, member_state_t from,
+                               member_state_t to, int64_t now) {
+    if (from == to) return;
+    if (from == MEMBER_ALIVE && to == MEMBER_SUSPECT) {
+        m->flap_armed = 1;
+        return;
+    }
+    if (from == MEMBER_SUSPECT &&
+        (to == MEMBER_ALIVE || to == MEMBER_DEAD)) {
+        if (m->flap_armed) note_flap(m, now);
+        m->flap_armed = 0;
+        return;
+    }
+    if (to == MEMBER_SUSPECT) m->flap_armed = 0;
+}
+
+int member_flaps_recent(const member_t *m, int64_t now) {
+    if (!m) return 0;
+    int n = 0;
+    for (int i = 0; i < m->flap_hist_count; i++)
+        if (now - m->flap_hist_ms[i] <= PULSE_FLAP_WINDOW_MS) n++;
+    return n;
+}
+
 int member_mark_suspect(member_table_t *t, const char *id, int64_t now) {
     member_t *m = member_find(t, id);
     if (!m || m->state != MEMBER_ALIVE) return 0;
+    flap_on_transition(m, MEMBER_ALIVE, MEMBER_SUSPECT, now);
     m->state = MEMBER_SUSPECT;
     m->state_since_ms = now;
     note_change(t, m);
@@ -752,6 +815,7 @@ int member_mark_suspect(member_table_t *t, const char *id, int64_t now) {
 int member_mark_dead(member_table_t *t, const char *id, int64_t now) {
     member_t *m = member_find(t, id);
     if (!m || m->state == MEMBER_DEAD) return 0;
+    flap_on_transition(m, m->state, MEMBER_DEAD, now);
     m->state = MEMBER_DEAD;
     m->state_since_ms = now;
     note_change(t, m);
@@ -779,6 +843,12 @@ int member_mark_alive(member_table_t *t, const char *id,
     }
     int changed = (m->state != MEMBER_ALIVE);
     int inc_raised = (incarnation > m->incarnation);
+    /* A revival completes a flap cycle when the member was
+     * SUSPECT — and only when the suspicion started from ALIVE
+     * on this node (see flap_on_transition): a DEAD peer coming
+     * back is a restart, not a flap, and the SUSPECT -> DEAD leg
+     * already counted the cycle when the peer died. */
+    if (changed) flap_on_transition(m, m->state, MEMBER_ALIVE, now);
     m->state = MEMBER_ALIVE;
     if (inc_raised) m->incarnation = incarnation;
     if (addr) m->addr = *addr;

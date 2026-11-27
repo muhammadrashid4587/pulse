@@ -608,6 +608,92 @@ int main(void) {
     CHECK(hcounts[2] == 16);
     CHECK(hcounts[5] == 16);
 
+    /* Flap counter (0.75.0): one completed ALIVE -> SUSPECT ->
+     * ALIVE cycle (a refuted suspicion) or ALIVE -> SUSPECT ->
+     * DEAD (the peer died after being suspected) is one flap,
+     * and the recent count is how many completed inside the
+     * last 10 minutes. A suspicion alone is not a flap yet —
+     * the cycle only completes when the member leaves SUSPECT —
+     * and a direct ALIVE -> DEAD with no suspicion in between
+     * is not one either. */
+    member_table_t tf;
+    member_table_init(&tf);
+    member_t *mf = member_add(&tf, "127.0.0.1:17110", &a4, 1);
+    CHECK(mf->flap_count == 0);
+    CHECK(member_flaps_recent(mf, now) == 0);
+    CHECK(member_flaps_recent(NULL, now) == 0);
+    CHECK(member_mark_suspect(&tf, "127.0.0.1:17110", now + 100) == 1);
+    CHECK(mf->flap_count == 0); /* suspected, not yet flapped */
+    CHECK(member_flaps_recent(mf, now + 100) == 0);
+    CHECK(member_mark_alive(&tf, "127.0.0.1:17110", &a4, 1, now + 200) == 1);
+    CHECK(mf->flap_count == 1);
+    CHECK(member_flaps_recent(mf, now + 200) == 1);
+    /* A second suspicion that ends in death is a second flap. */
+    CHECK(member_mark_suspect(&tf, "127.0.0.1:17110", now + 300) == 1);
+    CHECK(member_mark_dead(&tf, "127.0.0.1:17110", now + 400) == 1);
+    CHECK(mf->flap_count == 2);
+    CHECK(member_flaps_recent(mf, now + 400) == 2);
+    /* A restart is not a flap: the DEAD -> ALIVE leg is a new
+     * life, and the SUSPECT -> DEAD leg already counted the
+     * cycle when the peer died — and a direct ALIVE -> DEAD
+     * after the restart counts nothing either. */
+    CHECK(member_mark_alive(&tf, "127.0.0.1:17110", &a4, 2, now + 500) == 1);
+    CHECK(mf->flap_count == 2);
+    CHECK(member_mark_dead(&tf, "127.0.0.1:17110", now + 600) == 1);
+    CHECK(mf->flap_count == 2);
+    /* A third cycle, back through SUSPECT and ALIVE. */
+    CHECK(member_mark_alive(&tf, "127.0.0.1:17110", &a4, 3, now + 700) == 1);
+    CHECK(member_mark_suspect(&tf, "127.0.0.1:17110", now + 800) == 1);
+    CHECK(member_mark_alive(&tf, "127.0.0.1:17110", &a4, 3, now + 900) == 1);
+    CHECK(mf->flap_count == 3);
+    /* The 10-minute window: the three flaps completed at +200,
+     * +400 and +900, so at exactly one window after the first
+     * all three still count, one millisecond later the first
+     * has aged out, and a window after the last none do. */
+    CHECK(member_flaps_recent(mf, now + 200 + PULSE_FLAP_WINDOW_MS) == 3);
+    CHECK(member_flaps_recent(mf, now + 201 + PULSE_FLAP_WINDOW_MS) == 2);
+    CHECK(member_flaps_recent(mf, now + 901 + PULSE_FLAP_WINDOW_MS) == 0);
+    /* The ring holds the last 16 flap times: 20 more cycles in
+     * quick succession push the lifetime count to 23, but the
+     * recent count saturates at 16 — the honest limit of the
+     * bounded ring, documented on the surfaces. */
+    for (int k = 0; k < 20; k++) {
+        member_mark_suspect(&tf, "127.0.0.1:17110", now + 1000 + k * 10);
+        member_mark_alive(&tf, "127.0.0.1:17110", &a4, 3,
+                          now + 1005 + k * 10);
+    }
+    CHECK(mf->flap_count == 23);
+    CHECK(mf->flap_hist_count == 16);
+    CHECK(member_flaps_recent(mf, now + 1200) == 16);
+    /* Gossip-learned transitions count the same way (0.75.0):
+     * a member that arrives SUSPECT from gossip — never ALIVE
+     * on this node — and is then reported ALIVE is not a flap,
+     * since the cycle never started here; but once it is ALIVE
+     * here, a gossip-learned SUSPECT -> ALIVE and a
+     * gossip-learned SUSPECT -> DEAD each count one. */
+    member_table_t tg;
+    member_table_init(&tg);
+    CHECK(member_merge(&tg, "127.0.0.1:17101", "127.0.0.1:17111", &a4,
+                       1, MEMBER_SUSPECT, now) == MERGE_NEW);
+    member_t *mg = member_find(&tg, "127.0.0.1:17111");
+    CHECK(mg != NULL);
+    CHECK(mg->flap_count == 0);
+    CHECK(member_merge(&tg, "127.0.0.1:17101", "127.0.0.1:17111", &a4,
+                       2, MEMBER_ALIVE, now + 100) == MERGE_CHANGED);
+    CHECK(mg->flap_count == 0);
+    CHECK(member_merge(&tg, "127.0.0.1:17101", "127.0.0.1:17111", &a4,
+                       2, MEMBER_SUSPECT, now + 200) == MERGE_CHANGED);
+    CHECK(member_merge(&tg, "127.0.0.1:17101", "127.0.0.1:17111", &a4,
+                       3, MEMBER_ALIVE, now + 300) == MERGE_CHANGED);
+    CHECK(mg->flap_count == 1);
+    CHECK(member_flaps_recent(mg, now + 300) == 1);
+    CHECK(member_merge(&tg, "127.0.0.1:17101", "127.0.0.1:17111", &a4,
+                       3, MEMBER_SUSPECT, now + 400) == MERGE_CHANGED);
+    CHECK(member_merge(&tg, "127.0.0.1:17101", "127.0.0.1:17111", &a4,
+                       3, MEMBER_DEAD, now + 500) == MERGE_CHANGED);
+    CHECK(mg->flap_count == 2);
+    CHECK(member_flaps_recent(mg, now + 500) == 2);
+
     /* gossip fanout: 1 + floor(log2(peers)), capped at 4 */
     CHECK(member_gossip_fanout(0) == 1);
     CHECK(member_gossip_fanout(1) == 1);
