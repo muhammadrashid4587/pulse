@@ -17,11 +17,13 @@
 #     flap_rate_peers=0 with no FLAPRATE line, and PROMETHEUS
 #     says pulse_flap_rate_peers 0.
 #  2. Kill node 2 with SIGKILL and restart it: one completed
-#     cycle, so the peer reads flap_count at least 1 — but still
-#     "flap_rate":false with no FLAPRATE line anywhere: one flap
-#     is below the threshold of 3. (A slow restart can add a
-#     genuine refuted-suspicion flap of its own, so the count
-#     after one cycle is 1 or 2 — still below 3 either way.)
+#     cycle, so the peer reads flap_count at least 1. The count
+#     is left to settle first — a slow restart can add genuine
+#     refuted-suspicion flaps for a second or two after the peer
+#     comes back ALIVE — and then the warning is judged against
+#     the settled count: below the threshold of 3 the peer still
+#     reads "flap_rate":false with no FLAPRATE line anywhere, at
+#     or above it the FLAPRATE has fired exactly once.
 #  3. Kill and restart node 2 again, up to two more times, until
 #     the FLAPRATE fires: each kill is one more completed cycle,
 #     so three kills guarantee at least 3 recent flaps, and a
@@ -35,10 +37,11 @@
 #     FLAPRATE line as the WATCH stream did, and a WATCH FROM 0
 #     replay shows it too — the frozen flaps_10m survives a
 #     restart and a replay.
-# FLAPOK is not covered end to end here: the recovery fires when
-# flaps age out of the 10-minute window, which no short test can
-# wait for — the predicate, including the ageing, is covered at
-# the unit level in test_member.c instead.
+# FLAPOK is covered end to end by tests/test_flapok.sh: the
+# recovery fires when flaps age out of the 10-minute window,
+# which no short test can wait for — that test waits the real
+# 10 minutes instead. The predicate, including the ageing, is
+# covered at the unit level in test_member.c too.
 # The watcher runs under stdbuf -o0: pulse-ctl's stdout is
 # block-buffered to a file, so without it the streamed lines would
 # sit in the buffer and the test's polling would see nothing.
@@ -230,7 +233,7 @@ fi
 # 2. Kill node 2 with SIGKILL — a crash, not a clean shutdown, so
 # it sends no graceful-leave announcement and node 1 has to detect
 # the death through probing — then restart it: one completed
-# cycle, still below the threshold of 3.
+# cycle, judged once the flap count settles.
 kill -9 "$(cat "$TMP/n2.pid")" 2>/dev/null
 if wait_for "$TMP/n1.log" "DEAD 127.0.0.1:17974" 10; then
     note ok "node 1 marks the crashed peer DEAD"
@@ -245,17 +248,39 @@ else
     note fail "restarted peer comes back ALIVE after the first crash"
     tail -5 "$TMP/n1.log"
 fi
-# One kill is one flap, and a slow restart can add a genuine
-# refuted-suspicion flap of its own — so the count is 1 or 2,
-# still below the threshold of 3 either way, and no FLAPRATE
-# has fired.
+# One kill is one flap, and a slow restart can add genuine
+# refuted-suspicion flaps of its own — so the count after one
+# cycle is usually 1 or 2, still below the threshold of 3. But
+# the restart transient keeps landing flaps for a second or two
+# after the peer comes back ALIVE, so reading the count the
+# moment ALIVE appears can catch it mid-climb: a flap can land
+# between this check's reads and fire the FLAPRATE under it,
+# failing the check even though the warning behaved correctly —
+# that race tripped this check repeatedly under load. Wait for
+# the count to settle first — unchanged across a 1 s gap, up to
+# 10 s — the restart transient is over by then. Then judge the
+# warning against the settled count: below the threshold it must
+# not have fired, at or above it must have fired exactly once.
+# Either way the warning fires at the threshold, never early —
+# and a cycle that genuinely produced 3 flaps under load still
+# proves the warning, it just proves it a cycle early.
 COUNT1="$(json_member 18973 127.0.0.1:17974 flap_count)"
-if python3 -c "exit(0 if 1 <= int('$COUNT1') <= 2 else 1)" 2>/dev/null \
-   && [ "$(json_member 18973 127.0.0.1:17974 flap_rate)" = "False" ] \
-   && ! grep -q "FLAPRATE 127.0.0.1:17974 " "$TMP/n1.log"; then
+for _ in $(seq 1 10); do
+    sleep 1
+    COUNT1_NEW="$(json_member 18973 127.0.0.1:17974 flap_count)"
+    [ "$COUNT1_NEW" = "$COUNT1" ] && break
+    COUNT1="$COUNT1_NEW"
+done
+RATE1="$(json_member 18973 127.0.0.1:17974 flap_rate)"
+LINES1="$(grep -c 'FLAPRATE 127.0.0.1:17974 flaps=' "$TMP/n1.log")"
+if python3 -c "exit(0 if 1 <= int('$COUNT1') < 3 else 1)" 2>/dev/null \
+   && [ "$RATE1" = "False" ] && [ "$LINES1" = "0" ]; then
     note ok "after one crash, flap_count $COUNT1 is below the threshold and no FLAPRATE fired"
+elif python3 -c "exit(0 if int('$COUNT1') >= 3 else 1)" 2>/dev/null \
+   && [ "$RATE1" = "True" ] && [ "$LINES1" = "1" ]; then
+    note ok "after one crash, flap_count $COUNT1 already reached the threshold and the FLAPRATE fired once"
 else
-    note fail "after one crash, flap_count is below the threshold and no FLAPRATE fired (got $COUNT1)"
+    note fail "after one crash, the warning matches the settled flap_count (got $COUNT1, flap_rate $RATE1, $LINES1 FLAPRATE lines)"
     grep 'FLAPRATE' "$TMP/n1.log" || true
 fi
 

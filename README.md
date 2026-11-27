@@ -2183,6 +2183,10 @@ count at least as large and an answered count frozen at the same
 value, the peer having stopped answering; a SUSPECTED for a peer
 that never answered carries sent at least 1 with answered 0 —
 probed but never answered, distinguishable from never probed at
+all. That is when this node probed the peer itself: a suspicion
+learned from gossip about a peer this node never probed carries
+no fields, like any never-probed member, so the two cases are
+distinguishable in the log by whether the counts are present at
 all. They ride after the last_seen_ms field when it is present —
 a SUSPECTED carries both, the silence and the unanswered probes
 behind it. Self, a member never probed, and a member already
@@ -2842,7 +2846,12 @@ at the recovery and persisted in `<data-dir>/events` like the
 sees the episode end, and the flag in `JSON`, `METRICS` and
 `PROMETHEUS` clears at the same moment the `FLAPOK` fires, never
 before it. The `FLAPOK` fires once per episode, re-armed by the
-next `FLAPRATE`. The re-arm is on recovery, the same way the
+next `FLAPRATE`. The recovery is covered end to end by
+`tests/test_flapok.sh`, which drives a peer through
+kill/restart cycles until the `FLAPRATE` fires and then waits the
+real 10 minutes for the flaps to age out of the window — about
+11 minutes a run, the price of testing the real window instead
+of a shortened one. The re-arm is on recovery, the same way the
 quiet and low-probe-rate warnings' are: the count only falls as
 flaps age out of the 10-minute window, so clearing on contact
 would re-fire almost at once for a peer still flapping. The flag
@@ -3070,7 +3079,9 @@ make test
   with a larger one, the persisted `<data-dir>/events` file
   carries the same age on the SUSPECTED line as the stream did,
   and a `WATCH FROM 0` replay shows the never-started peer's
-  SUSPECTED event with no trailing field at all.
+  SUSPECTED event with no `last_seen_ms` field — it may or may
+  not carry probe counts, depending on whether this node probed
+  the peer before learning of the suspicion from gossip.
 - `tests/test_quiet_peer.sh`: integration test for the quiet-peer
   early warning (0.62.0) — a 2-node cluster converges from a
   `--peer-file` with `--quiet-peer-ms 300` and a long ack timeout
@@ -3707,10 +3718,12 @@ make test
   before any crash the peer reads `"flap_rate":false` with
   `flap_count` 0, `flap_rate_peers=0` in `METRICS` and `JSON`, no
   `FLAPRATE` line in `METRICS`, and `pulse_flap_rate_peers 0` in
-  `PROMETHEUS`; node 2 is killed with SIGKILL and restarted, and
-  the peer still reads `"flap_rate":false` with no `FLAPRATE` line
-  anywhere — one cycle is 1 or 2 flaps, still below the threshold
-  of 3; node 2 is killed and restarted again, up to two more
+  `PROMETHEUS`; node 2 is killed with SIGKILL and restarted, the
+  flap count is left to settle, and the warning is judged against
+  the settled count — below the threshold of 3 the peer still
+  reads `"flap_rate":false` with no `FLAPRATE` line anywhere, at
+  or above it the `FLAPRATE` has fired exactly once; node 2 is
+  killed and restarted again, up to two more
   times, until the `FLAPRATE` fires — each kill is one more
   completed cycle, so three kills guarantee at least 3 recent
   flaps — and node 1 logs exactly one `FLAPRATE <id> flaps=<n>
@@ -3722,11 +3735,36 @@ make test
   `pulse_flap_rate_peers 1` with `pulse_member_flaps_10m`
   agreeing too; the persisted `<data-dir>/events` file carries
   the same `FLAPRATE` line, and a `WATCH FROM 0` replay shows it
-  with the same frozen `flaps_10m`. The `FLAPOK` recovery is not
-  covered end to end here — it fires when flaps age out of the
-  10-minute window, which no short test can wait for — the
-  predicate, including the ageing, is covered at the unit level
-  in `test_member.c` instead.
+  with the same frozen `flaps_10m`. The `FLAPOK` recovery is
+  covered end to end by `tests/test_flapok.sh` instead — it fires
+  when flaps age out of the 10-minute window, which no short test
+  can wait for — and the predicate, including the ageing, is
+  covered at the unit level in `test_member.c` too.
+- `tests/test_flapok.sh`: integration test for the flap-rate
+  recovery (0.78.0) — two nodes converge from one shared peer
+  file with `--flap-rate-threshold 3` and a `WATCH` open on node
+  1, node 2 is killed with SIGKILL and restarted until the
+  `FLAPRATE` fires, and then the test waits the real 10 minutes
+  for the flaps to age out of the window: node 1 logs exactly one
+  `FLAPOK <id> flaps=<n> threshold=3` line — n is 1 or 2, two flaps
+  can age out in one probe cycle when they completed within ~100
+  ms of each other — the `WATCH` stream carries exactly one
+  `FLAPOK` event with that same frozen `flaps_10m`, and while the
+  peer is ALIVE its `JSON` says `"flap_rate":false`
+  with `flaps_10m` below 3, `METRICS` says `flap_rate_peers=0`
+  with no `FLAPRATE` line and a `FLAP` line whose recent count
+  is below 3 too, and `PROMETHEUS` says
+  `pulse_flap_rate_peers 0` with `pulse_member_flaps_10m`
+  below 3 too. The live counts are ranges, not exact values:
+  the count keeps falling as the remaining flaps age out
+  seconds after the `FLAPOK`, so a live query may already read
+  1 or 0 — the frozen log line and event are the exact proof;
+  the persisted `<data-dir>/events` file carries the same
+  `FLAPOK` line, and a `WATCH FROM 0` replay shows it with the
+  same frozen `flaps_10m`. The whole test runs about 11
+  minutes — the wait is the point, not a cost to trim: a shorter
+  window would test a different configuration, not the
+  documented 10-minute one.
 
 ## Roadmap
 
@@ -3808,3 +3846,4 @@ Done in 0.50.0.
 - ~~Flap counter: count how many times each member flips ALIVE -> SUSPECT -> ALIVE (a refuted suspicion) or ALIVE -> SUSPECT -> DEAD (the peer died after being suspected) — the lifetime total as `flap_count` in `JSON` plus `flaps_10m` for the flaps in the last 10 minutes, one `FLAP <id> <count> <recent>` line per member with at least one flap after the `RATEHIST` lines in `METRICS`, and `pulse_member_flap_count_total` / `pulse_member_flaps_10m` in `PROMETHEUS` — so a peer that keeps flapping is visible as a count instead of only in the log; a flap counts the same whether detected locally or learned from gossip, a suspicion alone is not a flap, a direct ALIVE -> DEAD is not one, and a member that arrives SUSPECT from gossip and is then reported ALIVE is not one either, since the cycle has to start on this node; the 10-minute count reads off a ring of the last 16 flap times, so it saturates at 16 while the lifetime count keeps growing, and a DEAD member keeps its count until GC; covered by unit tests for the counting (local and gossip-learned cycles, direct ALIVE -> DEAD, restart, window edges, ring saturation) and the exact canned lines on all three surfaces, and an integration test that kills a peer twice and checks the count climbs on all three surfaces and agrees across them, with self always at 0.~~ Done in 0.75.0.
 - ~~Flap-rate alert: when an ALIVE member's completed flap cycles in the last 10 minutes reach a configurable threshold (`--flap-rate-threshold`, 0 disables it), the node logs one `FLAPRATE <id> flaps=<n> threshold=<t>` line per flap-rate episode, records one `FLAPRATE` event on the `WATCH` stream (carrying the count as a trailing ` flaps_10m=<n>`, frozen at the crossing, persisted in `<data-dir>/events` and replayable), and reports the peer as `"flap_rate":true` in `JSON` with a `flap_rate_peers` count plus a `FLAPRATE <id> <flaps>` line in `METRICS` and a `pulse_flap_rate_peers` gauge in `PROMETHEUS` — so a peer dying and coming back over and over is visible while it is still ALIVE, before the next suspicion fires; when the count falls back below the threshold as flaps age out of the window, the node logs one `FLAPOK <id> flaps=<n> threshold=<t>` line and records one `FLAPOK` event carrying the fallen count, so the recovery is visible too instead of the flag silently clearing; the threshold is a count judged at or above, capped at 16 since the ring saturates there, only ALIVE peers count, self and a peer never flapped are never flap-rate, SUSPECT/DEAD peers are not flap-rate but keep their count, and the warning re-arms only when the count recovers below the threshold; covered by unit tests for the predicate (threshold edge, disabled, SUSPECT/DEAD not flap-rate, window ageing, table count excluding self) and an integration test that kills a peer until the FLAPRATE fires and checks the single log line and event, the flag and count while ALIVE, the counts and gauges, and the persisted file and replay — the FLAPOK recovery is not covered end to end, since it fires only when flaps age out of the 10-minute window.~~ Done in 0.76.0.
 - ~~Fix the event-log-cap GAP test race: `tests/test_watch_event_log_cap.sh` killed node 2 twice with a plain SIGTERM and assumed six events (JOINED, SUSPECTED + DEAD, REVIVED, SUSPECTED + DEAD), but a graceful kill sends a LEAVE announcement so node 1 marks the peer DEAD at once with no SUSPECTED first, and a peer-file seed gets no JOINED at all — so the test deterministically recorded only DEAD, REVIVED, DEAD, three events that never evict the 4-event ring, and passed only when a slow restart transiently added a SUSPECTED + REVIVED pair. The kills are now SIGKILL, an unclean death, so the probe timeout suspects the peer and the suspect timeout declares it dead — one SUSPECTED + DEAD per kill, five events at least, and the GAP fires every run. The same change fixes a `wait_count` bug in that test: `grep -c` prints 0 but exits 1 on no match, so `|| echo 0` appended a second 0 and broke the count test until the first match arrived.~~ Done in 0.77.0.
+- ~~FLAPOK end-to-end coverage: the flap-rate recovery was the one alert lifecycle with no live test — the `FLAPOK` fires only when flaps age out of the 10-minute window, which no short test can wait for, so `tests/test_flaprate.sh` covered the `FLAPRATE` side only and the predicate's ageing was covered at the unit level. A new `tests/test_flapok.sh` now waits the real 10 minutes: it drives a peer through kill/restart cycles until the `FLAPRATE` fires, then waits for the `FLAPOK` log line, the `WATCH` event with the fallen count frozen as `flaps_10m`, the flag clearing in `JSON`/`METRICS`/`PROMETHEUS` while the peer is still ALIVE, and the persisted events file and replay carrying the same line — about 11 minutes a run, the price of testing the real window instead of a shortened one. A pre-existing load-sensitive flake was found while verifying this: `tests/test_control.sh` assumes loopback probe RTTs stay at 0–1 ms for its `--slow-peer-rtt-ms 1` check, but under the load of a full `make test` run the mean hit 2 ms (max 11 ms) and the check failed once, then passed 3/3 on retry — the node behaved correctly, the test's assumption broke. The same verification caught a second load race in `tests/test_flaprate.sh`: its after-one-crash check read the flap count the moment the peer came back ALIVE, but a slow restart keeps landing genuine refuted-suspicion flaps for a second or two after that, so the `FLAPRATE` could fire between the check's reads and fail it even though the warning behaved correctly — it tripped twice in full runs and three times standalone under load, then passed when the machine went quiet. The check now waits for the count to settle (unchanged across a 1 s gap) and judges the warning against the settled count: below the threshold it must not have fired, at or above it must have fired exactly once. A second check in `tests/test_last_seen_watch.sh` was over-specific in the other direction: it demanded the replayed SUSPECTED for a never-started peer carry `probes_sent`/`probes_answered`, but a suspicion learned from gossip — the other node suspecting the never-started peer first — carries no probe fields at all, since this node never probed the peer itself, which is exactly what the probe-counts feature documents ("a member never probed carries no fields"). The check now accepts the SUSPECTED with or without probe counts and asserts only the missing `last_seen_ms`. The same verification caught the mirror image in `tests/test_probe_counts_watch.sh`: its replay check demanded the never-started peer's SUSPECTED carry probe counts, but a gossip-learned suspicion carries none — the same rule, the same race, the opposite over-assertion. That check now asserts the missing `last_seen_ms` in both cases and the counts (sent at least 1, answered 0) only when they are present, and the "Probe counts in the event log" section now says the sent-at-least-1 case is when this node probed the peer itself. Verifying the new test caught one more wrong assumption in the test itself: it asserted the `FLAPOK` always carries flaps=2, but two flaps can age out in one probe cycle when they completed within ~100 ms of each other — the first full run fired the `FLAPOK` with flaps=1 — so the test now reads the fallen count off the log line and checks the event, the persisted file and the replay carry that same value.~~ Done in 0.78.0.

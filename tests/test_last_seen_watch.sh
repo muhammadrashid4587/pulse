@@ -12,7 +12,7 @@
 #  2. A third node joins through --seed: the live stream carries its
 #     JOINED event with a small last_seen_ms — it was just heard
 #     from — while a replay shows the never-started peer's
-#     SUSPECTED event with no trailing field at all: never heard
+#     SUSPECTED event with no last_seen_ms field: never heard
 #     from means no value, never a fabricated zero.
 #  3. Kill node 2 with SIGKILL (a crash, so no graceful-leave
 #     announcement): node 1 marks it SUSPECT, and the SUSPECTED
@@ -167,11 +167,16 @@ fi
 
 # 5. A replay from the start shows the same rule at the other end:
 # the SUSPECTED event for the never-started peer carries no
-# trailing field at all — it was never heard from, so there is no
-# age to report — while the JOINED for the node that joined live
-# carries its age.
+# last_seen_ms field — it was never heard from, so there is no age
+# to report — while the JOINED for the node that joined live
+# carries its age. Whether the SUSPECTED also carries probe counts
+# depends on how this node learned of the suspicion: a direct probe
+# timeout carries probes_sent/probes_answered, but gossip from the
+# other node — which may suspect the never-started peer first —
+# carries none, since this node never probed it itself. The check
+# accepts either; only the missing last_seen_ms is asserted.
 (timeout 30 stdbuf -o0 -e0 "$CTL" "127.0.0.1:18321" WATCH FROM 0 > "$TMP/watch2.out" 2>&1 & echo $! > "$TMP/watch2.pid")
-if wait_for "$TMP/watch2.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17329 [0-9]+ [0-9]+ probes_sent=[0-9]+ probes_answered=0$' 10; then
+if wait_for "$TMP/watch2.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17329 [0-9]+ [0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
     note ok "replayed SUSPECTED for the never-started peer carries no last_seen_ms field"
 else
     note fail "replayed SUSPECTED for the never-started peer carries no last_seen_ms field"

@@ -27,10 +27,17 @@
 #     counts on the SUSPECTED line as the WATCH stream did, so the
 #     counts survive a restart and a replay.
 #  5. A replay from the start shows the same rule at the other end:
-#     the SUSPECTED event for the never-started peer carries probe
-#     counts with sent at least 1 and answered 0 — it was probed
-#     but never answered — and no last_seen_ms field, since it was
-#     never heard from.
+#     the SUSPECTED event for the never-started peer carries no
+#     last_seen_ms field, since it was never heard from — and probe
+#     counts with sent at least 1 and answered 0 when this node
+#     probed the peer itself before suspecting it. When the
+#     suspicion arrives by gossip first — the other node suspecting
+#     the never-started peer before this node probed it — the
+#     SUSPECTED carries no probe fields at all, since this node
+#     never probed the peer: the same rule as a member never
+#     probed, never a fabricated zero. Either outcome is correct;
+#     the check asserts the no-last_seen_ms in both cases and the
+#     counts only when they are present.
 # The watcher runs under stdbuf -o0: pulse-ctl's stdout is
 # block-buffered to a file, so without it the streamed lines would
 # sit in the buffer and the test's polling would see nothing.
@@ -180,23 +187,33 @@ else
 fi
 
 # 5. A replay from the start shows the same rule at the other end:
-# the SUSPECTED event for the never-started peer carries probe
-# counts with sent at least 1 and answered 0 — it was probed but
-# never answered — and no last_seen_ms field, since it was never
-# heard from.
+# the SUSPECTED event for the never-started peer carries no
+# last_seen_ms field, since it was never heard from. Whether it
+# also carries probe counts depends on how this node learned of
+# the suspicion: a direct probe timeout carries probes_sent at
+# least 1 with probes_answered 0 — probed but never answered —
+# while gossip from the other node, which may suspect the
+# never-started peer first, carries no probe fields at all, since
+# this node never probed the peer. Either outcome is correct; the
+# check asserts the missing last_seen_ms in both cases and the
+# counts only when they are present.
 (timeout 30 stdbuf -o0 -e0 "$CTL" "127.0.0.1:18351" WATCH FROM 0 > "$TMP/watch2.out" 2>&1 & echo $! > "$TMP/watch2.pid")
-if wait_for "$TMP/watch2.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17359 [0-9]+ [0-9]+ probes_sent=[0-9]+ probes_answered=0$' 10; then
-    note ok "replayed SUSPECTED for the never-started peer carries probe counts with 0 answered and no last_seen_ms"
+if wait_for "$TMP/watch2.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17359 [0-9]+ [0-9]+( probes_sent=[0-9]+ probes_answered=[0-9]+)?$' 10; then
+    note ok "replayed SUSPECTED for the never-started peer carries no last_seen_ms"
 else
-    note fail "replayed SUSPECTED for the never-started peer carries probe counts with 0 answered and no last_seen_ms"
+    note fail "replayed SUSPECTED for the never-started peer carries no last_seen_ms"
     grep '^EVENT' "$TMP/watch2.out" 2>/dev/null
 fi
 
 REPLAY_SENT="$(event_probes "$TMP/watch2.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17359 ' probes_sent)"
-if [ -n "$REPLAY_SENT" ] && python3 -c "exit(0 if int('$REPLAY_SENT') >= 1 else 1)" 2>/dev/null; then
-    note ok "replayed SUSPECTED for the never-started peer was probed at least once ($REPLAY_SENT sent)"
+REPLAY_ANS="$(event_probes "$TMP/watch2.out" '^EVENT [0-9]+ SUSPECTED 127\.0\.0\.1:17359 ' probes_answered)"
+if [ -z "$REPLAY_SENT" ] && [ -z "$REPLAY_ANS" ]; then
+    note ok "replayed SUSPECTED for the never-started peer carries no probe counts — the suspicion was learned from gossip before this node probed the peer"
+elif [ -n "$REPLAY_SENT" ] && [ -n "$REPLAY_ANS" ] \
+   && python3 -c "exit(0 if int('$REPLAY_SENT') >= 1 and int('$REPLAY_ANS') == 0 else 1)" 2>/dev/null; then
+    note ok "replayed SUSPECTED for the never-started peer was probed at least once ($REPLAY_SENT sent, 0 answered)"
 else
-    note fail "replayed SUSPECTED for the never-started peer was probed at least once (got '$REPLAY_SENT')"
+    note fail "replayed SUSPECTED probe counts are sane (sent '$REPLAY_SENT', answered '$REPLAY_ANS')"
 fi
 
 echo "test_probe_counts_watch: $PASS passed, $FAIL failed"
