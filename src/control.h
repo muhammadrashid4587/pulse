@@ -261,6 +261,34 @@
  *       seed — so self's line, when present, carries only join
  *       and sync; a peer never exchanged with has none; a DEAD
  *       member keeps its counts until GC.
+ *       Per-member detection latency (0.81.0): after the TRAFFIC
+ *       lines, one "DETECT <id> <last_ms> <mean_ms> <max_ms>
+ *       <samples>" line per member with at least one locally
+ *       measured suspicion — the last, mean and worst
+ *       last-direct-contact -> SUSPECT latency, and how many
+ *       suspicions the mean is over — and one "SUSPECTDEAD <id>
+ *       <last_ms> <mean_ms> <max_ms> <samples>" line per member
+ *       with at least one locally swept death — the last, mean
+ *       and worst SUSPECT -> DEAD duration, and how many deaths
+ *       the mean is over — the same values JSON reports as
+ *       "detect_ms" / "detect_mean_ms" / "detect_max_ms" /
+ *       "detect_samples" and "suspect_dead_ms" /
+ *       "suspect_dead_mean_ms" / "suspect_dead_max_ms" /
+ *       "suspect_dead_samples", and PROMETHEUS as
+ *       pulse_member_detect_ms / pulse_member_detect_mean_ms /
+ *       pulse_member_detect_max_ms / pulse_member_detect_samples
+ *       and pulse_member_suspect_dead_ms /
+ *       pulse_member_suspect_dead_mean_ms /
+ *       pulse_member_suspect_dead_max_ms /
+ *       pulse_member_suspect_dead_samples. A peer never heard
+ *       from before it was suspected has no DETECT line: it has
+ *       no heartbeat gap to measure, never a fabricated value —
+ *       though it can still carry a SUSPECTDEAD line, since the
+ *       sweep measures from when this node marked it SUSPECT; a
+ *       death learned from gossip directly adds no sample to
+ *       either, like the global latencies. Self never suspects
+ *       itself and has no line; a DEAD member keeps its values
+ *       until GC.
  *   JSON
  *       STATUS, MEMBERS and METRICS combined into one machine-readable
  *       JSON object on a single line, then END. Member phi is a number
@@ -306,7 +334,28 @@
  *       with; self's ping, ack, ping_req and gossip are 0 — it
  *       never probes or gossips with itself — but it can carry
  *       join and sync when it lists itself as a seed; a DEAD
- *       member keeps its counts until GC), and the
+ *       member keeps its counts until GC), and "detect_ms" /
+ *       "detect_mean_ms" / "detect_max_ms" / "detect_samples"
+ *       (0.81.0: the last, mean and worst locally measured
+ *       last-direct-contact -> SUSPECT latency, and how many
+ *       suspicions the mean is over — the per-member split of
+ *       the global detect_latency_ms, so a consumer can see
+ *       which peer is slow to detect; the last / mean / max are
+ *       null until the first sample lands, like rtt_ms, and the
+ *       sample count is always a number, 0 for self and for a
+ *       peer never suspected — a peer never heard from before
+ *       it was suspected has no detect sample, never a
+ *       fabricated value, since it has no heartbeat gap to
+ *       measure) and "suspect_dead_ms" /
+ *       "suspect_dead_mean_ms" / "suspect_dead_max_ms" /
+ *       "suspect_dead_samples" (0.81.0: the last, mean and worst
+ *       locally measured SUSPECT -> DEAD duration, and how many
+ *       deaths the mean is over — the per-member split of the
+ *       global suspect_to_dead_ms; null / 0 under the same rule,
+ *       and a peer never heard from can still carry a sample
+ *       here, since the sweep measures from when this node
+ *       marked it SUSPECT; a DEAD member keeps its values until
+ *       GC), and the
  *       metrics object carries "slow_peers" (how many members are
  *       slow) and "quiet_peers" (0.62.0: how many members are
  *       quiet) and "low_probe_rate_peers" (0.68.0: how many
@@ -419,7 +468,29 @@
  *       kind with a count above 0; a kind never exchanged has no
  *       series, self has series only for join and sync, when it
  *       lists itself as a seed, and a DEAD member keeps its series
- *       until GC. How long each
+ *       until GC. How long detection took for each peer rides as
+ *       "pulse_member_detect_ms" / "pulse_member_detect_mean_ms" /
+ *       "pulse_member_detect_max_ms" / "pulse_member_detect_samples"
+ *       gauges (0.81.0) — the last, mean and worst locally
+ *       measured last-direct-contact -> SUSPECT latency, and how
+ *       many suspicions the mean is over — one line per member
+ *       with at least one locally measured suspicion; a peer
+ *       never heard from before it was suspected has no series,
+ *       self never suspects itself and has none, and a DEAD
+ *       member keeps its gauges until GC. How long each peer sat
+ *       SUSPECT before the sweep declared it DEAD rides as
+ *       "pulse_member_suspect_dead_ms" /
+ *       "pulse_member_suspect_dead_mean_ms" /
+ *       "pulse_member_suspect_dead_max_ms" /
+ *       "pulse_member_suspect_dead_samples" gauges (0.81.0) —
+ *       the last, mean and worst locally measured SUSPECT ->
+ *       DEAD duration, and how many deaths the mean is over —
+ *       one line per member with at least one locally swept
+ *       death, under the same rule: a suspicion first learned
+ *       from gossip still gets a series once the sweep declares
+ *       it DEAD, a death learned from gossip directly adds no
+ *       sample, self has none, and a DEAD member keeps its
+ *       gauges until GC. How long each
  *       SUSPECT member has been suspected rides as a
  *       "pulse_member_suspect_ms" gauge (0.58.0), one line per
  *       SUSPECT member — the same value JSON reports as

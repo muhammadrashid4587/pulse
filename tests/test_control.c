@@ -137,7 +137,23 @@
  * metrics object, one "FLAPRATE <id> <flaps>" line rides after
  * the FLAP lines in METRICS for each member that counts as
  * flap-rate, and pulse_flap_rate_peers rides in PROMETHEUS; the
- * warning end to end is covered by tests/test_flaprate.sh. */
+ * warning end to end is covered by tests/test_flaprate.sh. Per-member
+ * detection latency (0.81.0) is covered here too: each member carries
+ * "detect_ms" / "detect_mean_ms" / "detect_max_ms" / "detect_samples"
+ * and "suspect_dead_ms" / "suspect_dead_mean_ms" / "suspect_dead_max_ms"
+ * / "suspect_dead_samples" in JSON (203 / 225 / 300 / 2 and 301 / 301 /
+ * 302 / 2 for the canned 17901; nulls and 0 samples for the detect half
+ * of the never-heard-from DEAD 17902, but 1000 / 1000 / 1000 / 1 for
+ * its suspect-dead half; nulls and 0 on both halves for self and the
+ * never-suspected 17903), one "DETECT <id> <last> <mean> <max>
+ * <samples>" line rides after the FLAP lines in METRICS for each member
+ * with at least one locally measured suspicion and one "SUSPECTDEAD
+ * <id> <last> <mean> <max> <samples>" line after it for each member
+ * with at least one locally swept death, and the same eight values ride
+ * in PROMETHEUS as pulse_member_detect_ms / _mean_ms / _max_ms /
+ * _samples and pulse_member_suspect_dead_ms / _mean_ms / _max_ms /
+ * _samples gauges under the same rule; the latency end to end is
+ * covered by tests/test_detect_latency.sh. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -222,6 +238,22 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         m->flap_hist_ms[1] = now - 1000;
         m->flap_hist_count = 2;
         m->flap_hist_head = 2;
+        /* Per-member detection latency (0.81.0): two locally
+         * measured suspicions — last 203, sum 450 over 2
+         * samples (mean 225), worst 300 — and two locally
+         * swept deaths — last 301, sum 602 over 2 (mean 301),
+         * worst 302. Set directly, like the canned RTT and
+         * probe counts above: the real transitions are covered
+         * in test_member.c and end to end in
+         * tests/test_detect_latency.sh. */
+        m->detect_last_ms = 203;
+        m->detect_sum_ms = 450;
+        m->detect_samples = 2;
+        m->detect_max_ms = 300;
+        m->suspect_dead_last_ms = 301;
+        m->suspect_dead_sum_ms = 602;
+        m->suspect_dead_samples = 2;
+        m->suspect_dead_max_ms = 302;
         /* Probe RTT (0.40.0): answered probes, last 3 ms, mean 2
          * over 4 samples — so PROMETHEUS has a real rtt gauge to
          * check for this peer. Worst RTT (0.64.0): 7 ms, the
@@ -313,6 +345,17 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         member_mark_dead(out, "127.0.0.1:17902", now - 4000);
         m->state = MEMBER_DEAD;
         m->last_seen_ms = 0; /* never heard from */
+        /* Per-member detection latency (0.81.0): no detect
+         * sample — the peer was never heard from, so it has no
+         * heartbeat gap to measure — but one suspect-dead
+         * sample: it sat SUSPECT for 1000 ms (now - 5000 to now
+         * - 4000) before the sweep declared it DEAD, so the
+         * DEAD peer keeps its duration until GC, like its flap
+         * count. Set directly, like the canned 17901 above. */
+        m->suspect_dead_last_ms = 1000;
+        m->suspect_dead_sum_ms = 1000;
+        m->suspect_dead_samples = 1;
+        m->suspect_dead_max_ms = 1000;
         /* No probe ever answered: rtt_ms stays -1, so PROMETHEUS
          * has no rtt gauge for this peer (0.40.0). Recent-probe
          * window (0.68.0): 5 sent / 0 answered — rate 0.00, a
@@ -1509,7 +1552,23 @@ int main(void) {
          * none. */
         const char *want_flap[2] = {"FLAP 127.0.0.1:17901 2 2",
                                     "FLAP 127.0.0.1:17902 1 1"};
+        /* Per-member detection latency in METRICS (0.81.0): the
+         * DETECT lines ride after the FLAP lines, in table order
+         * — the 17901 peer (last 203, mean 225, max 300, 2
+         * samples) — and the SUSPECTDEAD lines ride after them —
+         * the 17901 peer (last 301, mean 301, max 302, 2
+         * samples) and the DEAD 17902 (1000 / 1000 / 1000 / 1,
+         * kept until GC). The never-suspected 17903 and self
+         * have no line of either kind, and the never-heard-from
+         * 17902 has no DETECT line: it has no heartbeat gap to
+         * measure. */
+        const char *want_detect[1] = {
+            "DETECT 127.0.0.1:17901 203 225 300 2"};
+        const char *want_suspectdead[2] = {
+            "SUSPECTDEAD 127.0.0.1:17901 301 301 302 2",
+            "SUSPECTDEAD 127.0.0.1:17902 1000 1000 1000 1"};
         int nseen = 0, nrtt = 0, nprobes = 0, nratehist = 0, nflap = 0;
+        int ndetect = 0, nsuspectdead = 0;
         char *save = NULL;
         char *line = strtok_r(reply + sizeof metrics_line - 1, "\n",
                               &save);
@@ -1533,11 +1592,18 @@ int main(void) {
             } else if (nratehist < 3) {
                 CHECK(strcmp(line, want_ratehist[nratehist]) == 0);
                 nratehist++;
-            } else {
-                CHECK(nflap < 2);
-                if (nflap < 2)
-                    CHECK(strcmp(line, want_flap[nflap]) == 0);
+            } else if (nflap < 2) {
+                CHECK(strcmp(line, want_flap[nflap]) == 0);
                 nflap++;
+            } else if (ndetect < 1) {
+                CHECK(strcmp(line, want_detect[ndetect]) == 0);
+                ndetect++;
+            } else {
+                CHECK(nsuspectdead < 2);
+                if (nsuspectdead < 2)
+                    CHECK(strcmp(line,
+                                 want_suspectdead[nsuspectdead]) == 0);
+                nsuspectdead++;
             }
             line = strtok_r(NULL, "\n", &save);
         }
@@ -1546,6 +1612,8 @@ int main(void) {
         CHECK(nprobes == 2);
         CHECK(nratehist == 3);
         CHECK(nflap == 2);
+        CHECK(ndetect == 1);
+        CHECK(nsuspectdead == 2);
         CHECK(line != NULL && strcmp(line, "END") == 0);
     }
 
@@ -1729,6 +1797,80 @@ int main(void) {
         CHECK(peer != NULL && flaps != NULL &&
               (next_id == NULL || flaps < next_id));
     }
+    /* Per-member detection latency in JSON (0.81.0): each member
+     * carries "detect_ms" / "detect_mean_ms" / "detect_max_ms" /
+     * "detect_samples" and "suspect_dead_ms" /
+     * "suspect_dead_mean_ms" / "suspect_dead_max_ms" /
+     * "suspect_dead_samples" — the last, mean and worst locally
+     * measured last-contact -> SUSPECT latency and SUSPECT ->
+     * DEAD duration, and how many samples each mean is over:
+     * 203 / 225 / 300 / 2 and 301 / 301 / 302 / 2 for the canned
+     * 17901; the DEAD 17902 carries nulls and 0 samples for the
+     * detect half — it was never heard from, so it has no
+     * heartbeat gap to measure — but 1000 / 1000 / 1000 / 1 for
+     * the suspect-dead half, kept until GC; the never-suspected
+     * 17903 and self carry nulls and 0 samples on both halves,
+     * each checked inside its own member object. */
+    {
+        const char *peer = strstr(reply, "\"id\":\"127.0.0.1:17901\"");
+        const char *detect =
+            peer ? strstr(peer,
+                          "\"detect_ms\":203,\"detect_mean_ms\":225,"
+                          "\"detect_max_ms\":300,\"detect_samples\":2,"
+                          "\"suspect_dead_ms\":301,"
+                          "\"suspect_dead_mean_ms\":301,"
+                          "\"suspect_dead_max_ms\":302,"
+                          "\"suspect_dead_samples\":2")
+                 : NULL;
+        const char *next_id =
+            peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && detect != NULL &&
+              (next_id == NULL || detect < next_id));
+        peer = strstr(reply, "\"id\":\"127.0.0.1:17902\"");
+        detect = peer ? strstr(peer,
+                               "\"detect_ms\":null,"
+                               "\"detect_mean_ms\":null,"
+                               "\"detect_max_ms\":null,"
+                               "\"detect_samples\":0,"
+                               "\"suspect_dead_ms\":1000,"
+                               "\"suspect_dead_mean_ms\":1000,"
+                               "\"suspect_dead_max_ms\":1000,"
+                               "\"suspect_dead_samples\":1")
+                      : NULL;
+        next_id = peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && detect != NULL &&
+              (next_id == NULL || detect < next_id));
+        peer = strstr(reply, "\"id\":\"127.0.0.1:17903\"");
+        detect = peer ? strstr(peer,
+                               "\"detect_ms\":null,"
+                               "\"detect_mean_ms\":null,"
+                               "\"detect_max_ms\":null,"
+                               "\"detect_samples\":0,"
+                               "\"suspect_dead_ms\":null,"
+                               "\"suspect_dead_mean_ms\":null,"
+                               "\"suspect_dead_max_ms\":null,"
+                               "\"suspect_dead_samples\":0")
+                      : NULL;
+        next_id = peer ? strstr(peer + 1, "\"id\":") : NULL;
+        CHECK(peer != NULL && detect != NULL &&
+              (next_id == NULL || detect < next_id));
+        /* Self is the first member, so anchor at the members
+         * array like the probe-counts check above does. */
+        peer = strstr(reply, "\"members\":[{\"id\":\"127.0.0.1:17999\"");
+        detect = peer ? strstr(peer,
+                               "\"detect_ms\":null,"
+                               "\"detect_mean_ms\":null,"
+                               "\"detect_max_ms\":null,"
+                               "\"detect_samples\":0,"
+                               "\"suspect_dead_ms\":null,"
+                               "\"suspect_dead_mean_ms\":null,"
+                               "\"suspect_dead_max_ms\":null,"
+                               "\"suspect_dead_samples\":0")
+                      : NULL;
+        next_id = peer ? strstr(peer, "\"id\":\"127.0.0.1:17901\"") : NULL;
+        CHECK(peer != NULL && detect != NULL &&
+              (next_id == NULL || detect < next_id));
+    }
     /* Low-probe-rate warning (0.68.0): with the threshold hook
      * at 0.5, the canned 17903 (window 5 sent / 1 answered,
      * rate 0.20) counts as low, the canned 17901 (5 / 4, rate
@@ -1775,6 +1917,29 @@ int main(void) {
         CHECK(strstr(reply, "FLAP 127.0.0.1:17903") == NULL);
         CHECK(strstr(reply, "FLAP 127.0.0.1:17999") == NULL);
         CHECK(flap != NULL && rhist != NULL && flap > rhist);
+        /* Per-member detection latency in METRICS (0.81.0): one
+         * "DETECT <id> <last> <mean> <max> <samples>" line per
+         * member with at least one locally measured suspicion,
+         * after the FLAP lines — the canned 17901 (203 / 225 /
+         * 300 / 2) — and one "SUSPECTDEAD <id> <last> <mean>
+         * <max> <samples>" line per member with at least one
+         * locally swept death, after the DETECT lines — the
+         * canned 17901 (301 / 301 / 302 / 2) and the DEAD 17902
+         * (1000 / 1000 / 1000 / 1). The never-suspected 17903
+         * and self have no line of either kind, and the
+         * never-heard-from 17902 has no DETECT line. */
+        const char *detect = strstr(reply, "DETECT 127.0.0.1:17901 203 225 300 2\n");
+        CHECK(detect != NULL);
+        CHECK(strstr(reply, "DETECT 127.0.0.1:17902") == NULL);
+        CHECK(strstr(reply, "DETECT 127.0.0.1:17903") == NULL);
+        CHECK(strstr(reply, "DETECT 127.0.0.1:17999") == NULL);
+        CHECK(detect != NULL && flap != NULL && detect > flap);
+        const char *sdead = strstr(reply, "SUSPECTDEAD 127.0.0.1:17901 301 301 302 2\n");
+        CHECK(sdead != NULL);
+        CHECK(strstr(reply, "SUSPECTDEAD 127.0.0.1:17902 1000 1000 1000 1\n") != NULL);
+        CHECK(strstr(reply, "SUSPECTDEAD 127.0.0.1:17903") == NULL);
+        CHECK(strstr(reply, "SUSPECTDEAD 127.0.0.1:17999") == NULL);
+        CHECK(sdead != NULL && detect != NULL && sdead > detect);
     }
     CHECK(send_cmd(18991, "JSON\n", reply, sizeof reply) > 0);
     CHECK(strstr(reply, "\"low_probe_rate_peers\":1") != NULL);
@@ -1955,11 +2120,13 @@ int main(void) {
                  "\"seed_rejoin_backoff_ms\":{\"127.0.0.1:17101\":"
                  "10000,\"127.0.0.1:17103\":0}") != NULL);
     {
-        /* 16 KB, not 8 KB: the reply grows a family at a time
+        /* 32 KB, not 16 KB: the reply grows a family at a time
          * (0.55.0's pulse_seed_last_rejoin_ms pushed it past 8 KB
          * with the canned table), and a truncated reply drops
-         * the peer-file gauges at the end. */
-        char preply[16384];
+         * the peer-file gauges at the end. The eight per-member
+         * detection-latency families (0.81.0) pushed it past
+         * 16 KB the same way. */
+        char preply[32768];
         CHECK(send_cmd(18991, "PROMETHEUS\n", preply, sizeof preply) > 0);
         /* HELP/TYPE pairs and the value lines for the counters. */
         CHECK(strstr(preply, "# HELP pulse_suspected_total ") != NULL);
@@ -2182,6 +2349,48 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_flaps_10m{member=\"127.0.0.1:17902\"} 1\n") != NULL);
         CHECK(strstr(preply, "pulse_member_flaps_10m{member=\"127.0.0.1:17903\"}") == NULL);
         CHECK(strstr(preply, "pulse_member_flaps_10m{member=\"127.0.0.1:17999\"}") == NULL);
+        /* Per-member detection latency in PROMETHEUS (0.81.0):
+         * the last, mean and worst locally measured
+         * last-contact -> SUSPECT latency ride as gauges, one
+         * labelled sample per member with at least one locally
+         * measured suspicion — the canned 17901 (203 / 225 /
+         * 300, 2 samples) — while the never-heard-from 17902,
+         * the never-suspected 17903 and self have no series at
+         * all; and the last, mean and worst SUSPECT -> DEAD
+         * duration ride the same way, one sample per member
+         * with at least one locally swept death — the canned
+         * 17901 (301 / 301 / 302, 2 samples) and the DEAD 17902
+         * (1000 / 1000 / 1000, 1 sample, kept until GC) — while
+         * the never-declared-DEAD 17903 and self have none. */
+        CHECK(strstr(preply, "# TYPE pulse_member_detect_ms gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_detect_ms{member=\"127.0.0.1:17901\"} 203\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_detect_ms{member=\"127.0.0.1:17902\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_detect_ms{member=\"127.0.0.1:17903\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_detect_ms{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_detect_mean_ms gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_detect_mean_ms{member=\"127.0.0.1:17901\"} 225\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_detect_mean_ms{member=\"127.0.0.1:17902\"}") == NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_detect_max_ms gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_detect_max_ms{member=\"127.0.0.1:17901\"} 300\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_detect_max_ms{member=\"127.0.0.1:17902\"}") == NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_detect_samples gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_detect_samples{member=\"127.0.0.1:17901\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_detect_samples{member=\"127.0.0.1:17902\"}") == NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_suspect_dead_ms gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_ms{member=\"127.0.0.1:17901\"} 301\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_ms{member=\"127.0.0.1:17902\"} 1000\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_ms{member=\"127.0.0.1:17903\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_ms{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_suspect_dead_mean_ms gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_mean_ms{member=\"127.0.0.1:17901\"} 301\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_mean_ms{member=\"127.0.0.1:17902\"} 1000\n") != NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_suspect_dead_max_ms gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_max_ms{member=\"127.0.0.1:17901\"} 302\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_max_ms{member=\"127.0.0.1:17902\"} 1000\n") != NULL);
+        CHECK(strstr(preply, "# TYPE pulse_member_suspect_dead_samples gauge\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_samples{member=\"127.0.0.1:17901\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_samples{member=\"127.0.0.1:17902\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_suspect_dead_samples{member=\"127.0.0.1:17903\"}") == NULL);
         /* Time since last contact per member (0.59.0): one
          * pulse_member_last_seen_ms gauge sample per member heard
          * from — the seed peer and the peer-file peer, both heard

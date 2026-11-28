@@ -167,6 +167,43 @@ typedef struct {
      * counts. */
     int64_t traffic_sent[PULSE_TRAFFIC_KINDS];
     int64_t traffic_recv[PULSE_TRAFFIC_KINDS];
+    /* Per-member detection latency (0.81.0): how long detection
+     * took for this peer, measured locally — the last, mean and
+     * worst last-direct-contact -> SUSPECT latency (detect_*)
+     * and SUSPECT -> DEAD duration (suspect_dead_*), with how
+     * many samples each mean is over. The two halves are the
+     * per-member split of the global detect_latency_ms and
+     * suspect_to_dead_ms: detect is the time from the peer's
+     * last direct contact to the suspicion this node raised
+     * itself, suspect-dead is how long the peer then sat SUSPECT
+     * before the sweep declared it DEAD. detect_* only ever
+     * moves for a peer this node actually heard from — a peer
+     * never heard from has no heartbeat gap to measure, so it
+     * carries no detect sample, never a fabricated one, even
+     * though the global detect_latency_ms counts that case with
+     * the node's uptime as the latency. suspect_dead_* moves
+     * whenever the local sweep declares the peer DEAD, including
+     * a suspicion first learned from gossip: the sweep measures
+     * from when this node marked it SUSPECT, the same rule the
+     * global suspect_to_dead_ms uses. A suspicion or death
+     * learned from gossip directly (the merge setting DEAD at
+     * once) adds no sample to either, like the global latencies.
+     * detect_last_ms / detect_max_ms and suspect_dead_last_ms /
+     * suspect_dead_max_ms are -1 until the first sample lands,
+     * like rtt_ms / rtt_max_ms; the sums and sample counts start
+     * at 0. A DEAD member keeps its values until GC, like its
+     * RTT and probe counts, so how long detection took stays
+     * visible after the peer is gone. Local measurement only —
+     * never gossiped, never persisted, and not a table-version
+     * change, like the RTT itself. */
+    int64_t detect_last_ms;
+    int64_t detect_sum_ms;
+    int64_t detect_samples;
+    int64_t detect_max_ms;
+    int64_t suspect_dead_last_ms;
+    int64_t suspect_dead_sum_ms;
+    int64_t suspect_dead_samples;
+    int64_t suspect_dead_max_ms;
     /* Recent-probe window (0.68.0): the outcomes of the last
      * PULSE_PROBE_WINDOW direct probes to this peer — the recent
      * probe success rate, answered / sent over the window,
@@ -460,6 +497,43 @@ void member_note_traffic(member_table_t *t, const char *id, int kind,
  * member never exchanged with. The control plane uses it to
  * decide whether the member gets a TRAFFIC line at all. */
 int64_t member_traffic_total(const member_t *m);
+/* Record one locally measured detection latency for a peer
+ * (0.81.0): the ms from its last direct contact to the
+ * suspicion this node raised itself — the per-member split of
+ * the global detect_latency_ms sample. Unknown ids and negative
+ * latencies are ignored, and the caller only passes a latency
+ * when the peer was actually heard from (last_seen_ms > 0): a
+ * peer never heard from has no heartbeat gap to measure, so it
+ * gets no sample here, even though the global latency counts
+ * that case. Updates the last, the running sum and the worst,
+ * like member_note_rtt does for probe RTT. Does not bump the
+ * table version: detection latency is local measurement, not
+ * gossip content. */
+void member_note_detect(member_table_t *t, const char *id,
+                        int64_t latency_ms);
+/* Record one locally measured SUSPECT -> DEAD duration for a
+ * peer (0.81.0): the ms the peer sat SUSPECT before the local
+ * sweep declared it DEAD — the per-member split of the global
+ * suspect_to_dead_ms sample. Unknown ids and negative durations
+ * are ignored. The caller passes the duration whenever the sweep
+ * marks the peer DEAD, including a suspicion first learned from
+ * gossip: the sweep measures from when this node marked it
+ * SUSPECT. A death learned from gossip directly adds no sample,
+ * like the global latency. Updates the last, the running sum
+ * and the worst, like member_note_detect. Does not bump the
+ * table version. */
+void member_note_suspect_dead(member_table_t *t, const char *id,
+                              int64_t duration_ms);
+/* Mean locally measured detection latency in ms over all
+ * suspicions this node raised itself for the peer, or -1 when
+ * none was ever measured — a peer never suspected, or never
+ * heard from before it was suspected, has no mean to report. */
+int64_t member_detect_mean_ms(const member_t *m);
+/* Mean locally measured SUSPECT -> DEAD duration in ms over all
+ * deaths the local sweep declared for the peer, or -1 when none
+ * was ever measured — a peer never declared DEAD by the sweep
+ * has no mean to report. */
+int64_t member_suspect_dead_mean_ms(const member_t *m);
 /* The recent probe success rate (0.68.0): answered / sent over
  * the last PULSE_PROBE_WINDOW direct probes to this peer, or -1
  * when no probe to the peer is in the window yet — an absent

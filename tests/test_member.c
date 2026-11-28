@@ -348,6 +348,81 @@ int main(void) {
     CHECK(member_traffic_total(m2) == 7);
     CHECK(member_traffic_total(NULL) == 0);
 
+    /* Per-member detection latency (0.81.0): the last, mean and
+     * worst locally measured last-contact -> SUSPECT latency
+     * (detect_*) and SUSPECT -> DEAD duration (suspect_dead_*),
+     * with how many samples each mean is over. Both start
+     * unmeasured — last/max -1, sums and counts 0, means -1 —
+     * and each note moves exactly its own half: the last is the
+     * newest sample, the mean is the sum over the samples, the
+     * max only ever grows, never falls on a faster sample. A
+     * negative sample is ignored, an unknown id is ignored, and
+     * recording is not a gossip-visible change. */
+    CHECK(m2->detect_last_ms == -1);
+    CHECK(m2->detect_sum_ms == 0);
+    CHECK(m2->detect_samples == 0);
+    CHECK(m2->detect_max_ms == -1);
+    CHECK(member_detect_mean_ms(m2) == -1);
+    CHECK(m2->suspect_dead_last_ms == -1);
+    CHECK(m2->suspect_dead_sum_ms == 0);
+    CHECK(m2->suspect_dead_samples == 0);
+    CHECK(m2->suspect_dead_max_ms == -1);
+    CHECK(member_suspect_dead_mean_ms(m2) == -1);
+    CHECK(member_detect_mean_ms(NULL) == -1);
+    CHECK(member_suspect_dead_mean_ms(NULL) == -1);
+    member_note_detect(&t, "127.0.0.1:17102", 203);
+    CHECK(m2->detect_last_ms == 203);
+    CHECK(m2->detect_sum_ms == 203);
+    CHECK(m2->detect_samples == 1);
+    CHECK(m2->detect_max_ms == 203);
+    CHECK(member_detect_mean_ms(m2) == 203);
+    member_note_detect(&t, "127.0.0.1:17102", 297);
+    CHECK(m2->detect_last_ms == 297);
+    CHECK(m2->detect_sum_ms == 500);
+    CHECK(m2->detect_samples == 2);
+    CHECK(m2->detect_max_ms == 297);
+    CHECK(member_detect_mean_ms(m2) == 250);
+    /* A faster sample moves the last and the mean but never the
+     * max: the worst detection stays visible. */
+    member_note_detect(&t, "127.0.0.1:17102", 150);
+    CHECK(m2->detect_last_ms == 150);
+    CHECK(m2->detect_sum_ms == 650);
+    CHECK(m2->detect_samples == 3);
+    CHECK(m2->detect_max_ms == 297);
+    CHECK(member_detect_mean_ms(m2) == 216);
+    member_note_detect(&t, "127.0.0.1:17102", -5); /* ignored */
+    member_note_detect(&t, "127.0.0.1:17999", 100); /* unknown: ignored */
+    CHECK(m2->detect_samples == 3);
+    CHECK(t.version == v_before); /* latencies are local, not gossip */
+    /* The other half is independent: suspect-dead samples move
+     * only suspect_dead_*, never detect_*. */
+    member_note_suspect_dead(&t, "127.0.0.1:17102", 301);
+    CHECK(m2->suspect_dead_last_ms == 301);
+    CHECK(m2->suspect_dead_sum_ms == 301);
+    CHECK(m2->suspect_dead_samples == 1);
+    CHECK(m2->suspect_dead_max_ms == 301);
+    CHECK(member_suspect_dead_mean_ms(m2) == 301);
+    CHECK(m2->detect_samples == 3);
+    member_note_suspect_dead(&t, "127.0.0.1:17102", 305);
+    CHECK(m2->suspect_dead_last_ms == 305);
+    CHECK(m2->suspect_dead_sum_ms == 606);
+    CHECK(m2->suspect_dead_samples == 2);
+    CHECK(m2->suspect_dead_max_ms == 305);
+    CHECK(member_suspect_dead_mean_ms(m2) == 303);
+    member_note_suspect_dead(&t, "127.0.0.1:17102", 300);
+    CHECK(m2->suspect_dead_last_ms == 300);
+    CHECK(m2->suspect_dead_max_ms == 305); /* max never falls */
+    CHECK(member_suspect_dead_mean_ms(m2) == 302);
+    member_note_suspect_dead(&t, "127.0.0.1:17102", -1); /* ignored */
+    member_note_suspect_dead(&t, "127.0.0.1:17999", 300);
+    CHECK(m2->suspect_dead_samples == 3);
+    CHECK(t.version == v_before);
+    /* A peer with no samples stays unmeasured on both halves. */
+    CHECK(m3->detect_samples == 0);
+    CHECK(m3->suspect_dead_samples == 0);
+    CHECK(member_detect_mean_ms(m3) == -1);
+    CHECK(member_suspect_dead_mean_ms(m3) == -1);
+
     /* suspicion age (0.58.0): -1 unless the member is SUSPECT, then
      * now minus when it went SUSPECT; the age resets when the member
      * revives, and a DEAD member reports -1 — its suspicion is over. */

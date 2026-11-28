@@ -1794,6 +1794,16 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
             changed_inc[n_changed] = m ? m->incarnation : 0;
             n_changed++;
             metrics_note_suspect(&g_metrics, latency);
+            /* Per-member detection latency (0.81.0): the same
+             * sample, split per peer — but only for a peer this
+             * node actually heard from. A peer never heard from
+             * has last_seen_ms 0, so its "latency" would be the
+             * node's uptime, not a heartbeat gap; the global
+             * metric counts that case, the per-member value
+             * carries no sample instead, never a fabricated
+             * one. */
+            if (m && m->last_seen_ms > 0)
+                member_note_detect(&g_table, suspect_ids[i], latency);
         }
     }
     /* 3. Sweep stale suspects to dead. */
@@ -1819,6 +1829,17 @@ static void probe_cycle(int cycle, uint32_t *jitter_state) {
             int64_t flaps_before = m->flap_count;
             if (member_mark_dead(&g_table, m->id, now)) {
                 metrics_note_dead(&g_metrics, duration);
+                /* Per-member detection latency (0.81.0): the
+                 * SUSPECT -> DEAD half of the same sample, split
+                 * per peer — measured from when this node marked
+                 * the peer SUSPECT, so a suspicion first learned
+                 * from gossip still gets a sample here, the same
+                 * rule the global suspect_to_dead_ms uses. A
+                 * death learned from gossip directly (the merge
+                 * setting DEAD at once) never reaches this sweep
+                 * as SUSPECT, so it adds no sample, like the
+                 * global latency. */
+                member_note_suspect_dead(&g_table, m->id, duration);
                 if (n_dead < 8) {
                     snprintf(newly_dead[n_dead], PULSE_ID_LEN, "%s", m->id);
                     newly_dead_inc[n_dead] = m->incarnation;

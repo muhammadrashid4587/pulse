@@ -855,6 +855,68 @@ static void handle_metrics(int fd, const control_hooks_t *hooks) {
         }
         if (send_all(fd, trafficline) != 0) return;
     }
+    /* Per-member detection latency (0.81.0): how long detection
+     * took for each peer — the last, mean and worst
+     * last-direct-contact -> SUSPECT latency, and how many
+     * samples the mean is over — as one "DETECT <id> <last_ms>
+     * <mean_ms> <max_ms> <samples>" line per member with at
+     * least one locally measured suspicion, after the TRAFFIC
+     * lines, under the same rule as JSON's "detect_ms" /
+     * "detect_mean_ms" / "detect_max_ms" and PROMETHEUS's
+     * pulse_member_detect_ms / pulse_member_detect_mean_ms /
+     * pulse_member_detect_max_ms gauges — so a text-protocol
+     * consumer can see which peer is slow to detect instead of
+     * only the node-wide mean. A peer never heard from before
+     * it was suspected has no line: it has no heartbeat gap to
+     * measure, never a fabricated value. Self never suspects
+     * itself and so has no line, and a DEAD member keeps its
+     * values until GC, like its RTT, so how long detection took
+     * stays visible after the peer is gone. */
+    for (int i = 0; i < t.count; i++) {
+        const member_t *mem = &t.members[i];
+        if (mem->detect_samples == 0) continue;
+        char detectline[128];
+        snprintf(detectline, sizeof detectline,
+                 "\nDETECT %s %lld %lld %lld %lld",
+                 mem->id, (long long)mem->detect_last_ms,
+                 (long long)member_detect_mean_ms(mem),
+                 (long long)mem->detect_max_ms,
+                 (long long)mem->detect_samples);
+        if (send_all(fd, detectline) != 0) return;
+    }
+    /* Per-member SUSPECT -> DEAD duration (0.81.0): how long
+     * each peer sat SUSPECT before the sweep declared it DEAD —
+     * the last, mean and worst duration, and how many samples
+     * the mean is over — as one "SUSPECTDEAD <id> <last_ms>
+     * <mean_ms> <max_ms> <samples>" line per member with at
+     * least one locally swept death, after the DETECT lines,
+     * under the same rule as JSON's "suspect_dead_ms" /
+     * "suspect_dead_mean_ms" / "suspect_dead_max_ms" and
+     * PROMETHEUS's pulse_member_suspect_dead_ms /
+     * pulse_member_suspect_dead_mean_ms /
+     * pulse_member_suspect_dead_max_ms gauges — so a
+     * text-protocol consumer can see whether a peer sat out the
+     * whole suspect timeout or was declared dead faster. The
+     * duration is measured from when this node marked the peer
+     * SUSPECT, so a suspicion first learned from gossip still
+     * gets a line once the sweep declares it DEAD; a death
+     * learned from gossip directly adds no sample, like the
+     * global suspect_to_dead_ms. Self never suspects itself and
+     * so has no line, and a DEAD member keeps its values until
+     * GC, like its detect latency, so the duration stays visible
+     * after the peer is gone. */
+    for (int i = 0; i < t.count; i++) {
+        const member_t *mem = &t.members[i];
+        if (mem->suspect_dead_samples == 0) continue;
+        char sdline[128];
+        snprintf(sdline, sizeof sdline,
+                 "\nSUSPECTDEAD %s %lld %lld %lld %lld",
+                 mem->id, (long long)mem->suspect_dead_last_ms,
+                 (long long)member_suspect_dead_mean_ms(mem),
+                 (long long)mem->suspect_dead_max_ms,
+                 (long long)mem->suspect_dead_samples);
+        if (send_all(fd, sdline) != 0) return;
+    }
     send_all(fd, "\nEND\n");
 }
 
@@ -1116,6 +1178,55 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
             if (tw < 0 || (size_t)tw >= sizeof trafficbuf - tused)
                 snprintf(trafficbuf, sizeof trafficbuf, "{}");
         }
+        /* Per-member detection latency (0.81.0): how long
+         * detection took for this peer — "detect_ms" is the last
+         * locally measured last-direct-contact -> SUSPECT
+         * latency, "detect_mean_ms" / "detect_max_ms" the mean /
+         * worst over "detect_samples" suspicions this node raised
+         * itself, and "suspect_dead_ms" / "suspect_dead_mean_ms"
+         * / "suspect_dead_max_ms" / "suspect_dead_samples" the
+         * same for the SUSPECT -> DEAD duration the local sweep
+         * measured — the per-member split of the global
+         * detect_latency_ms / suspect_to_dead_ms, so a consumer
+         * can see which peer is slow to detect instead of only
+         * the node-wide mean. The last / mean / max are null
+         * until the first sample lands, like "rtt_ms" /
+         * "rtt_mean_ms" / "rtt_max_ms"; the sample counts are
+         * always numbers, never null: 0 for self (it never
+         * suspects itself) and for a peer never suspected or
+         * never declared DEAD by the sweep. A peer never heard
+         * from before it was suspected has no detect sample —
+         * it has no heartbeat gap to measure, never a fabricated
+         * value — but it can still carry a suspect-dead sample,
+         * since the sweep measures from when this node marked
+         * it SUSPECT. A DEAD member keeps its values until GC,
+         * like its RTT and probe counts. */
+        char detectbuf[32], detectmeanbuf[32], detectmaxbuf[32];
+        if (mem->detect_samples == 0) {
+            snprintf(detectbuf, sizeof detectbuf, "null");
+            snprintf(detectmeanbuf, sizeof detectmeanbuf, "null");
+            snprintf(detectmaxbuf, sizeof detectmaxbuf, "null");
+        } else {
+            snprintf(detectbuf, sizeof detectbuf, "%lld",
+                     (long long)mem->detect_last_ms);
+            snprintf(detectmeanbuf, sizeof detectmeanbuf, "%lld",
+                     (long long)member_detect_mean_ms(mem));
+            snprintf(detectmaxbuf, sizeof detectmaxbuf, "%lld",
+                     (long long)mem->detect_max_ms);
+        }
+        char sdeadbuf[32], sdeadmeanbuf[32], sdeadmaxbuf[32];
+        if (mem->suspect_dead_samples == 0) {
+            snprintf(sdeadbuf, sizeof sdeadbuf, "null");
+            snprintf(sdeadmeanbuf, sizeof sdeadmeanbuf, "null");
+            snprintf(sdeadmaxbuf, sizeof sdeadmaxbuf, "null");
+        } else {
+            snprintf(sdeadbuf, sizeof sdeadbuf, "%lld",
+                     (long long)mem->suspect_dead_last_ms);
+            snprintf(sdeadmeanbuf, sizeof sdeadmeanbuf, "%lld",
+                     (long long)member_suspect_dead_mean_ms(mem));
+            snprintf(sdeadmaxbuf, sizeof sdeadmaxbuf, "%lld",
+                     (long long)mem->suspect_dead_max_ms);
+        }
         w = snprintf(buf + used, sizeof buf - used,
                      "%s{\"id\":\"%s\",\"incarnation\":%u,\"state\":\"%s\","
                      "\"phi\":%s,\"phi_history\":%s,\"meta\":%s,\"rtt_ms\":%s,"
@@ -1126,7 +1237,12 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                      "\"probes_answered\":%lld,\"low_probe_rate\":%s,"
                      "\"probe_rate\":%s,\"probe_rate_history\":%s,"
                      "\"flap_count\":%lld,\"flaps_10m\":%d,"
-                     "\"flap_rate\":%s,\"traffic\":%s}",
+                     "\"flap_rate\":%s,\"traffic\":%s,"
+                     "\"detect_ms\":%s,\"detect_mean_ms\":%s,"
+                     "\"detect_max_ms\":%s,\"detect_samples\":%lld,"
+                     "\"suspect_dead_ms\":%s,\"suspect_dead_mean_ms\":%s,"
+                     "\"suspect_dead_max_ms\":%s,"
+                     "\"suspect_dead_samples\":%lld}",
                      i == 0 ? "" : ",", mem->id, mem->incarnation,
                      member_state_name(mem->state), phibuf, histbuf, metajson,
                      rttbuf, rttmeanbuf, rttmaxbuf,
@@ -1156,7 +1272,11 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
                                           now))
                          ? "true"
                          : "false",
-                     trafficbuf);
+                     trafficbuf,
+                     detectbuf, detectmeanbuf, detectmaxbuf,
+                     (long long)mem->detect_samples,
+                     sdeadbuf, sdeadmeanbuf, sdeadmaxbuf,
+                     (long long)mem->suspect_dead_samples);
         if (w < 0 || (size_t)w >= sizeof buf - used) return;
         used += (size_t)w;
     }
@@ -1909,6 +2029,127 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
                 t.members[i].id, pulse_traffic_kind_name(k),
                 (long long)t.members[i].traffic_recv[k]) == 0;
         }
+    }
+    /* Per-member detection latency (0.81.0): how long detection
+     * took for each peer — the last, mean and worst
+     * last-direct-contact -> SUSPECT latency and how many
+     * suspicions the mean is over — as gauges a scraper can
+     * alert on, one line per member with at least one locally
+     * measured suspicion, under the same rule as JSON's
+     * "detect_ms" / "detect_mean_ms" / "detect_max_ms" /
+     * "detect_samples" and METRICS's DETECT line. The mean
+     * cannot hide one slow detection among fast ones; the max
+     * cannot. A peer never heard from before it was suspected
+     * has no sample — it has no heartbeat gap to measure, never
+     * a fabricated value — self never suspects itself and has
+     * none either, and a DEAD member keeps its gauges until GC,
+     * like its RTT gauges, so the latency that killed it stays
+     * visible after it is gone. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_detect_ms Last locally measured "
+        "detection latency in ms, per member — last direct "
+        "contact to SUSPECT.\n"
+        "# TYPE pulse_member_detect_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].detect_samples == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_detect_ms{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)t.members[i].detect_last_ms) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_detect_mean_ms Mean locally measured "
+        "detection latency in ms, per member.\n"
+        "# TYPE pulse_member_detect_mean_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].detect_samples == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_detect_mean_ms{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)member_detect_mean_ms(&t.members[i])) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_detect_max_ms Worst locally measured "
+        "detection latency in ms, per member.\n"
+        "# TYPE pulse_member_detect_max_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].detect_samples == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_detect_max_ms{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)t.members[i].detect_max_ms) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_detect_samples Locally measured "
+        "detection latencies per member — how many suspicions "
+        "the mean is over.\n"
+        "# TYPE pulse_member_detect_samples gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].detect_samples == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_detect_samples{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)t.members[i].detect_samples) == 0;
+    }
+    /* Per-member SUSPECT -> DEAD duration (0.81.0): how long
+     * each peer sat SUSPECT before the sweep declared it DEAD —
+     * the last, mean and worst duration and how many deaths the
+     * mean is over — as gauges a scraper can alert on, one line
+     * per member with at least one locally swept death, under
+     * the same rule as JSON's "suspect_dead_ms" /
+     * "suspect_dead_mean_ms" / "suspect_dead_max_ms" /
+     * "suspect_dead_samples" and METRICS's SUSPECTDEAD line.
+     * The duration is measured from when this node marked the
+     * peer SUSPECT, so a suspicion first learned from gossip
+     * still gets a gauge once the sweep declares it DEAD; a
+     * death learned from gossip directly adds no sample. Self
+     * never suspects itself and has none, and a DEAD member
+     * keeps its gauges until GC, like its detect gauges, so the
+     * duration stays visible after the peer is gone. */
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_suspect_dead_ms Last locally "
+        "measured SUSPECT to DEAD duration in ms, per member.\n"
+        "# TYPE pulse_member_suspect_dead_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].suspect_dead_samples == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_suspect_dead_ms{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)t.members[i].suspect_dead_last_ms) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_suspect_dead_mean_ms Mean locally "
+        "measured SUSPECT to DEAD duration in ms, per member.\n"
+        "# TYPE pulse_member_suspect_dead_mean_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].suspect_dead_samples == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_suspect_dead_mean_ms{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)member_suspect_dead_mean_ms(&t.members[i])) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_suspect_dead_max_ms Worst locally "
+        "measured SUSPECT to DEAD duration in ms, per member.\n"
+        "# TYPE pulse_member_suspect_dead_max_ms gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].suspect_dead_samples == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_suspect_dead_max_ms{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)t.members[i].suspect_dead_max_ms) == 0;
+    }
+    ok &= prom_add(buf, sizeof buf, &used,
+        "# HELP pulse_member_suspect_dead_samples Locally "
+        "measured SUSPECT to DEAD durations per member — how "
+        "many deaths the mean is over.\n"
+        "# TYPE pulse_member_suspect_dead_samples gauge\n") == 0;
+    for (int i = 0; i < t.count; i++) {
+        if (t.members[i].suspect_dead_samples == 0) continue;
+        ok &= prom_add(buf, sizeof buf, &used,
+            "pulse_member_suspect_dead_samples{member=\"%s\"} %lld\n",
+            t.members[i].id,
+            (long long)t.members[i].suspect_dead_samples) == 0;
     }
     /* Recent probe success rate per member (0.68.0): the answered
      * / sent ratio over the last PULSE_PROBE_WINDOW direct probes

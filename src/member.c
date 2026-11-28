@@ -309,6 +309,14 @@ member_t *member_add(member_table_t *t, const char *id,
     m->rtt_sum_ms = 0;
     m->rtt_samples = 0;
     m->rtt_max_ms = -1;
+    m->detect_last_ms = -1;
+    m->detect_sum_ms = 0;
+    m->detect_samples = 0;
+    m->detect_max_ms = -1;
+    m->suspect_dead_last_ms = -1;
+    m->suspect_dead_sum_ms = 0;
+    m->suspect_dead_samples = 0;
+    m->suspect_dead_max_ms = -1;
     m->probes_sent = 0;
     m->probes_answered = 0;
     phi_init(&m->phi);
@@ -558,6 +566,39 @@ int64_t member_traffic_total(const member_t *m) {
     for (int i = 0; i < PULSE_TRAFFIC_KINDS; i++)
         total += m->traffic_sent[i] + m->traffic_recv[i];
     return total;
+}
+
+void member_note_detect(member_table_t *t, const char *id,
+                        int64_t latency_ms) {
+    if (latency_ms < 0) return;
+    member_t *m = member_find(t, id);
+    if (!m) return;
+    m->detect_last_ms = latency_ms;
+    m->detect_sum_ms += latency_ms;
+    m->detect_samples++;
+    if (latency_ms > m->detect_max_ms) m->detect_max_ms = latency_ms;
+}
+
+void member_note_suspect_dead(member_table_t *t, const char *id,
+                              int64_t duration_ms) {
+    if (duration_ms < 0) return;
+    member_t *m = member_find(t, id);
+    if (!m) return;
+    m->suspect_dead_last_ms = duration_ms;
+    m->suspect_dead_sum_ms += duration_ms;
+    m->suspect_dead_samples++;
+    if (duration_ms > m->suspect_dead_max_ms)
+        m->suspect_dead_max_ms = duration_ms;
+}
+
+int64_t member_detect_mean_ms(const member_t *m) {
+    if (!m || m->detect_samples == 0) return -1;
+    return m->detect_sum_ms / m->detect_samples;
+}
+
+int64_t member_suspect_dead_mean_ms(const member_t *m) {
+    if (!m || m->suspect_dead_samples == 0) return -1;
+    return m->suspect_dead_sum_ms / m->suspect_dead_samples;
 }
 
 double member_probe_rate(const member_t *m) {
