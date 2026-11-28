@@ -26,6 +26,18 @@
 
 #define PULSE_PROBE_RATE_HISTORY 16
 
+/* Per-member probe-RTT histogram (0.83.0): bucket bounds for the
+ * per-member probe-RTT histogram in PROMETHEUS — the same five
+ * buckets as the global probe-RTT histogram: <1, 1-4, 5-9, 10-49,
+ * >=50 ms, so the per-member shape reads against the same scale
+ * as the node-wide one. The bounds match PULSE_RTT_HIST_BOUNDS
+ * in metrics.h; they live here too because member.h cannot
+ * include metrics.h (metrics.h includes member.h). The last
+ * bucket is +Inf, so the total bucket count is NBOUNDS + 1. */
+#define PULSE_MEMBER_RTT_HIST_BOUNDS { 1, 5, 10, 50 }
+#define PULSE_MEMBER_RTT_HIST_NBOUNDS 4
+#define PULSE_MEMBER_RTT_HIST_BUCKETS 5
+
 /* Flap counter (0.75.0): how many completed flap cycles to keep
  * timestamps for per peer — the same 16-slot ring the histories
  * use — and how far back the recent-flap count looks. A flap is
@@ -128,6 +140,19 @@ typedef struct {
      * has been answered, like rtt_ms. Local measurement only —
      * never gossiped, never persisted. */
     int64_t rtt_max_ms;
+    /* Per-member probe-RTT histogram (0.83.0): the same five
+     * buckets the global probe-RTT histogram uses (0.48.0) —
+     * <1, 1-4, 5-9, 10-49, >=50 ms — but per peer, so a scraper
+     * can see the shape of one peer's RTTs instead of only the
+     * node-wide shape: the mean can hide one 60 ms probe among
+     * sub-millisecond ones, and the max can hide that it was
+     * the only slow one. Every answered probe buckets one
+     * sample in member_note_rtt, with the same boundary rule as
+     * the global histogram: a sample exactly at a bound lands
+     * in the higher bucket. Local measurement only — never
+     * gossiped, never persisted, and not a table-version change,
+     * like the RTT itself. */
+    int64_t rtt_hist[PULSE_MEMBER_RTT_HIST_BUCKETS];
     /* Per-member probe counts (0.66.0): how many direct probes
      * this node sent to the peer (probes_sent) and how many of
      * them were answered (probes_answered) — the probe success
@@ -572,6 +597,20 @@ int member_probe_rate_history_json(const member_t *m, int64_t start_ms,
  * probe cycle has sampled the peer yet (or for a NULL member). */
 void member_probe_rate_history_stats(const member_t *m, double *latest,
                                      double *min, int *count);
+/* Cumulative bucket counts over the member's answered probes:
+ * counts has PULSE_MEMBER_RTT_HIST_NBOUNDS + 1 entries:
+ * counts[b] is how many samples are <=
+ * PULSE_MEMBER_RTT_HIST_BOUNDS[b] for b below NBOUNDS, and the
+ * last entry is the +Inf bucket — every sample. *sum is the sum
+ * of the sampled RTTs (the same rtt_sum_ms the mean divides),
+ * and *count is how many samples were bucketed — always
+ * rtt_samples, since every answered probe buckets exactly one
+ * sample in member_note_rtt. A sample exactly at a bound lands
+ * in that bucket, like the global probe-RTT histogram. All
+ * outputs are 0 for a NULL member or one with no answered
+ * probe. */
+void member_rtt_hist(const member_t *m, int *counts, int64_t *sum,
+                     int *count);
 /* Probe-rate-history histogram (0.74.0): bucket bounds for the
  * per-member probe-rate-history histogram in PROMETHEUS — a
  * healthy peer sits at 1.00 and the low-probe-rate warning fires

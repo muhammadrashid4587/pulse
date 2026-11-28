@@ -1979,6 +1979,59 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             t.members[i].id,
             (long long)member_rtt_max_ms(&t.members[i])) == 0;
     }
+    /* Per-member probe-RTT histogram (0.83.0): the same five
+     * buckets the global pulse_probe_rtt_ms histogram uses —
+     * <1, 1-4, 5-9, 10-49, >=50 ms — but per peer, as a real
+     * histogram, so a scraper can compute quantiles of one
+     * peer's RTTs instead of trusting its mean and max alone: a
+     * peer that usually answers in under a millisecond with one
+     * 60 ms probe reads differently from one that sits at 10 ms
+     * all the time. One histogram per member that has answered
+     * a probe, under the same rule as the last/mean/max gauges
+     * — self never probes itself and a peer never heard from
+     * has no series, and a dead member keeps its frozen
+     * histogram until GC, like its gauges, so the shape of the
+     * RTTs at suspicion stays visible after the peer is gone.
+     * The sum is the sum of the sampled RTTs (the same
+     * rtt_sum_ms the mean divides) and the +Inf bucket always
+     * equals the _count and the probes_answered counter for the
+     * same member. */
+    {
+        static const int64_t bounds[] = PULSE_MEMBER_RTT_HIST_BOUNDS;
+        ok &= prom_add(&buf, &cap, &used,
+            "# HELP pulse_member_probe_rtt_ms Direct-probe "
+            "round-trip time in ms, per member, cumulative "
+            "histogram.\n"
+            "# TYPE pulse_member_probe_rtt_ms histogram\n") == 0;
+        for (int i = 0; i < t.count; i++) {
+            if (t.members[i].rtt_ms < 0 ||
+                t.members[i].rtt_samples == 0) continue;
+            int counts[PULSE_MEMBER_RTT_HIST_NBOUNDS + 1];
+            int64_t sum;
+            int n;
+            member_rtt_hist(&t.members[i], counts, &sum, &n);
+            if (n == 0) continue;
+            for (int b = 0; b <= PULSE_MEMBER_RTT_HIST_NBOUNDS; b++) {
+                if (b < PULSE_MEMBER_RTT_HIST_NBOUNDS) {
+                    ok &= prom_add(&buf, &cap, &used,
+                        "pulse_member_probe_rtt_ms_bucket{member="
+                        "\"%s\",le=\"%lld\"} %d\n",
+                        t.members[i].id, (long long)bounds[b],
+                        counts[b]) == 0;
+                } else {
+                    ok &= prom_add(&buf, &cap, &used,
+                        "pulse_member_probe_rtt_ms_bucket{member="
+                        "\"%s\",le=\"+Inf\"} %d\n",
+                        t.members[i].id, counts[b]) == 0;
+                }
+            }
+            ok &= prom_add(&buf, &cap, &used,
+                "pulse_member_probe_rtt_ms_sum{member=\"%s\"} %lld\n"
+                "pulse_member_probe_rtt_ms_count{member=\"%s\"} %d\n",
+                t.members[i].id, (long long)sum, t.members[i].id,
+                n) == 0;
+        }
+    }
     /* Per-member probe counts (0.66.0): how many direct probes
      * this node sent to each peer and how many were answered —
      * the probe success rate — as counters, one labelled sample

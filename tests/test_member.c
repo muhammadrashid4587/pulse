@@ -297,6 +297,69 @@ int main(void) {
     CHECK(m3->rtt_samples == 0);
     CHECK(member_rtt_mean_ms(m3) == -1);
 
+    /* Per-member probe-RTT histogram (0.83.0): every answered
+     * probe buckets one sample into the same five buckets the
+     * global probe-RTT histogram uses — <1, 1-4, 5-9, 10-49,
+     * >=50 ms — and member_rtt_hist reads them back as
+     * cumulative counts with the sum of the sampled RTTs and
+     * the sample count. A fresh member has no samples: an
+     * all-zero histogram with sum 0 and count 0, and a NULL
+     * member reports the same instead of crashing. */
+    member_table_t th;
+    member_table_init(&th);
+    member_t *mh = member_add(&th, "127.0.0.1:17110", &a4, 1);
+    uint64_t th_v = th.version;
+    int rcounts[PULSE_MEMBER_RTT_HIST_NBOUNDS + 1];
+    int64_t rsum;
+    int rcount;
+    member_rtt_hist(mh, rcounts, &rsum, &rcount);
+    CHECK(rcount == 0 && rsum == 0 && rcounts[0] == 0 &&
+          rcounts[PULSE_MEMBER_RTT_HIST_NBOUNDS] == 0);
+    member_rtt_hist(NULL, rcounts, &rsum, &rcount);
+    CHECK(rcount == 0 && rsum == 0 &&
+          rcounts[PULSE_MEMBER_RTT_HIST_NBOUNDS] == 0);
+    /* Samples 0, 0, 3, 7, 60: two sub-millisecond, one in 1-4,
+     * one in 5-9, one at or above 50 — so the cumulative buckets
+     * read 2, 3, 4, 4, 5, the sum is 70 over 5 samples, and the
+     * count always equals rtt_samples. */
+    CHECK(member_note_rtt(&th, "127.0.0.1:17110", 0, 0) == 1);
+    CHECK(member_note_rtt(&th, "127.0.0.1:17110", 0, 0) == 1);
+    CHECK(member_note_rtt(&th, "127.0.0.1:17110", 3, 0) == 1);
+    CHECK(member_note_rtt(&th, "127.0.0.1:17110", 7, 0) == 1);
+    CHECK(member_note_rtt(&th, "127.0.0.1:17110", 60, 0) == 1);
+    member_rtt_hist(mh, rcounts, &rsum, &rcount);
+    CHECK(rcount == 5);
+    CHECK(rcount == (int)mh->rtt_samples);
+    CHECK(rsum == 70);
+    CHECK(rsum == mh->rtt_sum_ms);
+    CHECK(rcounts[0] == 2); /* le 1: the two 0 ms samples */
+    CHECK(rcounts[1] == 3); /* le 5: plus the 3 ms sample */
+    CHECK(rcounts[2] == 4); /* le 10: plus the 7 ms sample */
+    CHECK(rcounts[3] == 4); /* le 50: the 60 ms sample is above it */
+    CHECK(rcounts[4] == 5); /* +Inf: every sample */
+    /* A sample exactly at a bound lands in the higher bucket:
+     * 1 ms is not sub-millisecond, 5 ms is not 1-4, 10 ms is
+     * not 5-9, and 50 ms is not 10-49 — the same boundary rule
+     * as the global probe-RTT histogram. */
+    CHECK(member_note_rtt(&th, "127.0.0.1:17110", 1, 0) == 1);
+    CHECK(member_note_rtt(&th, "127.0.0.1:17110", 5, 0) == 1);
+    CHECK(member_note_rtt(&th, "127.0.0.1:17110", 10, 0) == 1);
+    CHECK(member_note_rtt(&th, "127.0.0.1:17110", 50, 0) == 1);
+    member_rtt_hist(mh, rcounts, &rsum, &rcount);
+    CHECK(rcount == 9);
+    CHECK(rsum == 136);
+    CHECK(rcounts[0] == 2); /* le 1: still only the two 0 ms samples */
+    CHECK(rcounts[1] == 4); /* le 5: plus 3 and the new 1, not the 5 */
+    CHECK(rcounts[2] == 6); /* le 10: plus 7 and the new 5, not the 10 */
+    CHECK(rcounts[3] == 7); /* le 50: plus the new 10, not the 50 */
+    CHECK(rcounts[4] == 9); /* +Inf: every sample */
+    /* Bucketing is not a gossip-visible change, and a negative
+     * sample buckets nothing. */
+    CHECK(th.version == th_v);
+    CHECK(member_note_rtt(&th, "127.0.0.1:17110", -1, 0) == 0);
+    member_rtt_hist(mh, rcounts, &rsum, &rcount);
+    CHECK(rcount == 9);
+
     /* Gossip traffic counters (0.80.0): sent and received start at
      * 0 for every kind; each note moves exactly one kind in one
      * direction, and the total is the sum over both directions and

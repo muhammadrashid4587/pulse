@@ -259,6 +259,15 @@ static void snapshot_full_table(member_table_t *out) {
         m->rtt_sum_ms = 10;
         m->rtt_samples = 4;
         m->rtt_max_ms = 7;
+        /* Per-member probe-RTT histogram (0.83.0): the four
+         * canned samples (3, 7, 0, 0) bucket as [2,1,1,0,0] —
+         * two sub-millisecond, one in 1-4, one in 5-9 — so the
+         * cumulative buckets read 2, 3, 4, 4, 4 with sum 10
+         * over 4 samples. Set directly, like the canned RTT
+         * above: the real bucketing is covered in test_member.c. */
+        m->rtt_hist[0] = 2;
+        m->rtt_hist[1] = 1;
+        m->rtt_hist[2] = 1;
         m->probes_sent = 5;
         m->probes_answered = 4;
         phi_heartbeat(&m->phi, now - 10000);
@@ -348,6 +357,15 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         m->rtt_sum_ms = 10;
         m->rtt_samples = 4;
         m->rtt_max_ms = 7;
+        /* Per-member probe-RTT histogram (0.83.0): the four
+         * canned samples (3, 7, 0, 0) bucket as [2,1,1,0,0] —
+         * two sub-millisecond, one in 1-4, one in 5-9 — so the
+         * cumulative buckets read 2, 3, 4, 4, 4 with sum 10
+         * over 4 samples. Set directly, like the canned RTT
+         * above: the real bucketing is covered in test_member.c. */
+        m->rtt_hist[0] = 2;
+        m->rtt_hist[1] = 1;
+        m->rtt_hist[2] = 1;
         m->probes_sent = 5;
         m->probes_answered = 4;
         /* Phi history (0.42.0): two 100 ms intervals, last
@@ -395,6 +413,11 @@ static void snapshot_hook(void *ctx, member_table_t *out) {
         m->rtt_sum_ms = 0;
         m->rtt_samples = 1;
         m->rtt_max_ms = 0;
+        /* Per-member probe-RTT histogram (0.83.0): the single
+         * canned 0 ms sample buckets as [1,0,0,0,0], so every
+         * cumulative bucket reads 1 with sum 0 over 1 sample.
+         * Set directly, like the canned RTT above. */
+        m->rtt_hist[0] = 1;
         m->probes_sent = 2;
         m->probes_answered = 1;
     }
@@ -2337,6 +2360,28 @@ int main(void) {
         CHECK(strstr(preply, "pulse_member_rtt_max_ms{member=\"127.0.0.1:17903\"} 0\n") != NULL);
         CHECK(strstr(preply, "pulse_member_rtt_max_ms{member=\"127.0.0.1:17999\"}") == NULL);
         CHECK(strstr(preply, "pulse_member_rtt_max_ms{member=\"127.0.0.1:17902\"}") == NULL);
+        /* Per-member probe-RTT histogram (0.83.0): the same five
+         * buckets as the global histogram, per peer — the seed
+         * peer's four canned samples (3, 7, 0, 0) read cumulative
+         * 2, 3, 4, 4, 4 with sum 10 over 4 samples, the
+         * peer-file peer's single 0 ms sample reads 1 in every
+         * bucket with sum 0 over 1 — while self, which never
+         * probes itself, and the never-heard-from dead peer have
+         * no histogram at all. */
+        CHECK(strstr(preply, "# TYPE pulse_member_probe_rtt_ms histogram\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_bucket{member=\"127.0.0.1:17901\",le=\"1\"} 2\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_bucket{member=\"127.0.0.1:17901\",le=\"5\"} 3\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_bucket{member=\"127.0.0.1:17901\",le=\"10\"} 4\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_bucket{member=\"127.0.0.1:17901\",le=\"50\"} 4\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_bucket{member=\"127.0.0.1:17901\",le=\"+Inf\"} 4\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_sum{member=\"127.0.0.1:17901\"} 10\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_count{member=\"127.0.0.1:17901\"} 4\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_bucket{member=\"127.0.0.1:17903\",le=\"1\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_bucket{member=\"127.0.0.1:17903\",le=\"+Inf\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_sum{member=\"127.0.0.1:17903\"} 0\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_count{member=\"127.0.0.1:17903\"} 1\n") != NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_bucket{member=\"127.0.0.1:17999\"}") == NULL);
+        CHECK(strstr(preply, "pulse_member_probe_rtt_ms_bucket{member=\"127.0.0.1:17902\"}") == NULL);
         /* Per-member probe counts (0.66.0): sent and answered as
          * counters, one labelled sample per member that has been
          * probed — 5 sent / 4 answered for 17901 (one probe went
@@ -2524,6 +2569,8 @@ int main(void) {
         CHECK(strstr(bigreply, "pulse_member_phi_history_samples{member=\"127.0.0.1:18062\"} 3\n") != NULL);
         CHECK(strstr(bigreply, "pulse_member_probe_rate_history_samples{member=\"127.0.0.1:18062\"} 2\n") != NULL);
         CHECK(strstr(bigreply, "pulse_member_flap_count_total{member=\"127.0.0.1:18062\"} 2\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_probe_rtt_ms_bucket{member=\"127.0.0.1:18062\",le=\"+Inf\"} 4\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_probe_rtt_ms_count{member=\"127.0.0.1:18062\"} 4\n") != NULL);
         /* Every fully-instrumented member carries a detect
          * gauge: 63 of them, so no member in the middle was
          * dropped either. */

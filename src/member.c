@@ -706,6 +706,31 @@ void member_probe_rate_history_hist(const member_t *m, const double *bounds,
     counts[n_bounds] = m->probe_rate_hist_count;
 }
 
+void member_rtt_hist(const member_t *m, int *counts, int64_t *sum,
+                     int *count) {
+    for (int b = 0; b <= PULSE_MEMBER_RTT_HIST_NBOUNDS; b++)
+        counts[b] = 0;
+    *sum = 0;
+    *count = 0;
+    if (!m) return;
+    *sum = m->rtt_sum_ms;
+    /* Cumulative counts: the raw per-bucket counts member_note_rtt
+     * keeps are turned into "at or below this bound" by a running
+     * total — the same accumulation the global probe-RTT
+     * histogram does at emission time in control.c — and the
+     * +Inf bucket holds every sample, so *count is the bucket
+     * total, which always equals rtt_samples: every answered
+     * probe buckets exactly one sample. */
+    int64_t cumulative = 0;
+    for (int b = 0; b < PULSE_MEMBER_RTT_HIST_NBOUNDS; b++) {
+        cumulative += m->rtt_hist[b];
+        counts[b] = (int)cumulative;
+    }
+    cumulative += m->rtt_hist[PULSE_MEMBER_RTT_HIST_NBOUNDS];
+    counts[PULSE_MEMBER_RTT_HIST_NBOUNDS] = (int)cumulative;
+    *count = counts[PULSE_MEMBER_RTT_HIST_NBOUNDS];
+}
+
 int member_is_low_probe_rate(const member_t *m, double threshold_frac) {
     if (!m || threshold_frac <= 0) return 0;
     if (m->state != MEMBER_ALIVE) return 0;
@@ -744,6 +769,19 @@ int member_note_rtt(member_table_t *t, const char *id, int64_t rtt_ms,
     m->probes_answered++;
     if (m->rtt_max_ms < 0 || rtt_ms > m->rtt_max_ms)
         m->rtt_max_ms = rtt_ms;
+    /* Per-member probe-RTT histogram (0.83.0): every answered
+     * probe buckets one sample — the same five buckets and the
+     * same boundary rule as the global probe-RTT histogram in
+     * metrics_note_rtt: a sample exactly at a bound lands in
+     * the higher bucket. */
+    {
+        static const int64_t bounds[] = PULSE_MEMBER_RTT_HIST_BOUNDS;
+        int bucket = 0;
+        while (bucket < PULSE_MEMBER_RTT_HIST_NBOUNDS &&
+               rtt_ms >= bounds[bucket])
+            bucket++;
+        m->rtt_hist[bucket]++;
+    }
     /* Slow-peer warning (0.22.0): a first crossing above the threshold
      * returns 2 so the caller warns once for the episode; the flag
      * clears when the mean recovers, so a later crossing warns again.
