@@ -1475,16 +1475,35 @@ static void handle_json(int fd, const control_hooks_t *hooks) {
  * and an absent metric is the Prometheus way of saying "not
  * applicable". Member ids are host:port (IPv6 bracketed), so they
  * carry no quote or backslash and need no label escaping. */
-static int prom_add(char *buf, size_t cap, size_t *used,
+/* Append one formatted piece to the Prometheus reply, growing the
+ * buffer until the piece fits (0.82.0): vsnprintf reports the
+ * length it wanted, so one grow-and-retry per piece is enough, and
+ * the reply is complete at any member count the table can hold —
+ * no fixed size can overflow. The buffer starts at 8 KB and
+ * doubles, so the common small-cluster reply costs one
+ * allocation; a failed allocation is the only way this returns
+ * -1. */
+static int prom_add(char **bufp, size_t *capp, size_t *used,
                     const char *fmt, ...) {
-    if (*used >= cap) return -1;
-    va_list ap;
-    va_start(ap, fmt);
-    int w = vsnprintf(buf + *used, cap - *used, fmt, ap);
-    va_end(ap);
-    if (w < 0 || (size_t)w >= cap - *used) return -1;
-    *used += (size_t)w;
-    return 0;
+    for (;;) {
+        if (*used >= *capp) return -1;
+        va_list ap;
+        va_start(ap, fmt);
+        int w = vsnprintf(*bufp + *used, *capp - *used, fmt, ap);
+        va_end(ap);
+        if (w < 0) return -1;
+        if ((size_t)w < *capp - *used) {
+            *used += (size_t)w;
+            return 0;
+        }
+        size_t need = *used + (size_t)w + 1;
+        size_t ncap = *capp ? *capp : 1024;
+        while (ncap < need) ncap *= 2;
+        char *nb = realloc(*bufp, ncap);
+        if (!nb) return -1;
+        *bufp = nb;
+        *capp = ncap;
+    }
 }
 
 static void handle_prometheus(int fd, const control_hooks_t *hooks) {
@@ -1503,44 +1522,52 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
     pulse_peer_file_state_t pf;
     peer_file_state_or_none(hooks, &pf);
 
-    /* 64 members at ~150 bytes each plus the fixed families is
-     * under 16 KB; 64 KB has ample headroom, as in handle_json. */
-    static char buf[65536];
+    /* The reply is built in a heap buffer that grows as needed
+     * (0.82.0): the old 64 KB static buffer overflowed at 64
+     * fully-instrumented members — every per-member family
+     * emitting every line is over 200 KB — and the handler then
+     * sent nothing at all, not even END, because a truncated
+     * piece failed prom_add and the handler bailed. The buffer
+     * now doubles until each piece fits, so the reply is
+     * complete at any member count the table can hold; it is
+     * also per-call, not shared. */
+    char *buf = malloc(8192);
+    size_t cap = buf ? 8192 : 0;
     size_t used = 0;
-    int ok = 1;
+    int ok = buf != NULL;
     /* Membership counts: current state, so gauges. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_members_alive Members currently ALIVE.\n"
         "# TYPE pulse_members_alive gauge\n"
         "pulse_members_alive %d\n",
         member_count_state(&t, MEMBER_ALIVE)) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_members_suspect Members currently SUSPECT.\n"
         "# TYPE pulse_members_suspect gauge\n"
         "pulse_members_suspect %d\n",
         member_count_state(&t, MEMBER_SUSPECT)) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_members_dead Members currently DEAD.\n"
         "# TYPE pulse_members_dead gauge\n"
         "pulse_members_dead %d\n",
         member_count_state(&t, MEMBER_DEAD)) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_members_total Members in the table.\n"
         "# TYPE pulse_members_total gauge\n"
         "pulse_members_total %d\n", t.count) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_slow_peers Members whose mean probe RTT is "
         "above --slow-peer-rtt-ms.\n"
         "# TYPE pulse_slow_peers gauge\n"
         "pulse_slow_peers %d\n",
         member_count_slow(&t, hooks->slow_rtt_threshold_ms)) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_quiet_peers ALIVE members whose last-contact "
         "age is above --quiet-peer-ms.\n"
         "# TYPE pulse_quiet_peers gauge\n"
         "pulse_quiet_peers %d\n",
         member_count_quiet(&t, hooks->self_id, hooks->quiet_threshold_ms, now)) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_low_probe_rate_peers ALIVE members whose "
         "recent probe success rate is below "
         "--low-probe-rate-frac.\n"
@@ -1556,7 +1583,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * current state, not a transition — and 0 when the warning
      * is disabled, so a scraper can alert on a member flapping
      * right now instead of only on the per-member flap counts. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_flap_rate_peers ALIVE members whose flap "
         "cycles in the last 10 minutes reach "
         "--flap-rate-threshold.\n"
@@ -1564,27 +1591,27 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         "pulse_flap_rate_peers %d\n",
         member_count_flap_rate(&t, hooks->self_id,
                                hooks->flap_rate_threshold, now)) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_uptime_seconds Seconds since this node "
         "started.\n"
         "# TYPE pulse_uptime_seconds gauge\n"
         "pulse_uptime_seconds %lld\n", (long long)uptime) == 0;
     /* Transition counts: lifetime totals, so counters. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_suspected_total ALIVE to SUSPECT transitions "
         "seen.\n"
         "# TYPE pulse_suspected_total counter\n"
         "pulse_suspected_total %lld\n", (long long)m.suspected) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_dead_total SUSPECT to DEAD transitions seen.\n"
         "# TYPE pulse_dead_total counter\n"
         "pulse_dead_total %lld\n", (long long)m.dead) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_refutes_total Times this node refuted gossip "
         "about itself.\n"
         "# TYPE pulse_refutes_total counter\n"
         "pulse_refutes_total %lld\n", (long long)m.refutes) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_joins_total First sightings of a member.\n"
         "# TYPE pulse_joins_total counter\n"
         "pulse_joins_total %lld\n", (long long)m.joins) == 0;
@@ -1596,12 +1623,12 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * HELP/TYPE pair with no samples: an absent metric is how
      * Prometheus says "not applicable". Member ids carry no quote
      * or backslash, so no label escaping is needed. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_seed_rejoin_total Re-JOINs sent to a seed "
         "that was not ALIVE, by seed.\n"
         "# TYPE pulse_seed_rejoin_total counter\n") == 0;
     for (int i = 0; i < m.seed_rejoin_seed_count; i++) {
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_seed_rejoin_total{seed=\"%s\"} %lld\n",
             m.seed_rejoins_by_seed[i].id,
             (long long)m.seed_rejoins_by_seed[i].count) == 0;
@@ -1618,13 +1645,13 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * Unix ms, not seconds: the retry fires every ~5 s, and
      * second resolution would hide whether the last attempt was
      * this interval or the one before. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_seed_last_rejoin_ms Wall-clock time of the "
         "most recent re-JOIN sent to each seed, as unix "
         "milliseconds, by seed.\n"
         "# TYPE pulse_seed_last_rejoin_ms gauge\n") == 0;
     for (int i = 0; i < m.seed_rejoin_seed_count; i++) {
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_seed_last_rejoin_ms{seed=\"%s\"} %lld\n",
             m.seed_rejoins_by_seed[i].id,
             (long long)m.seed_rejoins_by_seed[i].last_rejoin_unix_ms) == 0;
@@ -1639,24 +1666,24 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * and a node that re-joined nothing emits the HELP/TYPE pair
      * with no samples, like the counter and the last-rejoin
      * gauge above. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_seed_rejoin_backoff_ms Delay in ms before the "
         "next re-JOIN to each seed: the current exponential "
         "backoff, 0 while the seed is ALIVE.\n"
         "# TYPE pulse_seed_rejoin_backoff_ms gauge\n") == 0;
     for (int i = 0; i < m.seed_rejoin_seed_count; i++) {
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_seed_rejoin_backoff_ms{seed=\"%s\"} %lld\n",
             m.seed_rejoins_by_seed[i].id,
             (long long)m.seed_rejoins_by_seed[i].next_delay_ms) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_adaptive_fast_cycles_total Probe cycles that "
         "ran at the fast interval because a peer was SUSPECT.\n"
         "# TYPE pulse_adaptive_fast_cycles_total counter\n"
         "pulse_adaptive_fast_cycles_total %lld\n",
         (long long)m.adaptive_fast_cycles) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_suspect_refuted_total SUSPECT to ALIVE "
         "transitions: suspicions that turned out wrong.\n"
         "# TYPE pulse_suspect_refuted_total counter\n"
@@ -1665,7 +1692,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
     /* Latency groups: mean/max/samples as gauges. A mean of 0
      * with 0 samples means "no sample yet" — Prometheus has no
      * null, and the samples gauge says whether the mean is real. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_detect_latency_ms_mean Mean last-direct-"
         "contact to SUSPECT latency in ms.\n"
         "# TYPE pulse_detect_latency_ms_mean gauge\n"
@@ -1673,13 +1700,13 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         (long long)(m.detect_samples > 0
                         ? m.detect_sum_ms / m.detect_samples
                         : 0)) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_detect_latency_ms_max Max last-direct-"
         "contact to SUSPECT latency in ms.\n"
         "# TYPE pulse_detect_latency_ms_max gauge\n"
         "pulse_detect_latency_ms_max %lld\n",
         (long long)m.detect_max_ms) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_detect_latency_ms_samples Suspicions with a "
         "measured detection latency.\n"
         "# TYPE pulse_detect_latency_ms_samples gauge\n"
@@ -1692,26 +1719,26 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
     {
         static const int64_t bounds[] = PULSE_DETECT_HIST_BOUNDS;
         int64_t cumulative = 0;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_detect_latency_ms Detection latency in "
             "ms, last direct contact to SUSPECT.\n"
             "# TYPE pulse_detect_latency_ms histogram\n") == 0;
         for (int b = 0; b < PULSE_DETECT_HIST_BUCKETS; b++) {
             cumulative += m.detect_hist[b];
             if (b < PULSE_DETECT_HIST_BUCKETS - 1) {
-                ok &= prom_add(buf, sizeof buf, &used,
+                ok &= prom_add(&buf, &cap, &used,
                     "pulse_detect_latency_ms_bucket{le=\"%lld\"} "
                     "%lld\n",
                     (long long)bounds[b],
                     (long long)cumulative) == 0;
             } else {
-                ok &= prom_add(buf, sizeof buf, &used,
+                ok &= prom_add(&buf, &cap, &used,
                     "pulse_detect_latency_ms_bucket{le=\"+Inf\"} "
                     "%lld\n",
                     (long long)cumulative) == 0;
             }
         }
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_detect_latency_ms_sum %lld\n"
             "pulse_detect_latency_ms_count %lld\n",
             (long long)m.detect_sum_ms,
@@ -1723,7 +1750,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * answered direct probes: buckets <1, 1-4, 5-9, 10-49, >=50 ms,
      * the same five buckets METRICS reports as probe_rtt_ms hist.
      * A mean of 0 with 0 samples means "no probe answered yet". */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_probe_rtt_ms_mean Mean direct-probe "
         "round-trip time in ms.\n"
         "# TYPE pulse_probe_rtt_ms_mean gauge\n"
@@ -1731,13 +1758,13 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         (long long)(m.rtt_samples > 0
                         ? m.rtt_sum_ms / m.rtt_samples
                         : 0)) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_probe_rtt_ms_max Max direct-probe "
         "round-trip time in ms.\n"
         "# TYPE pulse_probe_rtt_ms_max gauge\n"
         "pulse_probe_rtt_ms_max %lld\n",
         (long long)m.rtt_max_ms) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_probe_rtt_ms_samples Direct probes answered.\n"
         "# TYPE pulse_probe_rtt_ms_samples gauge\n"
         "pulse_probe_rtt_ms_samples %lld\n",
@@ -1745,32 +1772,32 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
     {
         static const int64_t bounds[] = PULSE_RTT_HIST_BOUNDS;
         int64_t cumulative = 0;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_probe_rtt_ms Direct-probe round-trip "
             "time in ms.\n"
             "# TYPE pulse_probe_rtt_ms histogram\n") == 0;
         for (int b = 0; b < PULSE_RTT_HIST_BUCKETS; b++) {
             cumulative += m.rtt_hist[b];
             if (b < PULSE_RTT_HIST_BUCKETS - 1) {
-                ok &= prom_add(buf, sizeof buf, &used,
+                ok &= prom_add(&buf, &cap, &used,
                     "pulse_probe_rtt_ms_bucket{le=\"%lld\"} "
                     "%lld\n",
                     (long long)bounds[b],
                     (long long)cumulative) == 0;
             } else {
-                ok &= prom_add(buf, sizeof buf, &used,
+                ok &= prom_add(&buf, &cap, &used,
                     "pulse_probe_rtt_ms_bucket{le=\"+Inf\"} "
                     "%lld\n",
                     (long long)cumulative) == 0;
             }
         }
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_probe_rtt_ms_sum %lld\n"
             "pulse_probe_rtt_ms_count %lld\n",
             (long long)m.rtt_sum_ms,
             (long long)m.rtt_samples) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_suspect_to_dead_ms_mean Mean SUSPECT to DEAD "
         "duration in ms.\n"
         "# TYPE pulse_suspect_to_dead_ms_mean gauge\n"
@@ -1778,19 +1805,19 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         (long long)(m.suspect_dead_samples > 0
                         ? m.suspect_dead_sum_ms / m.suspect_dead_samples
                         : 0)) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_suspect_to_dead_ms_max Max SUSPECT to DEAD "
         "duration in ms.\n"
         "# TYPE pulse_suspect_to_dead_ms_max gauge\n"
         "pulse_suspect_to_dead_ms_max %lld\n",
         (long long)m.suspect_dead_max_ms) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_suspect_to_dead_ms_samples Deaths with a "
         "measured SUSPECT to DEAD duration.\n"
         "# TYPE pulse_suspect_to_dead_ms_samples gauge\n"
         "pulse_suspect_to_dead_ms_samples %lld\n",
         (long long)m.suspect_dead_samples) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_refute_latency_ms_mean Mean time a refuted "
         "suspicion sat SUSPECT, in ms.\n"
         "# TYPE pulse_refute_latency_ms_mean gauge\n"
@@ -1798,13 +1825,13 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         (long long)(m.refute_samples > 0
                         ? m.refute_sum_ms / m.refute_samples
                         : 0)) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_refute_latency_ms_max Max time a refuted "
         "suspicion sat SUSPECT, in ms.\n"
         "# TYPE pulse_refute_latency_ms_max gauge\n"
         "pulse_refute_latency_ms_max %lld\n",
         (long long)m.refute_max_ms) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_refute_latency_ms_samples Refuted suspicions "
         "with a measured SUSPECT duration.\n"
         "# TYPE pulse_refute_latency_ms_samples gauge\n"
@@ -1812,7 +1839,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         (long long)m.refute_samples) == 0;
     /* Watch stream state: current subscribers are a gauge, the
      * session and delivery / drop counts are lifetime totals. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_watch_subscribers WATCH streams connected "
         "right now.\n"
         "# TYPE pulse_watch_subscribers gauge\n"
@@ -1820,30 +1847,30 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
     /* Paused streams (0.37.0): how many WATCH streams are paused
      * right now — a paused stream is still connected and still
      * counts as a subscriber, it just is not consuming events. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_watch_paused WATCH streams paused right "
         "now.\n"
         "# TYPE pulse_watch_paused gauge\n"
         "pulse_watch_paused %d\n", ws.paused) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_watch_sessions_total WATCH sessions served "
         "since startup.\n"
         "# TYPE pulse_watch_sessions_total counter\n"
         "pulse_watch_sessions_total %llu\n",
         (unsigned long long)ws.sessions) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_watch_delivered_total EVENT lines WATCH "
         "streams have sent in total.\n"
         "# TYPE pulse_watch_delivered_total counter\n"
         "pulse_watch_delivered_total %llu\n",
         (unsigned long long)ws.delivered) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_watch_filtered_total Events WATCH streams "
         "consumed but skipped because their filter excluded them.\n"
         "# TYPE pulse_watch_filtered_total counter\n"
         "pulse_watch_filtered_total %llu\n",
         (unsigned long long)ws.filtered) == 0;
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_watch_dropped_total Events WATCH streams "
         "lost to a gap in the bounded event ring.\n"
         "# TYPE pulse_watch_dropped_total counter\n"
@@ -1853,7 +1880,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * ring holds — the --event-log-cap the node started with, 128
      * by default — as a gauge, so a scraper can see how far back
      * a replay can reach. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_watch_event_log_cap Events the WATCH event "
         "ring holds.\n"
         "# TYPE pulse_watch_event_log_cap gauge\n"
@@ -1864,7 +1891,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * started with, 16 by default — as a gauge, so a scraper can
      * see whether the node is trading convergence speed for
      * bandwidth. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_gossip_digest_size Members one gossip round's "
         "digest covers.\n"
         "# TYPE pulse_gossip_digest_size gauge\n"
@@ -1878,7 +1905,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * It is emitted always, like the other config gauges: the
      * threshold is the node's configured value whether or not
      * --phi-accrual is on. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_phi_threshold Phi value at which a peer is "
         "suspected.\n"
         "# TYPE pulse_phi_threshold gauge\n"
@@ -1887,12 +1914,12 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
     /* One info gauge per member, labelled by member, state and
      * source — the Prometheus way of exposing per-member state
      * without a separate metric per peer. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_info One per member, labelled by "
         "member, state and source.\n"
         "# TYPE pulse_member_info gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_info{member=\"%s\",state=\"%s\","
             "source=\"%s\"} 1\n",
             t.members[i].id, member_state_name(t.members[i].state),
@@ -1909,24 +1936,24 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * goes DEAD keeps its last RTT — the same as JSON, which
      * reports the last measured value too — so the gauge is the
      * last-known RTT, not a live one, for a dead member. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_rtt_ms Last direct-probe round-trip "
         "time in ms, per member.\n"
         "# TYPE pulse_member_rtt_ms gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].rtt_ms < 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_rtt_ms{member=\"%s\"} %lld\n",
             t.members[i].id, (long long)t.members[i].rtt_ms) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_rtt_mean_ms Mean direct-probe "
         "round-trip time in ms, per member.\n"
         "# TYPE pulse_member_rtt_mean_ms gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].rtt_ms < 0 ||
             t.members[i].rtt_samples == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_rtt_mean_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)member_rtt_mean_ms(&t.members[i])) == 0;
@@ -1940,14 +1967,14 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * of 0 is a real worst case of sub-millisecond probes, not a
      * missing one, and a dead member keeps its worst RTT until
      * GC, like its last and mean. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_rtt_max_ms Worst direct-probe "
         "round-trip time in ms, per member.\n"
         "# TYPE pulse_member_rtt_max_ms gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].rtt_ms < 0 ||
             t.members[i].rtt_samples == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_rtt_max_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)member_rtt_max_ms(&t.members[i])) == 0;
@@ -1967,24 +1994,24 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * dead member keeps its counters until GC, like its RTT
      * gauges, so the count is the last-known one, not a live
      * one, for a dead member. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_probes_sent_total Direct probes sent "
         "to a member.\n"
         "# TYPE pulse_member_probes_sent_total counter\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].probes_sent == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_probes_sent_total{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].probes_sent) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_probes_answered_total Direct probes "
         "answered by a member.\n"
         "# TYPE pulse_member_probes_answered_total counter\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].probes_sent == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_probes_answered_total{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].probes_answered) == 0;
@@ -2002,28 +2029,28 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * and a DEAD member keeps its series until GC, like its probe
      * counters, so the traffic that killed it stays visible after
      * it is gone. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_traffic_sent_total Gossip-protocol "
         "messages sent to a member, by kind.\n"
         "# TYPE pulse_member_traffic_sent_total counter\n") == 0;
     for (int i = 0; i < t.count; i++) {
         for (int k = 0; k < PULSE_TRAFFIC_KINDS; k++) {
             if (t.members[i].traffic_sent[k] == 0) continue;
-            ok &= prom_add(buf, sizeof buf, &used,
+            ok &= prom_add(&buf, &cap, &used,
                 "pulse_member_traffic_sent_total{member=\"%s\","
                 "kind=\"%s\"} %lld\n",
                 t.members[i].id, pulse_traffic_kind_name(k),
                 (long long)t.members[i].traffic_sent[k]) == 0;
         }
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_traffic_recv_total Gossip-protocol "
         "messages received from a member, by kind.\n"
         "# TYPE pulse_member_traffic_recv_total counter\n") == 0;
     for (int i = 0; i < t.count; i++) {
         for (int k = 0; k < PULSE_TRAFFIC_KINDS; k++) {
             if (t.members[i].traffic_recv[k] == 0) continue;
-            ok &= prom_add(buf, sizeof buf, &used,
+            ok &= prom_add(&buf, &cap, &used,
                 "pulse_member_traffic_recv_total{member=\"%s\","
                 "kind=\"%s\"} %lld\n",
                 t.members[i].id, pulse_traffic_kind_name(k),
@@ -2045,48 +2072,48 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * none either, and a DEAD member keeps its gauges until GC,
      * like its RTT gauges, so the latency that killed it stays
      * visible after it is gone. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_detect_ms Last locally measured "
         "detection latency in ms, per member — last direct "
         "contact to SUSPECT.\n"
         "# TYPE pulse_member_detect_ms gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].detect_samples == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_detect_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].detect_last_ms) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_detect_mean_ms Mean locally measured "
         "detection latency in ms, per member.\n"
         "# TYPE pulse_member_detect_mean_ms gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].detect_samples == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_detect_mean_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)member_detect_mean_ms(&t.members[i])) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_detect_max_ms Worst locally measured "
         "detection latency in ms, per member.\n"
         "# TYPE pulse_member_detect_max_ms gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].detect_samples == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_detect_max_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].detect_max_ms) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_detect_samples Locally measured "
         "detection latencies per member — how many suspicions "
         "the mean is over.\n"
         "# TYPE pulse_member_detect_samples gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].detect_samples == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_detect_samples{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].detect_samples) == 0;
@@ -2106,47 +2133,47 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * never suspects itself and has none, and a DEAD member
      * keeps its gauges until GC, like its detect gauges, so the
      * duration stays visible after the peer is gone. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_suspect_dead_ms Last locally "
         "measured SUSPECT to DEAD duration in ms, per member.\n"
         "# TYPE pulse_member_suspect_dead_ms gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].suspect_dead_samples == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_suspect_dead_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].suspect_dead_last_ms) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_suspect_dead_mean_ms Mean locally "
         "measured SUSPECT to DEAD duration in ms, per member.\n"
         "# TYPE pulse_member_suspect_dead_mean_ms gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].suspect_dead_samples == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_suspect_dead_mean_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)member_suspect_dead_mean_ms(&t.members[i])) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_suspect_dead_max_ms Worst locally "
         "measured SUSPECT to DEAD duration in ms, per member.\n"
         "# TYPE pulse_member_suspect_dead_max_ms gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].suspect_dead_samples == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_suspect_dead_max_ms{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].suspect_dead_max_ms) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_suspect_dead_samples Locally "
         "measured SUSPECT to DEAD durations per member — how "
         "many deaths the mean is over.\n"
         "# TYPE pulse_member_suspect_dead_samples gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].suspect_dead_samples == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_suspect_dead_samples{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].suspect_dead_samples) == 0;
@@ -2167,7 +2194,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * have no line: an absent series is how Prometheus says
      * "never probed", the same as the RTT gauges say "never
      * answered". */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_probe_rate Recent direct-probe "
         "success rate per member, answered / sent over the last "
         "20 direct probes.\n"
@@ -2175,7 +2202,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
     for (int i = 0; i < t.count; i++) {
         double rate = member_probe_rate(&t.members[i]);
         if (rate < 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_probe_rate{member=\"%s\"} %.2f\n",
             t.members[i].id, rate) == 0;
     }
@@ -2190,14 +2217,14 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * revives or goes DEAD, so a scraper can alert on a suspicion
      * nearing the suspect timeout instead of only on the DEAD
      * transition. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_suspect_ms How long a member has been "
         "suspected, in ms, per member.\n"
         "# TYPE pulse_member_suspect_ms gauge\n") == 0;
     for (int i = 0; i < t.count; i++) {
         int64_t age = member_suspect_age_ms(&t.members[i], now);
         if (age < 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_suspect_ms{member=\"%s\"} %lld\n",
             t.members[i].id, (long long)age) == 0;
     }
@@ -2213,7 +2240,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * peer's climbs toward the suspect timeout, and a DEAD
      * member's keeps growing until GC, so a scraper can alert on
      * a peer going quiet before the suspicion even fires. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_last_seen_ms How long since this node "
         "last heard from a member, in ms, per member.\n"
         "# TYPE pulse_member_last_seen_ms gauge\n") == 0;
@@ -2221,7 +2248,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         if (strcmp(t.members[i].id, hooks->self_id) == 0) continue;
         int64_t age = member_last_seen_age_ms(&t.members[i], now);
         if (age < 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_last_seen_ms{member=\"%s\"} %lld\n",
             t.members[i].id, (long long)age) == 0;
     }
@@ -2238,7 +2265,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * suspicion fires. A member that goes DEAD keeps its last
      * heartbeat, so its phi keeps growing until GC, the same as
      * JSON reports it. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_phi Phi-accrual failure-detector "
         "value, per member.\n"
         "# TYPE pulse_member_phi gauge\n") == 0;
@@ -2246,7 +2273,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         if (!phi_on || strcmp(t.members[i].id, hooks->self_id) == 0 ||
             !t.members[i].phi.have_last ||
             t.members[i].phi.count < PULSE_PHI_MIN_SAMPLES) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_phi{member=\"%s\"} %.2f\n",
             t.members[i].id, phi_value(&t.members[i].phi, now)) == 0;
     }
@@ -2264,7 +2291,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * the live phi gauge. The samples gauge says whether the
      * latest/max are real, the same convention as the latency
      * groups' samples gauges. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_phi_history_latest Latest sampled "
         "phi in the member's phi history.\n"
         "# TYPE pulse_member_phi_history_latest gauge\n") == 0;
@@ -2276,11 +2303,11 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         int n;
         phi_history_stats(&t.members[i].phi, &latest, &mx, &n);
         if (n == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_phi_history_latest{member=\"%s\"} %.2f\n",
             t.members[i].id, latest) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_phi_history_max Max sampled phi in "
         "the member's phi history.\n"
         "# TYPE pulse_member_phi_history_max gauge\n") == 0;
@@ -2292,11 +2319,11 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         int n;
         phi_history_stats(&t.members[i].phi, &latest, &mx, &n);
         if (n == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_phi_history_max{member=\"%s\"} %.2f\n",
             t.members[i].id, mx) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_phi_history_samples Samples in the "
         "member's phi history (at most 16).\n"
         "# TYPE pulse_member_phi_history_samples gauge\n") == 0;
@@ -2308,7 +2335,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         int n;
         phi_history_stats(&t.members[i].phi, &latest, &mx, &n);
         if (n == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_phi_history_samples{member=\"%s\"} %d\n",
             t.members[i].id, n) == 0;
     }
@@ -2330,7 +2357,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * gauge for the same member. */
     {
         static const double bounds[] = PULSE_PHI_HIST_BOUNDS;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_member_phi_history Sampled phi values "
             "in the member's phi history, cumulative histogram.\n"
             "# TYPE pulse_member_phi_history histogram\n") == 0;
@@ -2348,18 +2375,18 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             if (n == 0) continue;
             for (int b = 0; b <= PULSE_PHI_HIST_NBOUNDS; b++) {
                 if (b < PULSE_PHI_HIST_NBOUNDS) {
-                    ok &= prom_add(buf, sizeof buf, &used,
+                    ok &= prom_add(&buf, &cap, &used,
                         "pulse_member_phi_history_bucket{member="
                         "\"%s\",le=\"%g\"} %d\n",
                         t.members[i].id, bounds[b], counts[b]) == 0;
                 } else {
-                    ok &= prom_add(buf, sizeof buf, &used,
+                    ok &= prom_add(&buf, &cap, &used,
                         "pulse_member_phi_history_bucket{member="
                         "\"%s\",le=\"+Inf\"} %d\n",
                         t.members[i].id, counts[b]) == 0;
                 }
             }
-            ok &= prom_add(buf, sizeof buf, &used,
+            ok &= prom_add(&buf, &cap, &used,
                 "pulse_member_phi_history_sum{member=\"%s\"} %.2f\n"
                 "pulse_member_phi_history_count{member=\"%s\"} %d\n",
                 t.members[i].id, sum, t.members[i].id, n) == 0;
@@ -2383,7 +2410,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * the live rate gauge. The samples gauge says whether the
      * latest/min are real, the same convention as the latency
      * groups' samples gauges. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_probe_rate_history_latest Latest "
         "sampled probe success rate in the member's probe-rate "
         "history.\n"
@@ -2394,12 +2421,12 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         int n;
         member_probe_rate_history_stats(&t.members[i], &latest, &mn, &n);
         if (n == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_probe_rate_history_latest{member=\"%s\"} "
             "%.2f\n",
             t.members[i].id, latest) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_probe_rate_history_min Minimum "
         "sampled probe success rate in the member's probe-rate "
         "history.\n"
@@ -2410,12 +2437,12 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         int n;
         member_probe_rate_history_stats(&t.members[i], &latest, &mn, &n);
         if (n == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_probe_rate_history_min{member=\"%s\"} "
             "%.2f\n",
             t.members[i].id, mn) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_probe_rate_history_samples Samples "
         "in the member's probe-rate history (at most 16).\n"
         "# TYPE pulse_member_probe_rate_history_samples gauge\n") == 0;
@@ -2425,7 +2452,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         int n;
         member_probe_rate_history_stats(&t.members[i], &latest, &mn, &n);
         if (n == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_probe_rate_history_samples{member=\"%s\"} "
             "%d\n",
             t.members[i].id, n) == 0;
@@ -2447,7 +2474,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * member. */
     {
         static const double bounds[] = PULSE_PROBE_RATE_HIST_BOUNDS;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_member_probe_rate_history Sampled probe "
             "success rates in the member's probe-rate history, "
             "cumulative histogram.\n"
@@ -2462,18 +2489,18 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
             if (n == 0) continue;
             for (int b = 0; b <= PULSE_PROBE_RATE_HIST_NBOUNDS; b++) {
                 if (b < PULSE_PROBE_RATE_HIST_NBOUNDS) {
-                    ok &= prom_add(buf, sizeof buf, &used,
+                    ok &= prom_add(&buf, &cap, &used,
                         "pulse_member_probe_rate_history_bucket{member="
                         "\"%s\",le=\"%g\"} %d\n",
                         t.members[i].id, bounds[b], counts[b]) == 0;
                 } else {
-                    ok &= prom_add(buf, sizeof buf, &used,
+                    ok &= prom_add(&buf, &cap, &used,
                         "pulse_member_probe_rate_history_bucket{member="
                         "\"%s\",le=\"+Inf\"} %d\n",
                         t.members[i].id, counts[b]) == 0;
                 }
             }
-            ok &= prom_add(buf, sizeof buf, &used,
+            ok &= prom_add(&buf, &cap, &used,
                 "pulse_member_probe_rate_history_sum{member=\"%s\"} "
                 "%.2f\n"
                 "pulse_member_probe_rate_history_count{member=\"%s\"} "
@@ -2498,18 +2525,18 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * ring only holds the last 16 flap times, so a peer
      * flapping more than 16 times in 10 minutes still reads 16
      * recent while the counter keeps growing. */
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_flap_count_total Completed "
         "ALIVE -> SUSPECT -> ALIVE / DEAD cycles per member.\n"
         "# TYPE pulse_member_flap_count_total counter\n") == 0;
     for (int i = 0; i < t.count; i++) {
         if (t.members[i].flap_count == 0) continue;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "pulse_member_flap_count_total{member=\"%s\"} %lld\n",
             t.members[i].id,
             (long long)t.members[i].flap_count) == 0;
     }
-    ok &= prom_add(buf, sizeof buf, &used,
+    ok &= prom_add(&buf, &cap, &used,
         "# HELP pulse_member_flaps_10m Flap cycles completed in "
         "the last 10 minutes, per member (at most 16).\n"
         "# TYPE pulse_member_flaps_10m gauge\n") == 0;
@@ -2517,7 +2544,7 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
         int64_t now = pulse_now_ms();
         for (int i = 0; i < t.count; i++) {
             if (t.members[i].flap_count == 0) continue;
-            ok &= prom_add(buf, sizeof buf, &used,
+            ok &= prom_add(&buf, &cap, &used,
                 "pulse_member_flaps_10m{member=\"%s\"} %d\n",
                 t.members[i].id,
                 member_flaps_recent(&t.members[i], now)) == 0;
@@ -2527,47 +2554,48 @@ static void handle_prometheus(int fd, const control_hooks_t *hooks) {
      * --peer-file — an absent metric is how Prometheus says "not
      * applicable", matching METRICS reporting "-" and JSON null. */
     if (pf.have_file) {
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_peer_file_peers Peers listed in "
             "--peer-file at the last load.\n"
             "# TYPE pulse_peer_file_peers gauge\n"
             "pulse_peer_file_peers %d\n", pf.peers) == 0;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_peer_file_added Peers added by the last "
             "peer-file load.\n"
             "# TYPE pulse_peer_file_added gauge\n"
             "pulse_peer_file_added %d\n", pf.added) == 0;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_peer_file_dropped Peers dropped by the "
             "last peer-file load.\n"
             "# TYPE pulse_peer_file_dropped gauge\n"
             "pulse_peer_file_dropped %d\n", pf.dropped) == 0;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_peer_file_kept Peers kept by the last "
             "peer-file load (removed from the file but still "
             "ALIVE).\n"
             "# TYPE pulse_peer_file_kept gauge\n"
             "pulse_peer_file_kept %d\n", pf.kept) == 0;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_peer_file_bad Malformed lines skipped "
             "by the last peer-file load.\n"
             "# TYPE pulse_peer_file_bad gauge\n"
             "pulse_peer_file_bad %d\n", pf.bad) == 0;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_peer_file_last_reload_seconds Unix time "
             "of the last successful peer-file load.\n"
             "# TYPE pulse_peer_file_last_reload_seconds gauge\n"
             "pulse_peer_file_last_reload_seconds %lld\n",
             (long long)pf.last_reload_unix) == 0;
-        ok &= prom_add(buf, sizeof buf, &used,
+        ok &= prom_add(&buf, &cap, &used,
             "# HELP pulse_peer_file_last_mtime_seconds Mtime of "
             "--peer-file at the last successful load.\n"
             "# TYPE pulse_peer_file_last_mtime_seconds gauge\n"
             "pulse_peer_file_last_mtime_seconds %lld\n",
             (long long)pf.last_mtime_unix) == 0;
     }
-    if (!ok) return; /* buffer full: send nothing, as in handle_json */
-    if (send_all(fd, buf) != 0) return;
+    if (!ok) { free(buf); return; } /* allocation failed: send nothing, as in handle_json */
+    if (send_all(fd, buf) != 0) { free(buf); return; }
+    free(buf);
     send_all(fd, "END\n");
 }
 

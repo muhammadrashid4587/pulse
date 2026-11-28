@@ -212,10 +212,73 @@ static void peer_file_state_hook(void *ctx, pulse_peer_file_state_t *out) {
  * makes the snapshot return an empty table instead. */
 static int g_peers_empty = 0;
 
+/* Full table for the PROMETHEUS growth test (0.82.0): 64 members,
+ * self plus 63 peers, every peer fully instrumented — the same
+ * canned values the 17901 peer carries, on every peer — so the
+ * reply is over 200 KB, past the old 64 KB fixed buffer that
+ * used to overflow and send nothing. Set directly, like the
+ * canned 17901 above: the real transitions are covered in
+ * test_member.c and end to end in the integration tests. */
+static int g_full_table = 0;
+
+static void snapshot_full_table(member_table_t *out) {
+    int64_t now = pulse_now_ms();
+    struct sockaddr_storage addr;
+    memset(&addr, 0, sizeof addr);
+    member_t *m;
+    m = member_add(out, "127.0.0.1:17999", &addr, 1);
+    if (m) m->last_seen_ms = now;
+    for (int i = 0; i < PULSE_MAX_MEMBERS - 1; i++) {
+        char id[PULSE_ID_LEN];
+        snprintf(id, sizeof id, "127.0.0.1:%d", 18000 + i);
+        m = member_add(out, id, &addr, 1);
+        if (!m) break;
+        m->last_seen_ms = now;
+        m->flap_count = 2;
+        m->flap_hist_ms[0] = now - 3000;
+        m->flap_hist_ms[1] = now - 1000;
+        m->flap_hist_count = 2;
+        m->flap_hist_head = 2;
+        m->detect_last_ms = 203;
+        m->detect_sum_ms = 450;
+        m->detect_samples = 2;
+        m->detect_max_ms = 300;
+        m->suspect_dead_last_ms = 301;
+        m->suspect_dead_sum_ms = 602;
+        m->suspect_dead_samples = 2;
+        m->suspect_dead_max_ms = 302;
+        int base = 1000 + i * 10;
+        for (int j = 0; j < 4; j++)
+            member_note_probe_sent(out, id, base + j);
+        for (int j = 0; j < 4; j++)
+            member_note_probe_answered(out, id, base + j);
+        member_sample_probe_rate(m, now - 200);
+        member_note_probe_sent(out, id, base + 4);
+        member_sample_probe_rate(m, now - 100);
+        m->rtt_ms = 3;
+        m->rtt_sum_ms = 10;
+        m->rtt_samples = 4;
+        m->rtt_max_ms = 7;
+        m->probes_sent = 5;
+        m->probes_answered = 4;
+        phi_heartbeat(&m->phi, now - 10000);
+        phi_heartbeat(&m->phi, now - 9900);
+        phi_heartbeat(&m->phi, now - 9800);
+        phi_sample(&m->phi, now - 9800);
+        phi_sample(&m->phi, now - 9700);
+        phi_sample(&m->phi, now - 9600);
+        for (int k = 0; k < PULSE_TRAFFIC_KINDS; k++) {
+            m->traffic_sent[k] = 10 + k;
+            m->traffic_recv[k] = 9 + k;
+        }
+    }
+}
+
 static void snapshot_hook(void *ctx, member_table_t *out) {
     (void)ctx;
     member_table_init(out);
     if (g_peers_empty) return;
+    if (g_full_table) { snapshot_full_table(out); return; }
     int64_t now = pulse_now_ms();
     struct sockaddr_storage addr;
     memset(&addr, 0, sizeof addr);
@@ -2428,6 +2491,57 @@ int main(void) {
         size_t plen = strlen(preply);
         CHECK(plen >= 4 && strcmp(preply + plen - 4, "END\n") == 0);
     }
+    /* Full 64-member table in PROMETHEUS (0.82.0): the reply is
+     * built in a buffer that grows as needed, so 64
+     * fully-instrumented members — every per-member family
+     * emitting every line — render completely instead of
+     * overflowing the old 64 KB fixed buffer and sending
+     * nothing. The reply is over 200 KB, so it gets a 512 KB
+     * receive buffer; the checks prove the last member (the
+     * 64th) is present in every per-member family, the reply is
+     * longer than the old buffer, and it still ends with END. */
+    g_phi_mode = 1;
+    g_full_table = 1;
+    {
+        static char bigreply[512 * 1024];
+        CHECK(send_cmd(18991, "PROMETHEUS\n", bigreply, sizeof bigreply) > 0);
+        CHECK(strstr(bigreply, "pulse_members_total 64\n") != NULL);
+        /* Longer than the old 64 KB buffer: the old handler
+         * would have sent nothing at all for this table. */
+        CHECK(strlen(bigreply) > 65536);
+        /* The 64th member renders in every per-member family:
+         * the last member is the one an overflow would have
+         * cut, so its presence proves the whole table did. */
+        CHECK(strstr(bigreply, "pulse_member_info{member=\"127.0.0.1:18062\",state=\"ALIVE\",source=\"discovered\"} 1\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_rtt_ms{member=\"127.0.0.1:18062\"} 3\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_probes_sent_total{member=\"127.0.0.1:18062\"} 5\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_traffic_sent_total{member=\"127.0.0.1:18062\",kind=\"sync\"} 15\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_traffic_recv_total{member=\"127.0.0.1:18062\",kind=\"sync\"} 14\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_detect_ms{member=\"127.0.0.1:18062\"} 203\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_suspect_dead_ms{member=\"127.0.0.1:18062\"} 301\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_probe_rate{member=\"127.0.0.1:18062\"} 0.80\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_phi{member=\"127.0.0.1:18062\"} 30.00\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_phi_history_samples{member=\"127.0.0.1:18062\"} 3\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_probe_rate_history_samples{member=\"127.0.0.1:18062\"} 2\n") != NULL);
+        CHECK(strstr(bigreply, "pulse_member_flap_count_total{member=\"127.0.0.1:18062\"} 2\n") != NULL);
+        /* Every fully-instrumented member carries a detect
+         * gauge: 63 of them, so no member in the middle was
+         * dropped either. */
+        {
+            int n = 0;
+            const char *p = bigreply;
+            while ((p = strstr(p, "pulse_member_detect_ms{member=\"127.0.0.1:18")) != NULL) {
+                n++;
+                p++;
+            }
+            CHECK(n == 63);
+        }
+        /* The reply ends with END, like every other one-shot. */
+        size_t blen = strlen(bigreply);
+        CHECK(blen >= 4 && strcmp(bigreply + blen - 4, "END\n") == 0);
+    }
+    g_full_table = 0;
+    g_phi_mode = 0;
     /* Phi per member (0.42.0), phi mode on: the seed peer's canned
      * history produces a phi gauge at the 30.00 cap, while self
      * (no phi history), the peer-file peer (no phi history) and
